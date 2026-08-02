@@ -141,6 +141,27 @@ impl ChunkStore for ReplicatedChunkStore {
     fn contains(&self, id: &ChunkId) -> Result<bool> {
         Ok(self.health(id).writable())
     }
+
+    fn list_chunks(&self) -> Result<Vec<ChunkId>> {
+        let mut chunks = self
+            .replicas
+            .iter()
+            .map(DiskChunkStore::list_chunks)
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        chunks.sort_by_key(ChunkId::to_hex);
+        chunks.dedup();
+        Ok(chunks)
+    }
+
+    fn delete(&self, id: &ChunkId) -> Result<()> {
+        for replica in &self.replicas {
+            replica.delete(id)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

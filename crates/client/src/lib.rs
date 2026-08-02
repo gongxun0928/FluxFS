@@ -4,11 +4,11 @@ use fluxfs_chunk::ChunkStore;
 use fluxfs_meta::MetaStore;
 use fluxfs_types::{
     BackingMode, ChunkId, DataGen, DataState, Extent, FileType, FlushId, FlushIntent, FluxError,
-    Inode, InodeId, LocalityFields, LocalityLabel, Manifest, OpState, Origin, RequestOpId, Result,
-    UfsObject, UfsVersion, CHUNK_SIZE, DIRTY_WRITE_CAP_BYTES, ROOT_INODE,
+    GcLeaseId, Inode, InodeId, LocalityFields, LocalityLabel, Manifest, OpState, Origin,
+    RequestOpId, Result, UfsObject, UfsVersion, CHUNK_SIZE, DIRTY_WRITE_CAP_BYTES, ROOT_INODE,
 };
 use fluxfs_ufs::{ReadPathConfig, ReadPathStats, Ufs, UfsEntryMode, UfsProbe, UfsReadPath};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -68,6 +68,12 @@ pub struct FlushRecoveryReport {
     pub completed: usize,
     pub conflicts: usize,
     pub pending: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OrphanGcReport {
+    pub removed_manifests: usize,
+    pub removed_chunks: usize,
 }
 
 impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
@@ -257,6 +263,44 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
             }
         }
         Ok(report)
+    }
+
+    /// Resume a GC interrupted by process failure, without starting a new pass.
+    pub fn resume_orphan_gc(&self) -> Result<Option<OrphanGcReport>> {
+        let Some(plan) = self.meta.current_gc_plan()? else {
+            return Ok(None);
+        };
+        self.execute_gc_plan(plan).map(Some)
+    }
+
+    /// Atomically freeze metadata mutations, remove unreachable manifests, and
+    /// sweep physical chunks not referenced by any active inode manifest.
+    ///
+    /// This is a startup/quiesced operation: callers must not allow a writer to
+    /// stage chunks before the lease and delay its metadata commit until after
+    /// the lease is released. The mount path invokes it before serving FUSE.
+    pub fn run_orphan_gc(&self) -> Result<OrphanGcReport> {
+        let plan = match self.meta.current_gc_plan()? {
+            Some(plan) => plan,
+            None => self.meta.begin_gc(GcLeaseId::random())?,
+        };
+        self.execute_gc_plan(plan)
+    }
+
+    fn execute_gc_plan(&self, plan: fluxfs_types::GcPlan) -> Result<OrphanGcReport> {
+        let live = plan.live_chunks.iter().copied().collect::<BTreeSet<_>>();
+        let mut removed_chunks = 0;
+        for chunk in self.chunks.list_chunks()? {
+            if !live.contains(&chunk) {
+                self.chunks.delete(&chunk)?;
+                removed_chunks += 1;
+            }
+        }
+        self.meta.finish_gc(plan.lease_id)?;
+        Ok(OrphanGcReport {
+            removed_manifests: plan.removed_manifests,
+            removed_chunks,
+        })
     }
 
     fn complete_flush_intent(&self, ino: InodeId, intent: &FlushIntent) -> Result<Inode> {
@@ -938,6 +982,29 @@ mod tests {
         let mid = client.get_inode(file.id).unwrap().manifest_id.unwrap();
         let manifest = client.meta.get_manifest(mid).unwrap();
         assert_eq!(manifest.extents.len(), 2);
+    }
+
+    #[test]
+    fn orphan_gc_reclaims_superseded_chunks_and_preserves_live_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = HeedMetaStore::open(dir.path().join("meta")).unwrap();
+        let chunks = DiskChunkStore::open(dir.path().join("chunks")).unwrap();
+        let client = FluxClient::new(meta, chunks);
+        let file = client
+            .create_file(ROOT_INODE, "gc.bin", 0o644, 0, 0)
+            .unwrap();
+        client.write_at(file.id, 0, b"old bytes").unwrap();
+        let old = client.chunks.list_chunks().unwrap();
+        assert_eq!(old.len(), 1);
+        client.write_at(file.id, 0, b"new bytes").unwrap();
+        assert_eq!(client.chunks.list_chunks().unwrap().len(), 2);
+
+        let report = client.run_orphan_gc().unwrap();
+        assert_eq!(report.removed_manifests, 1);
+        assert_eq!(report.removed_chunks, 1);
+        assert!(!client.chunks.contains(&old[0]).unwrap());
+        assert_eq!(client.read_all(file.id).unwrap(), b"new bytes");
+        assert!(client.meta.current_gc_plan().unwrap().is_none());
     }
 
     #[test]

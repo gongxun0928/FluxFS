@@ -88,4 +88,16 @@ impl ChunkStore for FoyerChunkStore {
         }
         self.disk.contains(id)
     }
+
+    fn list_chunks(&self) -> Result<Vec<ChunkId>> {
+        self.disk.list_chunks()
+    }
+
+    fn delete(&self, id: &ChunkId) -> Result<()> {
+        self.hot
+            .lock()
+            .map_err(|_| FluxError::Io("hot cache lock poisoned".into()))?
+            .remove(id.as_bytes());
+        self.disk.delete(id)
+    }
 }

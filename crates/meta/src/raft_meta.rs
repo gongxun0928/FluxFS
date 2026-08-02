@@ -4,8 +4,8 @@ use crate::heed_store::HeedMetaStore;
 use crate::raft_types::{FluxRaft, MetaRaftRequest, MetaRaftResponse};
 use crate::store::MetaStore;
 use fluxfs_types::{
-    Dentry, FileType, FlushId, FlushIntent, FluxError, Inode, InodeId, Manifest, ManifestId,
-    RequestOpId, Result, UfsObject, ROOT_INODE,
+    Dentry, FileType, FlushId, FlushIntent, FluxError, GcLeaseId, GcPlan, Inode, InodeId, Manifest,
+    ManifestId, RequestOpId, Result, UfsObject, ROOT_INODE,
 };
 use std::future::Future;
 use std::sync::Arc;
@@ -89,6 +89,16 @@ impl RaftMetaStore {
     fn map_manifest_id(resp: MetaRaftResponse) -> Result<ManifestId> {
         match resp {
             MetaRaftResponse::ManifestId(id) => Ok(ManifestId(id)),
+            MetaRaftResponse::Err(err) => Err(err),
+            other => Err(FluxError::Meta(format!(
+                "unexpected raft response: {other:?}"
+            ))),
+        }
+    }
+
+    fn map_gc_plan(resp: MetaRaftResponse) -> Result<GcPlan> {
+        match resp {
+            MetaRaftResponse::GcPlan(plan) => Ok(*plan),
             MetaRaftResponse::Err(err) => Err(err),
             other => Err(FluxError::Meta(format!(
                 "unexpected raft response: {other:?}"
@@ -237,6 +247,24 @@ impl MetaStore for RaftMetaStore {
 
     fn list_flush_intents(&self) -> Result<Vec<(InodeId, FlushIntent)>> {
         self.store.list_flush_intents()
+    }
+
+    fn begin_gc(&self, lease_id: GcLeaseId) -> Result<GcPlan> {
+        Self::map_gc_plan(self.write(MetaRaftRequest::BeginGc {
+            request_id: Some(RequestOpId::random()),
+            lease_id,
+        })?)
+    }
+
+    fn current_gc_plan(&self) -> Result<Option<GcPlan>> {
+        self.store.current_gc_plan()
+    }
+
+    fn finish_gc(&self, lease_id: GcLeaseId) -> Result<()> {
+        Self::map_empty(self.write(MetaRaftRequest::FinishGc {
+            request_id: Some(RequestOpId::random()),
+            lease_id,
+        })?)
     }
 
     fn import_external_with_id(

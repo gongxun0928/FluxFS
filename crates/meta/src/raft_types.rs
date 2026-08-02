@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 
 use fluxfs_types::{
-    FileType, FlushId, FlushIntent, FluxError, Inode, Manifest, RequestOpId, UfsObject,
+    FileType, FlushId, FlushIntent, FluxError, GcLeaseId, GcPlan, Inode, Manifest, RequestOpId,
+    UfsObject,
 };
 
 pub type NodeId = u64;
@@ -84,6 +85,16 @@ pub enum MetaRaftRequest {
         flush_id: FlushId,
         error: String,
     },
+    BeginGc {
+        #[serde(default)]
+        request_id: Option<RequestOpId>,
+        lease_id: GcLeaseId,
+    },
+    FinishGc {
+        #[serde(default)]
+        request_id: Option<RequestOpId>,
+        lease_id: GcLeaseId,
+    },
     /// Atomically allocate inode id, optional manifest, dentry, and External inode.
     ///
     /// `inode.id` in the template is ignored (server allocates). Manifest extents
@@ -118,6 +129,8 @@ impl MetaRaftRequest {
             | Self::BeginFlush { request_id, .. }
             | Self::CommitFlush { request_id, .. }
             | Self::FailFlushConflict { request_id, .. }
+            | Self::BeginGc { request_id, .. }
+            | Self::FinishGc { request_id, .. }
             | Self::ImportExternal { request_id, .. }
             | Self::Unlink { request_id, .. } => request_id.as_ref(),
         }
@@ -132,6 +145,8 @@ impl MetaRaftRequest {
             | Self::BeginFlush { request_id, .. }
             | Self::CommitFlush { request_id, .. }
             | Self::FailFlushConflict { request_id, .. }
+            | Self::BeginGc { request_id, .. }
+            | Self::FinishGc { request_id, .. }
             | Self::ImportExternal { request_id, .. }
             | Self::Unlink { request_id, .. } => {
                 *request_id = Some(id);
@@ -147,6 +162,7 @@ pub enum MetaRaftResponse {
     Empty,
     Inode(Box<Inode>),
     ManifestId(u64),
+    GcPlan(Box<GcPlan>),
     Err(FluxError),
 }
 

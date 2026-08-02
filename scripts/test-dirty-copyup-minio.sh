@@ -196,8 +196,12 @@ start_mount
 cmp "$test_root/expected.bin" "$mount_dir/large.bin"
 mc_sh "mc cat local/${minio_bucket}/${prefix}/large.bin" >"$test_root/backing-after-remount.bin"
 cmp "$test_root/expected.bin" "$test_root/backing-after-remount.bin"
+# The clean head references only UFS. Startup GC removes superseded manifests
+# and their chunks from every reachable Worker (worker-0 intentionally remains down).
+test "$(find "$test_root/worker-1/objects" -type f | wc -l)" -eq 0
+test "$(find "$test_root/worker-2/objects" -type f | wc -l)" -eq 0
 fusermount3 -u "$mount_dir"
 wait "$mount_pid"
 mount_pid=""
 
-echo "Dirty copy-up mixed manifest + RF=2 Worker fault + FUSE remount: ok"
+echo "Dirty copy-up + fsync recovery + startup orphan GC + FUSE remount: ok"

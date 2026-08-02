@@ -2,8 +2,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use fluxfs_chunk::{ChunkStore, DiskChunkStore};
 use fluxfs_proto::chunk::v1::{
-    ContainsChunkRequest, ContainsChunkResponse, GetChunkRequest, GetChunkResponse, HealthRequest,
-    HealthResponse, ListChunksRequest, ListChunksResponse, PutChunkRequest, PutChunkResponse,
+    ContainsChunkRequest, ContainsChunkResponse, DeleteChunkRequest, DeleteChunkResponse,
+    GetChunkRequest, GetChunkResponse, HealthRequest, HealthResponse, ListChunksRequest,
+    ListChunksResponse, PutChunkRequest, PutChunkResponse,
 };
 use fluxfs_proto::{ChunkWorker, ChunkWorkerServer};
 use fluxfs_types::{ChunkId, FluxError, CHUNK_SIZE};
@@ -107,6 +108,22 @@ impl ChunkWorker for ChunkSvc {
                 .into_iter()
                 .map(|chunk| chunk.as_bytes().to_vec())
                 .collect(),
+            worker_id: self.worker_id,
+        }))
+    }
+
+    async fn delete_chunk(
+        &self,
+        request: Request<DeleteChunkRequest>,
+    ) -> Result<Response<DeleteChunkResponse>, Status> {
+        let chunk = ChunkId::try_from(request.into_inner().chunk_id.as_slice())
+            .map_err(status_from_flux)?;
+        let store = Arc::clone(&self.store);
+        tokio::task::spawn_blocking(move || store.delete(&chunk))
+            .await
+            .map_err(|error| Status::internal(format!("chunk delete task: {error}")))?
+            .map_err(status_from_flux)?;
+        Ok(Response::new(DeleteChunkResponse {
             worker_id: self.worker_id,
         }))
     }

@@ -40,6 +40,27 @@ impl FlushId {
     }
 }
 
+/// Persistent stop-the-world lease for a safe metadata/chunk GC sweep.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct GcLeaseId(pub u64);
+
+impl GcLeaseId {
+    pub fn random() -> Self {
+        let bytes = uuid::Uuid::new_v4().into_bytes();
+        Self(u64::from_le_bytes(
+            bytes[..8].try_into().expect("UUID prefix"),
+        ))
+    }
+}
+
+/// Immutable live set captured while the GC lease blocks all other mutations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GcPlan {
+    pub lease_id: GcLeaseId,
+    pub live_chunks: Vec<ChunkId>,
+    pub removed_manifests: usize,
+}
+
 /// In-flight External lazy-load tracking token.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HydrateToken(pub u64);

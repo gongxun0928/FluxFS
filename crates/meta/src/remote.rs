@@ -2,19 +2,20 @@
 
 use crate::store::MetaStore;
 use fluxfs_proto::meta::v1::{
-    BeginFlushRequest, CommitFlushRequest, CommitInodeManifestRequest, CreateRequest,
-    FailFlushConflictRequest, GetInodeRequest, GetManifestRequest, ImportExternalRequest,
-    ListFlushIntentsRequest, LookupRequest, PutInodeRequest, PutManifestRequest, ReaddirRequest,
-    UnlinkRequest,
+    BeginFlushRequest, BeginGcRequest, CommitFlushRequest, CommitInodeManifestRequest,
+    CreateRequest, CurrentGcPlanRequest, FailFlushConflictRequest, FinishGcRequest,
+    GetInodeRequest, GetManifestRequest, ImportExternalRequest, ListFlushIntentsRequest,
+    LookupRequest, PutInodeRequest, PutManifestRequest, ReaddirRequest, UnlinkRequest,
 };
 use fluxfs_proto::meta_codec::{
-    decode_dentries, decode_flush_intents, decode_inode, decode_manifest, encode_flush_intent,
-    encode_inode, encode_manifest, encode_ufs_object, file_type_to_wire, flux_from_status,
+    decode_dentries, decode_flush_intents, decode_gc_plan, decode_inode, decode_manifest,
+    encode_flush_intent, encode_inode, encode_manifest, encode_ufs_object, file_type_to_wire,
+    flux_from_status,
 };
 use fluxfs_proto::MetaServiceClient;
 use fluxfs_types::{
-    Dentry, FileType, FlushId, FlushIntent, FluxError, Inode, InodeId, Manifest, ManifestId,
-    RequestOpId, Result, UfsObject, ROOT_INODE,
+    Dentry, FileType, FlushId, FlushIntent, FluxError, GcLeaseId, GcPlan, Inode, InodeId, Manifest,
+    ManifestId, RequestOpId, Result, UfsObject, ROOT_INODE,
 };
 use std::future::Future;
 use std::sync::Mutex;
@@ -269,6 +270,47 @@ impl MetaStore for RemoteMetaStore {
             .map_err(flux_from_status)?
             .into_inner();
         decode_flush_intents(&response.intents_json)
+    }
+
+    fn begin_gc(&self, lease_id: GcLeaseId) -> Result<GcPlan> {
+        let mut c = self.client()?;
+        let response = self
+            .block_on(async {
+                c.begin_gc(BeginGcRequest {
+                    lease_id: lease_id.0,
+                    request_id: RequestOpId::random().to_hex(),
+                })
+                .await
+            })
+            .map_err(flux_from_status)?
+            .into_inner();
+        decode_gc_plan(&response.plan_json)
+    }
+
+    fn current_gc_plan(&self) -> Result<Option<GcPlan>> {
+        let mut c = self.client()?;
+        let response = self
+            .block_on(async { c.current_gc_plan(CurrentGcPlanRequest {}).await })
+            .map_err(flux_from_status)?
+            .into_inner();
+        if response.present {
+            decode_gc_plan(&response.plan_json).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn finish_gc(&self, lease_id: GcLeaseId) -> Result<()> {
+        let mut c = self.client()?;
+        self.block_on(async {
+            c.finish_gc(FinishGcRequest {
+                lease_id: lease_id.0,
+                request_id: RequestOpId::random().to_hex(),
+            })
+            .await
+        })
+        .map_err(flux_from_status)?;
+        Ok(())
     }
 
     fn import_external_with_id(

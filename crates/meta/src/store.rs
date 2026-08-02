@@ -1,6 +1,6 @@
 use fluxfs_types::{
-    Dentry, FileType, FlushId, FlushIntent, Inode, InodeId, Manifest, ManifestId, RequestOpId,
-    Result, UfsObject, ROOT_INODE,
+    Dentry, FileType, FlushId, FlushIntent, GcLeaseId, GcPlan, Inode, InodeId, Manifest,
+    ManifestId, RequestOpId, Result, UfsObject, ROOT_INODE,
 };
 
 /// Engine-agnostic metadata API frozen for W1.
@@ -33,6 +33,7 @@ pub trait MetaStore: Send + Sync {
     /// When `expected_parent_generation` is `Some`, succeeds only if the
     /// durable parent directory's `generation` matches; on success the parent
     /// generation is incremented in the same transaction.
+    #[allow(clippy::too_many_arguments)]
     fn create_cas(
         &self,
         expected_parent_generation: Option<u64>,
@@ -134,6 +135,12 @@ pub trait MetaStore: Send + Sync {
     ) -> Result<Inode>;
 
     fn list_flush_intents(&self) -> Result<Vec<(InodeId, FlushIntent)>>;
+
+    fn begin_gc(&self, lease_id: GcLeaseId) -> Result<GcPlan>;
+
+    fn current_gc_plan(&self) -> Result<Option<GcPlan>>;
+
+    fn finish_gc(&self, lease_id: GcLeaseId) -> Result<()>;
 
     /// Atomically import an External inode (+ optional manifest) under `parent/name`.
     fn import_external(

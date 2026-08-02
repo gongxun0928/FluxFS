@@ -329,16 +329,31 @@ fn mount_with_chunks<C: ChunkStore + 'static>(
 }
 
 fn reconcile_before_mount<M: MetaStore, C: ChunkStore>(client: &FluxClient<M, C>) -> Result<()> {
-    if !client.has_ufs() {
-        return Ok(());
-    }
-    let report = client
-        .reconcile_flushes()
-        .context("reconcile durable flush intents")?;
-    if report.completed + report.conflicts + report.pending > 0 {
+    if let Some(report) = client
+        .resume_orphan_gc()
+        .context("resume interrupted orphan GC")?
+    {
         println!(
-            "flush recovery: completed={} conflicts={} pending={}",
-            report.completed, report.conflicts, report.pending
+            "orphan GC recovery: manifests={} chunks={}",
+            report.removed_manifests, report.removed_chunks
+        );
+    }
+    if client.has_ufs() {
+        let report = client
+            .reconcile_flushes()
+            .context("reconcile durable flush intents")?;
+        if report.completed + report.conflicts + report.pending > 0 {
+            println!(
+                "flush recovery: completed={} conflicts={} pending={}",
+                report.completed, report.conflicts, report.pending
+            );
+        }
+    }
+    let report = client.run_orphan_gc().context("run startup orphan GC")?;
+    if report.removed_manifests + report.removed_chunks > 0 {
+        println!(
+            "orphan GC: manifests={} chunks={}",
+            report.removed_manifests, report.removed_chunks
         );
     }
     Ok(())

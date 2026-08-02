@@ -19,6 +19,9 @@ service MetaService {
   rpc CommitFlush(CommitFlushRequest) returns (CommitFlushResponse);
   rpc FailFlushConflict(FailFlushConflictRequest) returns (FailFlushConflictResponse);
   rpc ListFlushIntents(ListFlushIntentsRequest) returns (ListFlushIntentsResponse);
+  rpc BeginGc(BeginGcRequest) returns (BeginGcResponse);
+  rpc CurrentGcPlan(CurrentGcPlanRequest) returns (CurrentGcPlanResponse);
+  rpc FinishGc(FinishGcRequest) returns (FinishGcResponse);
   rpc ImportExternal(ImportExternalRequest) returns (ImportExternalResponse);
   rpc Unlink(UnlinkRequest) returns (UnlinkResponse);
   rpc Ping(PingRequest) returns (PingResponse);
@@ -101,6 +104,24 @@ message FailFlushConflictResponse { bytes inode_json = 1; }
 
 message ListFlushIntentsRequest {}
 message ListFlushIntentsResponse { bytes intents_json = 1; }
+
+message BeginGcRequest {
+  uint64 lease_id = 1;
+  string request_id = 2;
+}
+message BeginGcResponse { bytes plan_json = 1; }
+
+message CurrentGcPlanRequest {}
+message CurrentGcPlanResponse {
+  bool present = 1;
+  bytes plan_json = 2;
+}
+
+message FinishGcRequest {
+  uint64 lease_id = 1;
+  string request_id = 2;
+}
+message FinishGcResponse {}
 
 message ImportExternalRequest {
   uint64 parent = 1;

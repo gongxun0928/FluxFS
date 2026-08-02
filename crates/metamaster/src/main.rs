@@ -4,20 +4,23 @@ use fluxfs_meta::{
     start_single_voter, FluxRaft, HeedMetaStore, MetaRaftRequest, MetaRaftResponse, MetaStore,
 };
 use fluxfs_proto::meta::v1::{
-    BeginFlushRequest, BeginFlushResponse, CommitFlushRequest, CommitFlushResponse,
-    CommitInodeManifestRequest, CommitInodeManifestResponse, CreateRequest, CreateResponse,
-    FailFlushConflictRequest, FailFlushConflictResponse, GetInodeRequest, GetInodeResponse,
-    GetManifestRequest, GetManifestResponse, ImportExternalRequest, ImportExternalResponse,
-    ListFlushIntentsRequest, ListFlushIntentsResponse, LookupRequest, LookupResponse, PingRequest,
-    PingResponse, PutInodeRequest, PutInodeResponse, PutManifestRequest, PutManifestResponse,
-    ReaddirRequest, ReaddirResponse, UnlinkRequest, UnlinkResponse,
+    BeginFlushRequest, BeginFlushResponse, BeginGcRequest, BeginGcResponse, CommitFlushRequest,
+    CommitFlushResponse, CommitInodeManifestRequest, CommitInodeManifestResponse, CreateRequest,
+    CreateResponse, CurrentGcPlanRequest, CurrentGcPlanResponse, FailFlushConflictRequest,
+    FailFlushConflictResponse, FinishGcRequest, FinishGcResponse, GetInodeRequest,
+    GetInodeResponse, GetManifestRequest, GetManifestResponse, ImportExternalRequest,
+    ImportExternalResponse, ListFlushIntentsRequest, ListFlushIntentsResponse, LookupRequest,
+    LookupResponse, PingRequest, PingResponse, PutInodeRequest, PutInodeResponse,
+    PutManifestRequest, PutManifestResponse, ReaddirRequest, ReaddirResponse, UnlinkRequest,
+    UnlinkResponse,
 };
 use fluxfs_proto::meta_codec::{
     decode_flush_intent, decode_inode, decode_manifest, decode_ufs_object, encode_dentries,
-    encode_flush_intents, encode_inode, encode_manifest, file_type_from_wire, status_from_flux,
+    encode_flush_intents, encode_gc_plan, encode_inode, encode_manifest, file_type_from_wire,
+    status_from_flux,
 };
 use fluxfs_proto::{MetaService, MetaServiceServer};
-use fluxfs_types::{FlushId, ManifestId, RequestOpId};
+use fluxfs_types::{FlushId, GcLeaseId, ManifestId, RequestOpId};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -75,6 +78,18 @@ impl MetaSvc {
     fn map_resp_manifest_id(resp: MetaRaftResponse) -> std::result::Result<u64, Status> {
         match resp {
             MetaRaftResponse::ManifestId(id) => Ok(id),
+            MetaRaftResponse::Err(err) => Err(status_from_flux(err)),
+            other => Err(Status::internal(format!(
+                "unexpected raft response: {other:?}"
+            ))),
+        }
+    }
+
+    fn map_resp_gc_plan(
+        resp: MetaRaftResponse,
+    ) -> std::result::Result<fluxfs_types::GcPlan, Status> {
+        match resp {
+            MetaRaftResponse::GcPlan(plan) => Ok(*plan),
             MetaRaftResponse::Err(err) => Err(status_from_flux(err)),
             other => Err(Status::internal(format!(
                 "unexpected raft response: {other:?}"
@@ -292,6 +307,50 @@ impl MetaService for MetaSvc {
         }))
     }
 
+    async fn begin_gc(
+        &self,
+        req: Request<BeginGcRequest>,
+    ) -> Result<Response<BeginGcResponse>, Status> {
+        let r = req.into_inner();
+        let response = self
+            .write(MetaRaftRequest::BeginGc {
+                request_id: parse_request_op_id(&r.request_id),
+                lease_id: GcLeaseId(r.lease_id),
+            })
+            .await?;
+        let plan = Self::map_resp_gc_plan(response)?;
+        Ok(Response::new(BeginGcResponse {
+            plan_json: encode_gc_plan(&plan).map_err(status_from_flux)?,
+        }))
+    }
+
+    async fn current_gc_plan(
+        &self,
+        _req: Request<CurrentGcPlanRequest>,
+    ) -> Result<Response<CurrentGcPlanResponse>, Status> {
+        let plan = self.store.current_gc_plan().map_err(status_from_flux)?;
+        let (present, plan_json) = match plan {
+            Some(plan) => (true, encode_gc_plan(&plan).map_err(status_from_flux)?),
+            None => (false, Vec::new()),
+        };
+        Ok(Response::new(CurrentGcPlanResponse { present, plan_json }))
+    }
+
+    async fn finish_gc(
+        &self,
+        req: Request<FinishGcRequest>,
+    ) -> Result<Response<FinishGcResponse>, Status> {
+        let r = req.into_inner();
+        let response = self
+            .write(MetaRaftRequest::FinishGc {
+                request_id: parse_request_op_id(&r.request_id),
+                lease_id: GcLeaseId(r.lease_id),
+            })
+            .await?;
+        Self::map_resp_empty(response)?;
+        Ok(Response::new(FinishGcResponse {}))
+    }
+
     async fn import_external(
         &self,
         req: Request<ImportExternalRequest>,
@@ -358,7 +417,7 @@ fn parse_request_op_id(s: &str) -> Option<RequestOpId> {
 // Minimal hex decode for request ids (lowercase/uppercase).
 mod hex {
     pub fn decode(s: &str) -> Result<Vec<u8>, ()> {
-        if s.len() % 2 != 0 {
+        if !s.len().is_multiple_of(2) {
             return Err(());
         }
         let mut out = Vec::with_capacity(s.len() / 2);

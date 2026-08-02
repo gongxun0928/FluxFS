@@ -1,6 +1,6 @@
 use crate::meta::v1;
 use fluxfs_types::{
-    Dentry, FileType, FlushIntent, FluxError, Inode, InodeId, Manifest, ManifestId,
+    Dentry, FileType, FlushIntent, FluxError, GcPlan, Inode, InodeId, Manifest, ManifestId,
     Result as FluxResult, UfsObject,
 };
 
@@ -41,6 +41,14 @@ pub fn encode_flush_intents(intents: &[(InodeId, FlushIntent)]) -> FluxResult<Ve
 }
 
 pub fn decode_flush_intents(bytes: &[u8]) -> FluxResult<Vec<(InodeId, FlushIntent)>> {
+    serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))
+}
+
+pub fn encode_gc_plan(plan: &GcPlan) -> FluxResult<Vec<u8>> {
+    serde_json::to_vec(plan).map_err(|e| FluxError::Meta(e.to_string()))
+}
+
+pub fn decode_gc_plan(bytes: &[u8]) -> FluxResult<GcPlan> {
     serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))
 }
 

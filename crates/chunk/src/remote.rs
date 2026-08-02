@@ -7,7 +7,8 @@
 
 use crate::ChunkStore;
 use fluxfs_proto::chunk::v1::{
-    ContainsChunkRequest, GetChunkRequest, HealthRequest, ListChunksRequest, PutChunkRequest,
+    ContainsChunkRequest, DeleteChunkRequest, GetChunkRequest, HealthRequest, ListChunksRequest,
+    PutChunkRequest,
 };
 use fluxfs_proto::ChunkWorkerClient;
 use fluxfs_types::{ChunkId, FluxError, Result, CHUNK_SIZE};
@@ -39,6 +40,13 @@ enum Command {
     },
     Repair {
         reply: RpcReply<RepairReport>,
+    },
+    ListChunks {
+        reply: RpcReply<Vec<ChunkId>>,
+    },
+    Delete {
+        id: ChunkId,
+        reply: RpcReply<()>,
     },
 }
 
@@ -118,6 +126,14 @@ impl ChunkStore for RemoteReplicatedChunkStore {
 
     fn contains(&self, id: &ChunkId) -> Result<bool> {
         self.call(|reply| Command::Contains { id: *id, reply })
+    }
+
+    fn list_chunks(&self) -> Result<Vec<ChunkId>> {
+        self.call(|reply| Command::ListChunks { reply })
+    }
+
+    fn delete(&self, id: &ChunkId) -> Result<()> {
+        self.call(|reply| Command::Delete { id: *id, reply })
     }
 }
 
@@ -295,7 +311,55 @@ async fn handle_command(
             .await;
             let _ = reply.send(result);
         }
+        Command::ListChunks { reply } => {
+            let result = all_chunks(clients).await;
+            let _ = reply.send(result);
+        }
+        Command::Delete { id, reply } => {
+            let mut reached = 0usize;
+            let mut errors = Vec::new();
+            for client in clients.iter_mut() {
+                match client
+                    .delete_chunk(DeleteChunkRequest {
+                        chunk_id: id.as_bytes().to_vec(),
+                    })
+                    .await
+                {
+                    Ok(_) => reached += 1,
+                    Err(error) => errors.push(error.to_string()),
+                }
+            }
+            let result = if reached == 0 {
+                Err(FluxError::Io(format!(
+                    "delete {} reached no workers: {}",
+                    id.to_hex(),
+                    errors.join("; ")
+                )))
+            } else {
+                Ok(())
+            };
+            let _ = reply.send(result);
+        }
     }
+}
+
+async fn all_chunks(clients: &mut [ChunkWorkerClient<Channel>]) -> Result<Vec<ChunkId>> {
+    let mut chunks = Vec::new();
+    let mut reached = 0usize;
+    for client in clients.iter_mut() {
+        if let Ok(response) = client.list_chunks(ListChunksRequest {}).await {
+            reached += 1;
+            for raw in response.into_inner().chunk_ids {
+                chunks.push(ChunkId::try_from(raw.as_slice())?);
+            }
+        }
+    }
+    if reached == 0 {
+        return Err(FluxError::Io("chunk inventory reached no workers".into()));
+    }
+    chunks.sort_by_key(ChunkId::to_hex);
+    chunks.dedup();
+    Ok(chunks)
 }
 
 async fn healthy_workers(

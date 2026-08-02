@@ -145,6 +145,26 @@ impl ChunkStore for DiskChunkStore {
     fn contains(&self, id: &ChunkId) -> Result<bool> {
         Ok(self.object_path(id).exists())
     }
+
+    fn list_chunks(&self) -> Result<Vec<ChunkId>> {
+        DiskChunkStore::list_chunks(self)
+    }
+
+    fn delete(&self, id: &ChunkId) -> Result<()> {
+        let path = self.object_path(id);
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                if let Some(parent) = path.parent() {
+                    fs::File::open(parent)
+                        .and_then(|dir| dir.sync_all())
+                        .map_err(|error| FluxError::Io(error.to_string()))?;
+                }
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(FluxError::Io(error.to_string())),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -180,5 +200,17 @@ mod tests {
         let corrupt = store.put(b"second").unwrap();
         fs::write(store.object_path(&corrupt), b"corrupt").unwrap();
         assert_eq!(store.list_chunks().unwrap(), vec![first]);
+    }
+
+    #[test]
+    fn delete_is_durable_and_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DiskChunkStore::open(dir.path()).unwrap();
+        let id = store.put(b"garbage").unwrap();
+        assert_eq!(store.list_chunks().unwrap(), vec![id]);
+        store.delete(&id).unwrap();
+        store.delete(&id).unwrap();
+        assert!(!store.contains(&id).unwrap());
+        assert!(store.list_chunks().unwrap().is_empty());
     }
 }

@@ -217,8 +217,8 @@ mod tests {
             mode: 0o644,
             uid: 0,
             gid: 0,
-                expected_parent_generation: None,
-            };
+            expected_parent_generation: None,
+        };
         let first = raft
             .client_write(req.clone())
             .await
@@ -333,8 +333,8 @@ mod tests {
             mode: 0o644,
             uid: 0,
             gid: 0,
-                expected_parent_generation: None,
-            })
+            expected_parent_generation: None,
+        })
         .await
         .expect("create");
 

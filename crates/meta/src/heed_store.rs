@@ -1,15 +1,16 @@
 use crate::raft_types::{MetaRaftRequest, MetaRaftResponse, SmAppliedMeta};
 use crate::store::MetaStore;
 use fluxfs_types::{
-    BackingMode, DataGen, DataState, Dentry, Extent, FileType, FlushId, FlushIntent, FluxError,
-    Inode, InodeId, LocalityFields, LocalityLabel, Manifest, ManifestId, OpState, Origin, Result,
-    UfsObject, UfsVersion, ROOT_INODE,
+    BackingMode, ChunkId, DataGen, DataState, Dentry, Extent, FileType, FlushId, FlushIntent,
+    FluxError, GcLeaseId, GcPlan, Inode, InodeId, LocalityFields, LocalityLabel, Manifest,
+    ManifestId, OpState, Origin, Result, UfsObject, UfsVersion, ROOT_INODE,
 };
 use heed::types::{Bytes, Str};
 use heed::{Database, Env, EnvOpenOptions};
 use openraft::BasicNode;
 use openraft::StoredMembership;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,6 +23,7 @@ type RequestDb = Database<Str, Bytes>;
 
 const KEY_SM_LAST_APPLIED: &str = "raft_sm_last_applied";
 const KEY_SM_LAST_MEMBERSHIP: &str = "raft_sm_last_membership";
+const KEY_GC_LEASE: &str = "gc_lease";
 
 /// Full MetaStore snapshot payload for OpenRaft install/build.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +37,9 @@ pub struct MetaSnapshotData {
     /// Retained Meta mutation results keyed by [`fluxfs_types::RequestOpId`].
     #[serde(default)]
     pub client_requests: Vec<(String, MetaRaftResponse)>,
+    /// A persistent stop-the-world lease makes physical chunk sweeping safe.
+    #[serde(default)]
+    pub gc_lease: Option<GcLeaseId>,
 }
 
 pub struct HeedMetaStore {
@@ -209,137 +214,156 @@ impl HeedMetaStore {
             }
         }
 
-        let resp = match req {
-            MetaRaftRequest::Create {
-                parent,
-                name,
-                file_type,
-                mode,
-                uid,
-                gid,
-                expected_parent_generation,
-                ..
-            } => {
-                match self.create_in_txn(
+        let gc_blocked = self.gc_lease_in_txn(&wtxn)?.is_some()
+            && !matches!(
+                req,
+                MetaRaftRequest::BeginGc { .. } | MetaRaftRequest::FinishGc { .. }
+            );
+        let resp = if gc_blocked {
+            MetaRaftResponse::Err(FluxError::Busy)
+        } else {
+            match req {
+                MetaRaftRequest::Create {
+                    parent,
+                    name,
+                    file_type,
+                    mode,
+                    uid,
+                    gid,
+                    expected_parent_generation,
+                    ..
+                } => {
+                    match self.create_in_txn(
+                        &mut wtxn,
+                        *expected_parent_generation,
+                        *parent,
+                        name,
+                        *file_type,
+                        *mode,
+                        *uid,
+                        *gid,
+                    ) {
+                        Ok(inode) => MetaRaftResponse::Inode(Box::new(inode)),
+                        Err(e) => MetaRaftResponse::Err(e),
+                    }
+                }
+                MetaRaftRequest::PutInode { inode, .. } => {
+                    match put_inode_raw(&self.inodes, &mut wtxn, inode.as_ref()) {
+                        Ok(()) => MetaRaftResponse::Empty,
+                        Err(e) => MetaRaftResponse::Err(e),
+                    }
+                }
+                MetaRaftRequest::PutManifest { manifest, .. } => {
+                    match self.put_manifest_in_txn(&mut wtxn, manifest.as_ref()) {
+                        Ok(id) => MetaRaftResponse::ManifestId(id.0),
+                        Err(e) => MetaRaftResponse::Err(e),
+                    }
+                }
+                MetaRaftRequest::CommitInodeManifest {
+                    expected_generation,
+                    inode,
+                    manifest,
+                    ..
+                } => {
+                    match self.commit_inode_manifest_in_txn(
+                        &mut wtxn,
+                        *expected_generation,
+                        inode.as_ref(),
+                        manifest.as_ref(),
+                    ) {
+                        Ok(inode) => MetaRaftResponse::Inode(Box::new(inode)),
+                        Err(e) => MetaRaftResponse::Err(e),
+                    }
+                }
+                MetaRaftRequest::BeginFlush {
+                    expected_generation,
+                    inode,
+                    intent,
+                    ..
+                } => match self.begin_flush_in_txn(
+                    &mut wtxn,
+                    *expected_generation,
+                    *inode,
+                    intent.as_ref(),
+                ) {
+                    Ok(inode) => MetaRaftResponse::Inode(Box::new(inode)),
+                    Err(e) => MetaRaftResponse::Err(e),
+                },
+                MetaRaftRequest::CommitFlush {
+                    expected_generation,
+                    inode,
+                    flush_id,
+                    published_ufs,
+                    ..
+                } => match self.commit_flush_in_txn(
+                    &mut wtxn,
+                    *expected_generation,
+                    *inode,
+                    *flush_id,
+                    published_ufs.as_ref(),
+                ) {
+                    Ok(inode) => MetaRaftResponse::Inode(Box::new(inode)),
+                    Err(e) => MetaRaftResponse::Err(e),
+                },
+                MetaRaftRequest::FailFlushConflict {
+                    expected_generation,
+                    inode,
+                    flush_id,
+                    error,
+                    ..
+                } => match self.fail_flush_conflict_in_txn(
+                    &mut wtxn,
+                    *expected_generation,
+                    *inode,
+                    *flush_id,
+                    error,
+                ) {
+                    Ok(inode) => MetaRaftResponse::Inode(Box::new(inode)),
+                    Err(e) => MetaRaftResponse::Err(e),
+                },
+                MetaRaftRequest::BeginGc { lease_id, .. } => {
+                    match self.begin_gc_in_txn(&mut wtxn, *lease_id) {
+                        Ok(plan) => MetaRaftResponse::GcPlan(Box::new(plan)),
+                        Err(e) => MetaRaftResponse::Err(e),
+                    }
+                }
+                MetaRaftRequest::FinishGc { lease_id, .. } => {
+                    match self.finish_gc_in_txn(&mut wtxn, *lease_id) {
+                        Ok(()) => MetaRaftResponse::Empty,
+                        Err(e) => MetaRaftResponse::Err(e),
+                    }
+                }
+                MetaRaftRequest::ImportExternal {
+                    parent,
+                    name,
+                    inode,
+                    manifest,
+                    expected_parent_generation,
+                    ..
+                } => match self.import_external_in_txn(
                     &mut wtxn,
                     *expected_parent_generation,
                     *parent,
                     name,
-                    *file_type,
-                    *mode,
-                    *uid,
-                    *gid,
-                ) {
-                    Ok(inode) => MetaRaftResponse::Inode(Box::new(inode)),
-                    Err(e) => MetaRaftResponse::Err(e),
-                }
-            }
-            MetaRaftRequest::PutInode { inode, .. } => {
-                match put_inode_raw(&self.inodes, &mut wtxn, inode.as_ref()) {
-                    Ok(()) => MetaRaftResponse::Empty,
-                    Err(e) => MetaRaftResponse::Err(e),
-                }
-            }
-            MetaRaftRequest::PutManifest { manifest, .. } => {
-                match self.put_manifest_in_txn(&mut wtxn, manifest.as_ref()) {
-                    Ok(id) => MetaRaftResponse::ManifestId(id.0),
-                    Err(e) => MetaRaftResponse::Err(e),
-                }
-            }
-            MetaRaftRequest::CommitInodeManifest {
-                expected_generation,
-                inode,
-                manifest,
-                ..
-            } => {
-                match self.commit_inode_manifest_in_txn(
-                    &mut wtxn,
-                    *expected_generation,
                     inode.as_ref(),
-                    manifest.as_ref(),
+                    manifest.as_deref(),
                 ) {
                     Ok(inode) => MetaRaftResponse::Inode(Box::new(inode)),
                     Err(e) => MetaRaftResponse::Err(e),
+                },
+                MetaRaftRequest::Unlink {
+                    parent,
+                    name,
+                    expected_parent_generation,
+                    ..
+                } => {
+                    match self.unlink_in_txn(&mut wtxn, *expected_parent_generation, *parent, name)
+                    {
+                        Ok(()) => MetaRaftResponse::Empty,
+                        Err(e) => MetaRaftResponse::Err(e),
+                    }
                 }
             }
-            MetaRaftRequest::BeginFlush {
-                expected_generation,
-                inode,
-                intent,
-                ..
-            } => match self.begin_flush_in_txn(
-                &mut wtxn,
-                *expected_generation,
-                *inode,
-                intent.as_ref(),
-            ) {
-                Ok(inode) => MetaRaftResponse::Inode(Box::new(inode)),
-                Err(e) => MetaRaftResponse::Err(e),
-            },
-            MetaRaftRequest::CommitFlush {
-                expected_generation,
-                inode,
-                flush_id,
-                published_ufs,
-                ..
-            } => match self.commit_flush_in_txn(
-                &mut wtxn,
-                *expected_generation,
-                *inode,
-                *flush_id,
-                published_ufs.as_ref(),
-            ) {
-                Ok(inode) => MetaRaftResponse::Inode(Box::new(inode)),
-                Err(e) => MetaRaftResponse::Err(e),
-            },
-            MetaRaftRequest::FailFlushConflict {
-                expected_generation,
-                inode,
-                flush_id,
-                error,
-                ..
-            } => match self.fail_flush_conflict_in_txn(
-                &mut wtxn,
-                *expected_generation,
-                *inode,
-                *flush_id,
-                error,
-            ) {
-                Ok(inode) => MetaRaftResponse::Inode(Box::new(inode)),
-                Err(e) => MetaRaftResponse::Err(e),
-            },
-            MetaRaftRequest::ImportExternal {
-                parent,
-                name,
-                inode,
-                manifest,
-                expected_parent_generation,
-                ..
-            } => match self.import_external_in_txn(
-                &mut wtxn,
-                *expected_parent_generation,
-                *parent,
-                name,
-                inode.as_ref(),
-                manifest.as_deref(),
-            ) {
-                Ok(inode) => MetaRaftResponse::Inode(Box::new(inode)),
-                Err(e) => MetaRaftResponse::Err(e),
-            },
-            MetaRaftRequest::Unlink {
-                parent,
-                name,
-                expected_parent_generation,
-                ..
-            } => match self.unlink_in_txn(
-                &mut wtxn,
-                *expected_parent_generation,
-                *parent,
-                name,
-            ) {
-                Ok(()) => MetaRaftResponse::Empty,
-                Err(e) => MetaRaftResponse::Err(e),
-            },
         };
 
         if let Some(op_id) = req.request_id().filter(|id| !id.is_none()) {
@@ -463,6 +487,7 @@ impl HeedMetaStore {
                 serde_json::from_slice(v).map_err(|e| FluxError::Meta(e.to_string()))?;
             client_requests.push((k.to_string(), resp));
         }
+        let gc_lease = self.gc_lease_in_txn(&rtxn)?;
         drop(rtxn);
         Ok(MetaSnapshotData {
             inodes,
@@ -472,6 +497,7 @@ impl HeedMetaStore {
             next_manifest,
             sm: sm.clone(),
             client_requests,
+            gc_lease,
         })
     }
 
@@ -570,12 +596,22 @@ impl HeedMetaStore {
         self.meta
             .put(&mut wtxn, "next_manifest", &u64_bytes(snap.next_manifest))
             .map_err(|e| FluxError::Meta(e.to_string()))?;
+        match snap.gc_lease {
+            Some(lease) => self
+                .meta
+                .put(&mut wtxn, KEY_GC_LEASE, &u64_bytes(lease.0))
+                .map_err(|e| FluxError::Meta(e.to_string()))?,
+            None => {
+                self.meta
+                    .delete(&mut wtxn, KEY_GC_LEASE)
+                    .map_err(|e| FluxError::Meta(e.to_string()))?;
+            }
+        }
         self.put_sm_meta_raw(&mut wtxn, &snap.sm)?;
         wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     /// Load parent directory, optional generation CAS, then bump generation/mtime.
     fn load_and_bump_parent_dir(
         &self,
@@ -610,6 +646,7 @@ impl HeedMetaStore {
         Ok(parent_ino)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_in_txn(
         &self,
         wtxn: &mut heed::RwTxn,
@@ -939,6 +976,111 @@ impl HeedMetaStore {
         Ok(())
     }
 
+    fn gc_lease_in_txn(&self, txn: &heed::RoTxn<'_>) -> Result<Option<GcLeaseId>> {
+        self.meta
+            .get(txn, KEY_GC_LEASE)
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+            .map(u64_from_bytes)
+            .transpose()
+            .map(|lease| lease.map(GcLeaseId))
+    }
+
+    fn gc_plan_in_txn(&self, txn: &heed::RoTxn<'_>, lease_id: GcLeaseId) -> Result<GcPlan> {
+        let mut active = BTreeSet::new();
+        for item in self
+            .inodes
+            .iter(txn)
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+        {
+            let (_, bytes) = item.map_err(|e| FluxError::Meta(e.to_string()))?;
+            let inode: Inode =
+                serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))?;
+            if let Some(id) = inode.manifest_id {
+                active.insert(id.0);
+            }
+        }
+        let mut live_chunks = BTreeSet::<ChunkId>::new();
+        for id in active {
+            let Some(bytes) = self
+                .manifests
+                .get(txn, &inode_key(id))
+                .map_err(|e| FluxError::Meta(e.to_string()))?
+            else {
+                return Err(FluxError::Meta(format!("active manifest {id} is missing")));
+            };
+            let manifest: Manifest =
+                serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))?;
+            for extent in manifest.extents {
+                if let Extent::Local { chunk, .. } = extent {
+                    live_chunks.insert(chunk);
+                }
+            }
+        }
+        Ok(GcPlan {
+            lease_id,
+            live_chunks: live_chunks.into_iter().collect(),
+            removed_manifests: 0,
+        })
+    }
+
+    fn begin_gc_in_txn(&self, txn: &mut heed::RwTxn<'_>, lease_id: GcLeaseId) -> Result<GcPlan> {
+        if let Some(current) = self.gc_lease_in_txn(txn)? {
+            return if current == lease_id {
+                self.gc_plan_in_txn(txn, lease_id)
+            } else {
+                Err(FluxError::Busy)
+            };
+        }
+        self.meta
+            .put(txn, KEY_GC_LEASE, &u64_bytes(lease_id.0))
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+
+        let mut active = BTreeSet::new();
+        for item in self
+            .inodes
+            .iter(txn)
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+        {
+            let (_, bytes) = item.map_err(|e| FluxError::Meta(e.to_string()))?;
+            let inode: Inode =
+                serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))?;
+            if let Some(id) = inode.manifest_id {
+                active.insert(id.0);
+            }
+        }
+        let all: Vec<u64> = self
+            .manifests
+            .iter(txn)
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+            .map(|item| {
+                item.map_err(|e| FluxError::Meta(e.to_string()))
+                    .and_then(|(k, _)| u64_from_bytes(k))
+            })
+            .collect::<Result<_>>()?;
+        let mut removed = 0;
+        for id in all {
+            if !active.contains(&id) {
+                self.manifests
+                    .delete(txn, &inode_key(id))
+                    .map_err(|e| FluxError::Meta(e.to_string()))?;
+                removed += 1;
+            }
+        }
+        let mut plan = self.gc_plan_in_txn(txn, lease_id)?;
+        plan.removed_manifests = removed;
+        Ok(plan)
+    }
+
+    fn finish_gc_in_txn(&self, txn: &mut heed::RwTxn<'_>, lease_id: GcLeaseId) -> Result<()> {
+        if self.gc_lease_in_txn(txn)? != Some(lease_id) {
+            return Err(FluxError::Busy);
+        }
+        self.meta
+            .delete(txn, KEY_GC_LEASE)
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        Ok(())
+    }
+
     fn with_write_txn<T>(
         &self,
         operation: impl FnOnce(&Self, &mut heed::RwTxn<'_>) -> Result<T>,
@@ -951,6 +1093,9 @@ impl HeedMetaStore {
             .env
             .write_txn()
             .map_err(|e| FluxError::Meta(e.to_string()))?;
+        if self.gc_lease_in_txn(&wtxn)?.is_some() {
+            return Err(FluxError::Busy);
+        }
         let result = operation(self, &mut wtxn)?;
         wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
         Ok(result)
@@ -1103,6 +1248,9 @@ impl MetaStore for HeedMetaStore {
             .env
             .write_txn()
             .map_err(|e| FluxError::Meta(e.to_string()))?;
+        if self.gc_lease_in_txn(&wtxn)?.is_some() {
+            return Err(FluxError::Busy);
+        }
         put_inode_raw(&self.inodes, &mut wtxn, inode)?;
         wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
         Ok(())
@@ -1118,6 +1266,9 @@ impl MetaStore for HeedMetaStore {
             .env
             .write_txn()
             .map_err(|e| FluxError::Meta(e.to_string()))?;
+        if self.gc_lease_in_txn(&wtxn)?.is_some() {
+            return Err(FluxError::Busy);
+        }
         let id = self.put_manifest_in_txn(&mut wtxn, manifest)?;
         wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
         Ok(id)
@@ -1138,6 +1289,9 @@ impl MetaStore for HeedMetaStore {
             .env
             .write_txn()
             .map_err(|e| FluxError::Meta(e.to_string()))?;
+        if self.gc_lease_in_txn(&wtxn)?.is_some() {
+            return Err(FluxError::Busy);
+        }
         if !op_id.is_none() {
             if let Some(cached) = self.get_client_request_in_txn(&wtxn, &op_id.to_hex())? {
                 return match cached {
@@ -1255,6 +1409,44 @@ impl MetaStore for HeedMetaStore {
         Ok(result)
     }
 
+    fn begin_gc(&self, lease_id: GcLeaseId) -> Result<GcPlan> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| FluxError::Meta("write lock poisoned".into()))?;
+        let mut txn = self
+            .env
+            .write_txn()
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        let plan = self.begin_gc_in_txn(&mut txn, lease_id)?;
+        txn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
+        Ok(plan)
+    }
+
+    fn current_gc_plan(&self) -> Result<Option<GcPlan>> {
+        let txn = self
+            .env
+            .read_txn()
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        let Some(lease) = self.gc_lease_in_txn(&txn)? else {
+            return Ok(None);
+        };
+        self.gc_plan_in_txn(&txn, lease).map(Some)
+    }
+
+    fn finish_gc(&self, lease_id: GcLeaseId) -> Result<()> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| FluxError::Meta("write lock poisoned".into()))?;
+        let mut txn = self
+            .env
+            .write_txn()
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        self.finish_gc_in_txn(&mut txn, lease_id)?;
+        txn.commit().map_err(|e| FluxError::Meta(e.to_string()))
+    }
+
     fn import_external_with_id(
         &self,
         op_id: fluxfs_types::RequestOpId,
@@ -1272,6 +1464,9 @@ impl MetaStore for HeedMetaStore {
             .env
             .write_txn()
             .map_err(|e| FluxError::Meta(e.to_string()))?;
+        if self.gc_lease_in_txn(&wtxn)?.is_some() {
+            return Err(FluxError::Busy);
+        }
         if !op_id.is_none() {
             if let Some(cached) = self.get_client_request_in_txn(&wtxn, &op_id.to_hex())? {
                 return match cached {
@@ -1523,6 +1718,82 @@ mod tests {
             manifest.extents.as_slice(),
             [Extent::UfsRange { ufs_version, .. }] if ufs_version == &UfsVersion("new-etag".into())
         ));
+    }
+
+    #[test]
+    fn gc_lease_persists_blocks_mutations_and_reclaims_only_unreachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = GcLeaseId(42);
+        let live = ChunkId::from_bytes(b"live");
+        let orphan = ChunkId::from_bytes(b"orphan");
+        let active_mid;
+        let orphan_mid;
+        {
+            let store = HeedMetaStore::open(dir.path()).unwrap();
+            let file = store
+                .create(ROOT_INODE, "active", FileType::Regular, 0o644, 0, 0)
+                .unwrap();
+            let mut next = file.clone();
+            next.size = 4;
+            next.generation += 1;
+            next.head_gen = DataGen(2);
+            let active = Manifest {
+                inode: file.id,
+                gen: DataGen(2),
+                size: 4,
+                extents: vec![Extent::Local {
+                    offset: 0,
+                    len: 4,
+                    chunk: live,
+                }],
+            };
+            let committed = store
+                .commit_inode_manifest(file.generation, &next, &active)
+                .unwrap();
+            active_mid = committed.manifest_id.unwrap();
+            orphan_mid = store
+                .put_manifest(&Manifest {
+                    inode: file.id,
+                    gen: DataGen(1),
+                    size: 6,
+                    extents: vec![Extent::Local {
+                        offset: 0,
+                        len: 6,
+                        chunk: orphan,
+                    }],
+                })
+                .unwrap();
+
+            let plan = store.begin_gc(lease).unwrap();
+            assert_eq!(plan.live_chunks, vec![live]);
+            assert_eq!(plan.removed_manifests, 1);
+            assert_eq!(store.get_manifest(active_mid).unwrap(), active);
+            assert_eq!(store.get_manifest(orphan_mid), Err(FluxError::NotFound));
+            assert!(matches!(
+                store.create(ROOT_INODE, "blocked", FileType::Regular, 0o644, 0, 0),
+                Err(FluxError::Busy)
+            ));
+
+            let snapshot = store.export_snapshot(&SmAppliedMeta::default()).unwrap();
+            let restored_dir = tempfile::tempdir().unwrap();
+            let restored = HeedMetaStore::open(restored_dir.path()).unwrap();
+            restored.install_snapshot_data(&snapshot).unwrap();
+            let restored_plan = restored.current_gc_plan().unwrap().unwrap();
+            assert_eq!(restored_plan.lease_id, lease);
+            assert_eq!(restored_plan.live_chunks, vec![live]);
+        }
+
+        let store = HeedMetaStore::open(dir.path()).unwrap();
+        let resumed = store.current_gc_plan().unwrap().unwrap();
+        assert_eq!(resumed.lease_id, lease);
+        assert_eq!(resumed.live_chunks, vec![live]);
+        assert_eq!(resumed.removed_manifests, 0);
+        assert_eq!(store.finish_gc(GcLeaseId(99)), Err(FluxError::Busy));
+        store.finish_gc(lease).unwrap();
+        assert!(store.current_gc_plan().unwrap().is_none());
+        store
+            .create(ROOT_INODE, "unblocked", FileType::Regular, 0o644, 0, 0)
+            .unwrap();
     }
 
     #[test]
