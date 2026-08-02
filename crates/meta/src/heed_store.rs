@@ -1,6 +1,7 @@
 use crate::store::MetaStore;
 use fluxfs_types::{
-    Dentry, FileType, FluxError, Inode, InodeId, LocalityLabel, Result, ROOT_INODE,
+    BackingMode, DataGen, DataState, Dentry, FileType, FluxError, Inode, InodeId, LocalityFields,
+    LocalityLabel, OpState, Origin, Result, ROOT_INODE,
 };
 use heed::types::{Bytes, Str};
 use heed::{Database, Env, EnvOpenOptions};
@@ -63,9 +64,21 @@ impl HeedMetaStore {
                 atime_ms: now,
                 link_count: 2,
                 generation: 1,
+                head_gen: DataGen(1),
+                ufs_gen: DataGen(0),
+                ufs_base_version: None,
                 locality: LocalityLabel::Ephemeral,
+                locality_fields: Some(LocalityFields {
+                    backing_mode: BackingMode::Ephemeral,
+                    data_state: DataState::Ephemeral,
+                    op_state: OpState::None,
+                    origin: Origin::FluxCreated,
+                }),
                 ufs: None,
                 extent_root: None,
+                manifest_id: None,
+                flush_intent: None,
+                last_error: None,
             };
             put_inode_raw(&inodes, &mut wtxn, &root)?;
             meta.put(&mut wtxn, "next_inode", &u64_bytes(ROOT_INODE + 1))
@@ -207,9 +220,21 @@ impl MetaStore for HeedMetaStore {
                 1
             },
             generation: 1,
+            head_gen: DataGen(1),
+            ufs_gen: DataGen(0),
+            ufs_base_version: None,
             locality: LocalityLabel::Ephemeral,
+            locality_fields: Some(LocalityFields {
+                backing_mode: BackingMode::Ephemeral,
+                data_state: DataState::Ephemeral,
+                op_state: OpState::None,
+                origin: Origin::FluxCreated,
+            }),
             ufs: None,
             extent_root: None,
+            manifest_id: None,
+            flush_intent: None,
+            last_error: None,
         };
         put_inode_raw(&self.inodes, &mut wtxn, &inode)?;
         self.dentries
