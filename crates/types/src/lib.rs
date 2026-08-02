@@ -103,11 +103,54 @@ pub struct GcBatch {
     pub removed_manifests: usize,
 }
 
-/// Stable target slot in the configured ChunkStore topology. Dynamic Worker
-/// membership will replace slots with membership-issued IDs, but retry safety
-/// already requires the target set to be persisted before the first delete.
+/// Stable membership-issued Worker identity. It remains valid across endpoint
+/// reordering and is persisted in GC retry records and placement decisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct WorkerTargetId(pub u64);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerRegistration {
+    pub id: WorkerTargetId,
+    pub endpoint: String,
+    pub failure_domain: String,
+    pub capacity_bytes: u64,
+    pub available_bytes: u64,
+    /// Sampled by the leader before Raft proposal; apply never reads a clock.
+    pub lease_deadline_ms: u64,
+}
+
+impl WorkerRegistration {
+    pub fn validate(&self) -> Result<()> {
+        if self.id.0 == 0 {
+            return Err(FluxError::InvalidArg("worker id 0 is reserved".into()));
+        }
+        if self.endpoint.is_empty() || self.failure_domain.is_empty() {
+            return Err(FluxError::InvalidArg(
+                "worker endpoint and failure domain must be non-empty".into(),
+            ));
+        }
+        if self.capacity_bytes == 0 || self.available_bytes > self.capacity_bytes {
+            return Err(FluxError::InvalidArg(
+                "invalid worker capacity/available bytes".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerMembership {
+    pub epoch: u64,
+    pub workers: Vec<WorkerRegistration>,
+}
+
+impl WorkerMembership {
+    pub fn active_at(&self, now_ms: u64) -> impl Iterator<Item = &WorkerRegistration> {
+        self.workers
+            .iter()
+            .filter(move |worker| worker.lease_deadline_ms > now_ms)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GcTombstone {

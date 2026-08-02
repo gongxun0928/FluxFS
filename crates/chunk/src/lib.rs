@@ -5,6 +5,7 @@
 mod disk;
 mod foyer_store;
 mod pack;
+mod placement;
 mod remote;
 mod replicated;
 mod store;
@@ -12,6 +13,7 @@ mod store;
 pub use disk::DiskChunkStore;
 pub use foyer_store::FoyerChunkStore;
 pub use pack::CompactReport;
+pub use placement::select_worker_targets;
 pub use remote::{
     RemoteReplicatedChunkStore, RepairReport, DEFAULT_MAX_PENDING_CHUNK_OPS, REPAIR_PAGE_SIZE,
 };
