@@ -1,11 +1,12 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use fluxfs_chunk::{DiskChunkStore, FoyerChunkStore};
+use fluxfs_chunk::DiskChunkStore;
 use fluxfs_client::FluxClient;
 use fluxfs_meta::HeedMetaStore;
 use fluxfs_types::{FileType, ROOT_INODE};
 use fluxfs_ufs::Ufs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(name = "fluxfs", about = "FluxFS MVP co-located control binary")]
@@ -16,10 +17,22 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// W1 smoke: meta create/lookup + chunk put/get (+ optional local UFS HEAD).
+    /// Meta create/lookup + chunk put/get + local UFS HEAD smoke.
     Smoke {
         #[arg(long, default_value = "/tmp/fluxfs-smoke")]
         data_dir: PathBuf,
+    },
+    /// Mount Ephemeral FluxFS (`--no-ufs`) at a local path. Blocking.
+    Mount {
+        /// Persistent data directory (meta + authoritative chunks).
+        #[arg(long, default_value = "/tmp/fluxfs-data")]
+        data_dir: PathBuf,
+        /// Mount point (must exist and be empty/usable).
+        #[arg(long)]
+        mountpoint: PathBuf,
+        /// Required for v0.1 mount path (UFS-backed mount lands later).
+        #[arg(long, default_value_t = true)]
+        no_ufs: bool,
     },
     /// Print stack / topology freeze summary.
     Info,
@@ -34,17 +47,26 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Info => {
-            println!("FluxFS MVP W1");
+            println!("FluxFS MVP");
             println!("  repo: https://github.com/gongxun0928/FluxFS");
-            println!("  meta: openraft types + heed MetaStore (single-voter Raft next)");
-            println!("  chunk: DiskChunkStore + FoyerChunkStore hybrid facade");
+            println!("  meta: heed MetaStore + openraft type stub");
+            println!("  chunk: DiskChunkStore (authoritative); foyer facade optional");
             println!("  ufs: OpenDAL (local FS / S3)");
-            println!("  client: internal API; FUSE crate skeleton (linux)");
             println!("  fuse_supported: {}", fluxfs_fuse::mount_supported());
-            println!("  topology: crate-split Master/Worker, co-located binary");
+            println!("  mount: fluxfs mount --no-ufs --data-dir DIR --mountpoint MNT");
         }
         Cmd::Smoke { data_dir } => {
             run_smoke(data_dir).await?;
+        }
+        Cmd::Mount {
+            data_dir,
+            mountpoint,
+            no_ufs,
+        } => {
+            if !no_ufs {
+                bail!("v0.1 only supports --no-ufs (Ephemeral); UFS-backed mount is next");
+            }
+            run_mount(data_dir, mountpoint)?;
         }
     }
     Ok(())
@@ -57,39 +79,51 @@ async fn run_smoke(data_dir: PathBuf) -> Result<()> {
     std::fs::create_dir_all(&ufs_path)?;
 
     let meta = HeedMetaStore::open(&meta_path).context("open meta")?;
-    let chunks = FoyerChunkStore::open(&chunk_path, 1024).context("open chunks")?;
-    // Keep disk store path exercised too.
-    let _disk = DiskChunkStore::open(data_dir.join("chunks-disk")).context("open disk chunks")?;
-
+    let chunks = DiskChunkStore::open(&chunk_path).context("open chunks")?;
     let client = FluxClient::new(meta, chunks);
 
     let dir = client
-        .mkdir(ROOT_INODE, "testdir")
+        .mkdir(ROOT_INODE, "testdir", 0o755, 0, 0)
         .context("mkdir testdir")?;
     let file = client
-        .create_file(dir.id, "hello.txt")
+        .create_file(dir.id, "hello.txt", 0o644, 0, 0)
         .context("create hello.txt")?;
-    let looked = client
-        .lookup(dir.id, "hello.txt")
-        .context("lookup hello.txt")?;
-    assert_eq!(looked.id, file.id);
-    assert_eq!(looked.file_type, FileType::Regular);
-
-    let cid = client.put_chunk(b"hello fluxfs")?;
-    let data = client.get_chunk(&cid)?;
-    assert_eq!(data, b"hello fluxfs");
+    client
+        .write_at(file.id, 0, b"hello fluxfs")
+        .context("write")?;
+    let got = client.read_all(file.id).context("read")?;
+    assert_eq!(got, b"hello fluxfs");
+    assert_eq!(file.file_type, FileType::Regular);
 
     let ufs = Ufs::local(&ufs_path)?;
     let obj = ufs.write_full("obj.bin", b"ufs-bytes").await?;
     let head = ufs.head("obj.bin").await?;
     assert_eq!(head.size, obj.size);
-    assert_eq!(head.size, 9);
 
     println!("smoke ok");
     println!("  root={}", client.root());
-    println!("  file_inode={}", file.id);
-    println!("  chunk={}", cid.to_hex());
+    println!("  file_inode={} bytes={}", file.id, got.len());
     println!("  ufs_key={} size={}", head.key, head.size);
     println!("  meta_path={}", meta_path.display());
+    Ok(())
+}
+
+fn run_mount(data_dir: PathBuf, mountpoint: PathBuf) -> Result<()> {
+    if !fluxfs_fuse::mount_supported() {
+        bail!("FUSE mount only supported on Linux in this build");
+    }
+    std::fs::create_dir_all(&data_dir)?;
+    std::fs::create_dir_all(&mountpoint)?;
+    let meta = HeedMetaStore::open(data_dir.join("meta")).context("open meta")?;
+    // Authoritative durable store for Ephemeral (RF=2 multi-worker comes next).
+    let chunks = DiskChunkStore::open(data_dir.join("chunks")).context("open chunks")?;
+    let client = Arc::new(FluxClient::new(meta, chunks));
+    println!(
+        "mounting Ephemeral FluxFS data_dir={} mountpoint={}",
+        data_dir.display(),
+        mountpoint.display()
+    );
+    println!("basic check: echo hi > {0}/hi.txt && cat {0}/hi.txt", mountpoint.display());
+    fluxfs_fuse::mount_ephemeral(client, &mountpoint).context("fuse mount")?;
     Ok(())
 }

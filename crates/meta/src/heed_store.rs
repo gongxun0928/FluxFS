@@ -1,7 +1,7 @@
 use crate::store::MetaStore;
 use fluxfs_types::{
     BackingMode, DataGen, DataState, Dentry, FileType, FluxError, Inode, InodeId, LocalityFields,
-    LocalityLabel, OpState, Origin, Result, ROOT_INODE,
+    LocalityLabel, Manifest, ManifestId, OpState, Origin, Result, ROOT_INODE,
 };
 use heed::types::{Bytes, Str};
 use heed::{Database, Env, EnvOpenOptions};
@@ -12,12 +12,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 type InodeDb = Database<Bytes, Bytes>;
 type DentryDb = Database<Str, Bytes>;
 type MetaDb = Database<Str, Bytes>;
+type ManifestDb = Database<Bytes, Bytes>;
 
 pub struct HeedMetaStore {
     env: Env,
     inodes: InodeDb,
     dentries: DentryDb,
     meta: MetaDb,
+    manifests: ManifestDb,
     /// Serialize writers; LMDB allows one write txn at a time anyway.
     write_lock: Mutex<()>,
 }
@@ -28,7 +30,7 @@ impl HeedMetaStore {
         let env = unsafe {
             EnvOpenOptions::new()
                 .map_size(512 * 1024 * 1024)
-                .max_dbs(8)
+                .max_dbs(16)
                 .open(path.as_ref())
                 .map_err(|e| FluxError::Meta(e.to_string()))?
         };
@@ -44,6 +46,9 @@ impl HeedMetaStore {
             .map_err(|e| FluxError::Meta(e.to_string()))?;
         let meta: MetaDb = env
             .create_database(&mut wtxn, Some("meta"))
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        let manifests: ManifestDb = env
+            .create_database(&mut wtxn, Some("manifests"))
             .map_err(|e| FluxError::Meta(e.to_string()))?;
 
         if inodes
@@ -83,6 +88,15 @@ impl HeedMetaStore {
             put_inode_raw(&inodes, &mut wtxn, &root)?;
             meta.put(&mut wtxn, "next_inode", &u64_bytes(ROOT_INODE + 1))
                 .map_err(|e| FluxError::Meta(e.to_string()))?;
+            meta.put(&mut wtxn, "next_manifest", &u64_bytes(1))
+                .map_err(|e| FluxError::Meta(e.to_string()))?;
+        } else if meta
+            .get(&wtxn, "next_manifest")
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+            .is_none()
+        {
+            meta.put(&mut wtxn, "next_manifest", &u64_bytes(1))
+                .map_err(|e| FluxError::Meta(e.to_string()))?;
         }
 
         wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
@@ -92,8 +106,22 @@ impl HeedMetaStore {
             inodes,
             dentries,
             meta,
+            manifests,
             write_lock: Mutex::new(()),
         })
+    }
+
+    fn alloc_manifest_id(&self, wtxn: &mut heed::RwTxn) -> Result<ManifestId> {
+        let raw = self
+            .meta
+            .get(wtxn, "next_manifest")
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+            .ok_or_else(|| FluxError::Meta("missing next_manifest".into()))?;
+        let id = u64_from_bytes(raw)?;
+        self.meta
+            .put(wtxn, "next_manifest", &u64_bytes(id + 1))
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        Ok(ManifestId(id))
     }
 
     fn alloc_inode(&self, wtxn: &mut heed::RwTxn) -> Result<InodeId> {
@@ -297,6 +325,80 @@ impl MetaStore for HeedMetaStore {
             .write_txn()
             .map_err(|e| FluxError::Meta(e.to_string()))?;
         put_inode_raw(&self.inodes, &mut wtxn, inode)?;
+        wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
+        Ok(())
+    }
+
+    fn put_manifest(&self, manifest: &Manifest) -> Result<ManifestId> {
+        manifest.validate()?;
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| FluxError::Meta("write lock poisoned".into()))?;
+        let mut wtxn = self
+            .env
+            .write_txn()
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        let id = self.alloc_manifest_id(&mut wtxn)?;
+        let bytes = serde_json::to_vec(manifest).map_err(|e| FluxError::Meta(e.to_string()))?;
+        self.manifests
+            .put(&mut wtxn, &inode_key(id.0), &bytes)
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
+        Ok(id)
+    }
+
+    fn get_manifest(&self, id: ManifestId) -> Result<Manifest> {
+        let rtxn = self
+            .env
+            .read_txn()
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        let bytes = self
+            .manifests
+            .get(&rtxn, &inode_key(id.0))
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+            .ok_or(FluxError::NotFound)?
+            .to_vec();
+        drop(rtxn);
+        serde_json::from_slice(&bytes).map_err(|e| FluxError::Meta(e.to_string()))
+    }
+
+    fn unlink(&self, parent: InodeId, name: &str) -> Result<()> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| FluxError::Meta("write lock poisoned".into()))?;
+        let mut wtxn = self
+            .env
+            .write_txn()
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        let parent_bytes = self
+            .inodes
+            .get(&wtxn, &inode_key(parent))
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+            .ok_or(FluxError::NotFound)?
+            .to_vec();
+        let mut parent_ino: Inode =
+            serde_json::from_slice(&parent_bytes).map_err(|e| FluxError::Meta(e.to_string()))?;
+        if parent_ino.file_type != FileType::Directory {
+            return Err(FluxError::NotDirectory);
+        }
+        let key = dentry_key(parent, name);
+        if self
+            .dentries
+            .get(&wtxn, &key)
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+            .is_none()
+        {
+            return Err(FluxError::NotFound);
+        }
+        self.dentries
+            .delete(&mut wtxn, &key)
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        let now = now_ms();
+        parent_ino.mtime_ms = now;
+        parent_ino.ctime_ms = now;
+        put_inode_raw(&self.inodes, &mut wtxn, &parent_ino)?;
         wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
         Ok(())
     }

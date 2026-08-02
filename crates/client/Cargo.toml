@@ -11,3 +11,8 @@ fluxfs-meta = { workspace = true }
 fluxfs-chunk = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+fluxfs-chunk = { workspace = true }
+fluxfs-meta = { workspace = true }

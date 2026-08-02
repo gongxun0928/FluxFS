@@ -26,9 +26,17 @@ crates/
 ## Quick start
 
 ```bash
-cargo test -p fluxfs-meta -p fluxfs-chunk
+cargo test --workspace
 cargo run -p fluxfs -- info
 cargo run -p fluxfs -- smoke --data-dir /tmp/fluxfs-smoke
+
+# Ephemeral local mount (no UFS)
+mkdir -p /tmp/fluxfs-data /tmp/fluxfs-mnt
+cargo run -p fluxfs -- mount --no-ufs --data-dir /tmp/fluxfs-data --mountpoint /tmp/fluxfs-mnt
+# other terminal:
+#   echo hi > /tmp/fluxfs-mnt/hi.txt && cat /tmp/fluxfs-mnt/hi.txt
+# unmount:
+#   fusermount3 -u /tmp/fluxfs-mnt
 ```
 
 ## Locked product boundaries (alpha)

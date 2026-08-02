@@ -792,6 +792,7 @@ dependencies = [
  "fluxfs-meta",
  "fluxfs-types",
  "serde",
+ "tempfile",
  "thiserror 2.0.19",
 ]
 
@@ -799,7 +800,9 @@ dependencies = [
 name = "fluxfs-fuse"
 version = "0.1.0"
 dependencies = [
+ "fluxfs-chunk",
  "fluxfs-client",
+ "fluxfs-meta",
  "fluxfs-types",
  "fuser",
  "tracing",
