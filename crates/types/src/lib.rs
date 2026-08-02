@@ -12,6 +12,9 @@ use thiserror::Error;
 /// Per-record codec schema versioning envelope (C4, task #32).
 pub mod schema;
 
+/// Workload identity, principals, and authorization primitives (C1, task #30).
+pub mod auth;
+
 pub type InodeId = u64;
 pub type Generation = u64;
 
@@ -879,6 +882,15 @@ pub enum FluxError {
     Meta(String),
     #[error("ufs: {0}")]
     Ufs(String),
+    /// Caller did not authenticate (no/invalid client cert, anonymous mount
+    /// token on a non-bootstrap mutation). Maps to tonic `Unauthenticated`.
+    /// See task #30 C1.
+    #[error("unauthenticated: {0}")]
+    Unauthenticated(String),
+    /// Caller authenticated but lacks the required capability, or tenant/mount
+    /// token was denied. Maps to tonic `PermissionDenied`. See task #30 C1.
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
 }
 
 pub type Result<T> = std::result::Result<T, FluxError>;

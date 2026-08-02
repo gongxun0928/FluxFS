@@ -164,6 +164,12 @@ pub fn status_from_flux(err: FluxError) -> tonic::Status {
         FluxError::CasFailed { .. } | FluxError::DirtyConflict | FluxError::ReadOnly => {
             Code::FailedPrecondition
         }
+        // C1 auth errors (task #30): distinct codes so clients can branch on
+        // "re-present credentials" (Unauthenticated) vs "this principal can
+        // never do that" (PermissionDenied). Both are non-retryable without
+        // out-of-band action, matching cursor's A7 review (msg 36c528fc).
+        FluxError::Unauthenticated(_) => Code::Unauthenticated,
+        FluxError::Unauthorized(_) => Code::PermissionDenied,
         _ => Code::Internal,
     };
     // Attach the structured FluxError as tonic::Status details so clients can
@@ -194,6 +200,8 @@ pub fn flux_from_status(status: tonic::Status) -> FluxError {
         tonic::Code::ResourceExhausted => FluxError::Capability(status.message().to_string()),
         tonic::Code::Unavailable => FluxError::Busy,
         tonic::Code::FailedPrecondition => FluxError::Meta(status.message().to_string()),
+        tonic::Code::Unauthenticated => FluxError::Unauthenticated(status.message().to_string()),
+        tonic::Code::PermissionDenied => FluxError::Unauthorized(status.message().to_string()),
         _ => FluxError::Meta(status.to_string()),
     }
 }
@@ -236,6 +244,9 @@ mod tests {
             FluxError::Io("short read".into()),
             FluxError::Meta("raft apply".into()),
             FluxError::Ufs("s3 403".into()),
+            // C1 (task #30) auth variants: structured payload must survive.
+            FluxError::Unauthenticated("no client cert".into()),
+            FluxError::Unauthorized("worker cannot admin".into()),
         ];
         for err in cases {
             let decoded = roundtrip(err.clone());
@@ -275,6 +286,39 @@ mod tests {
         let status = tonic::Status::new(tonic::Code::Internal, "boom".to_string());
         let decoded = flux_from_status(status);
         assert!(matches!(decoded, FluxError::Meta(_)));
+    }
+
+    // ===== C1 auth-variant wire code tests (task #30) =====
+
+    #[test]
+    fn unauthenticated_maps_to_tonic_unauthenticated_code() {
+        // Code-level contract (cursor msg 36c528fc): clients must see
+        // Code::Unauthenticated so they can branch "re-present credentials"
+        // vs PermissionDenied's "this principal can never do that".
+        let status = status_from_flux(FluxError::Unauthenticated("no client cert".into()));
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[test]
+    fn unauthorized_maps_to_tonic_permission_denied_code() {
+        let status = status_from_flux(FluxError::Unauthorized("worker cannot admin".into()));
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn auth_codes_survive_lossy_backward_compat_path() {
+        // A client talking to an old server that emits only Code (no details)
+        // must still reconstruct a recognizable auth FluxError variant.
+        let unauth = flux_from_status(tonic::Status::new(
+            tonic::Code::Unauthenticated,
+            "no cert".to_string(),
+        ));
+        assert!(matches!(unauth, FluxError::Unauthenticated(_)));
+        let denied = flux_from_status(tonic::Status::new(
+            tonic::Code::PermissionDenied,
+            "no cap".to_string(),
+        ));
+        assert!(matches!(denied, FluxError::Unauthorized(_)));
     }
 
     // ===== Rolling-compat codec tests (C4 fix-forward) =====
