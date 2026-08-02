@@ -27,7 +27,7 @@ blake3 = "1.8"
 clap = { version = "4.6", features = ["derive"] }
 foyer = "0.22"
 fuser = "0.18"
-rocksdb = "0.23"
+heed = "0.22"
 opendal = { version = "0.58", features = ["services-fs", "services-s3"] }
 openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 proptest = "1.11"

@@ -2,8 +2,8 @@ use fluxfs_types::{Dentry, FileType, Inode, InodeId, Manifest, ManifestId, Resul
 
 /// Engine-agnostic metadata API frozen for W1.
 ///
-/// Implementations: [`crate::RocksMetaStore`] (default). Engine types must not
-/// leak into VFS callers.
+/// Implementations: [`crate::HeedMetaStore`] (default). Future: slatedb / Mantle-scale LSM
+/// must satisfy this trait without changing VFS callers.
 pub trait MetaStore: Send + Sync {
     fn root(&self) -> InodeId {
         ROOT_INODE

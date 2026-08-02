@@ -1,7 +1,7 @@
 //! openraft type configuration for MetaMaster.
 //!
 //! Single-voter bring-up: mutating MetaStore ops are logged as [`MetaRaftRequest`]
-//! and applied into [`crate::RocksMetaStore`].
+//! and applied into [`crate::HeedMetaStore`]. Reads stay on Heed directly.
 
 use openraft::declare_raft_types;
 use openraft::BasicNode;

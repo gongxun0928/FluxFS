@@ -3,13 +3,13 @@ name = "fluxfs-meta"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "MetaMaster: MetaStore trait, RocksDB backend, remote client, openraft single-voter"
+description = "MetaMaster: MetaStore trait, heed backend, remote client, openraft single-voter"
 
 [dependencies]
 fluxfs-types = { workspace = true }
 fluxfs-proto = { workspace = true }
+heed = { workspace = true }
 openraft = { workspace = true }
-rocksdb = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

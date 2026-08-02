@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use fluxfs_chunk::{ChunkStore, DiskChunkStore, RemoteReplicatedChunkStore, ReplicatedChunkStore};
 use fluxfs_client::FluxClient;
-use fluxfs_meta::{MetaStore, RemoteMetaStore, RocksMetaStore};
+use fluxfs_meta::{HeedMetaStore, MetaStore, RemoteMetaStore};
 use fluxfs_types::{FileType, ROOT_INODE};
 use fluxfs_ufs::Ufs;
 use std::path::PathBuf;
@@ -61,7 +61,7 @@ async fn main() -> Result<()> {
         Cmd::Info => {
             println!("FluxFS MVP");
             println!("  repo: https://github.com/gongxun0928/FluxFS");
-            println!("  meta: RocksDB MetaStore; remote via fluxfs-metamaster (tonic)");
+            println!("  meta: heed MetaStore; remote via fluxfs-metamaster (tonic)");
             println!("  chunk: ReplicatedChunkStore RF=2; Worker RPC next");
             println!("  ufs: OpenDAL (local FS / S3)");
             println!("  fuse_supported: {}", fluxfs_fuse::mount_supported());
@@ -98,7 +98,7 @@ async fn run_smoke(data_dir: PathBuf) -> Result<()> {
     let ufs_path = data_dir.join("ufs");
     std::fs::create_dir_all(&ufs_path)?;
 
-    let meta = RocksMetaStore::open(&meta_path).context("open meta")?;
+    let meta = HeedMetaStore::open(&meta_path).context("open meta")?;
     let chunks = DiskChunkStore::open(&chunk_path).context("open chunks")?;
     let client = FluxClient::new(meta, chunks);
 
@@ -186,7 +186,7 @@ fn mount_with_chunks<C: ChunkStore + 'static>(
         );
         fluxfs_fuse::mount_ephemeral(client, &mountpoint).context("fuse mount")?;
     } else {
-        let meta = RocksMetaStore::open(data_dir.join("meta")).context("open meta")?;
+        let meta = HeedMetaStore::open(data_dir.join("meta")).context("open meta")?;
         let client = Arc::new(FluxClient::new(meta, chunks));
         println!(
             "mounting Ephemeral FluxFS ({chunk_mode}) data_dir={} mountpoint={}",

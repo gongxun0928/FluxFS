@@ -1,6 +1,7 @@
-//! Bootstrap a single-voter MetaMaster Raft instance on RocksDB.
+//! Bootstrap a single-voter MetaMaster Raft instance.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,17 +10,25 @@ use openraft::error::RaftError;
 use openraft::BasicNode;
 use openraft::Config;
 
-use crate::raft_log_store::RocksRaftLogStore;
+use crate::heed_store::HeedMetaStore;
+use crate::raft_log_store::{HeedRaftLogStore, HeedRaftStore};
 use crate::raft_network::StubNetwork;
 use crate::raft_sm::MetaStateMachine;
 use crate::raft_types::{FluxRaft, NodeId};
-use crate::rocks_store::RocksMetaStore;
 use fluxfs_types::{FluxError, Result};
 
+/// Default single-voter node id.
 pub const SINGLE_VOTER_ID: NodeId = 1;
 
-/// Start openraft with one voter on the shared RocksDB behind `store`.
-pub async fn start_single_voter(store: Arc<RocksMetaStore>, advertise: &str) -> Result<FluxRaft> {
+/// Start openraft with one voter, wait until this node is leader.
+///
+/// Raft vote/log live under `raft_dir` (heed). SM applied markers and inode
+/// state live in [`HeedMetaStore`] (same write txn on normal apply).
+pub async fn start_single_voter(
+    store: Arc<HeedMetaStore>,
+    raft_dir: impl AsRef<Path>,
+    advertise: &str,
+) -> Result<FluxRaft> {
     let mut config = Config {
         cluster_name: "fluxfs-meta".into(),
         election_timeout_min: 150,
@@ -36,7 +45,8 @@ pub async fn start_single_voter(store: Arc<RocksMetaStore>, advertise: &str) -> 
             .map_err(|e| FluxError::Meta(format!("raft config: {e}")))?,
     );
 
-    let log_store = RocksRaftLogStore::new(store.db());
+    let raft_store = Arc::new(HeedRaftStore::open(raft_dir)?);
+    let log_store = HeedRaftLogStore::new(raft_store);
     let state_machine =
         MetaStateMachine::new(store).map_err(|e| FluxError::Meta(format!("raft sm: {e}")))?;
     let network = StubNetwork;
@@ -76,7 +86,6 @@ pub async fn start_single_voter(store: Arc<RocksMetaStore>, advertise: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft_sm::MetaStateMachine;
     use crate::raft_types::{MetaRaftRequest, MetaRaftResponse};
     use crate::store::MetaStore;
     use fluxfs_types::{FileType, ROOT_INODE};
@@ -85,8 +94,8 @@ mod tests {
     #[tokio::test]
     async fn single_voter_create_via_raft() {
         let dir = tempdir().unwrap();
-        let store = Arc::new(RocksMetaStore::open(dir.path()).unwrap());
-        let raft = start_single_voter(store.clone(), "127.0.0.1:0")
+        let store = Arc::new(HeedMetaStore::open(dir.path().join("meta")).unwrap());
+        let raft = start_single_voter(store.clone(), dir.path().join("raft"), "127.0.0.1:0")
             .await
             .expect("start raft");
 
@@ -126,17 +135,17 @@ mod tests {
             duplicate.data,
             MetaRaftResponse::Err(FluxError::AlreadyExists)
         ));
-        raft.shutdown().await.expect("shutdown");
     }
 
     #[tokio::test]
     async fn single_voter_survives_process_restart() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("meta");
+        let meta_path = dir.path().join("meta");
+        let raft_path = dir.path().join("raft");
 
         {
-            let store = Arc::new(RocksMetaStore::open(&path).unwrap());
-            let raft = start_single_voter(store.clone(), "127.0.0.1:0")
+            let store = Arc::new(HeedMetaStore::open(&meta_path).unwrap());
+            let raft = start_single_voter(store.clone(), &raft_path, "127.0.0.1:0")
                 .await
                 .expect("start raft");
             raft.client_write(MetaRaftRequest::Create {
@@ -149,16 +158,19 @@ mod tests {
             })
             .await
             .expect("create");
+            // Explicit shutdown so heed env releases the map.
             raft.shutdown().await.expect("shutdown");
         }
 
-        let store = Arc::new(RocksMetaStore::open(&path).unwrap());
-        let looked = store.lookup(ROOT_INODE, "persist.txt").expect("durable");
+        let store = Arc::new(HeedMetaStore::open(&meta_path).unwrap());
+        let looked = store
+            .lookup(ROOT_INODE, "persist.txt")
+            .expect("heed durable");
         assert_eq!(looked.file_type, FileType::Regular);
 
-        let raft = start_single_voter(store.clone(), "127.0.0.1:0")
+        let raft = start_single_voter(store.clone(), &raft_path, "127.0.0.1:0")
             .await
-            .expect("restart raft");
+            .expect("restart raft from durable log");
         assert!(raft.is_initialized().await.expect("initialized"));
 
         let resp = raft
@@ -176,14 +188,13 @@ mod tests {
         store
             .lookup(ROOT_INODE, "after-restart.txt")
             .expect("visible after restart write");
-        raft.shutdown().await.expect("shutdown");
     }
 
     #[tokio::test]
     async fn snapshot_roundtrip_restores_inodes() {
         let dir = tempdir().unwrap();
-        let store = Arc::new(RocksMetaStore::open(dir.path().join("meta")).unwrap());
-        let raft = start_single_voter(store.clone(), "127.0.0.1:0")
+        let store = Arc::new(HeedMetaStore::open(dir.path().join("meta")).unwrap());
+        let raft = start_single_voter(store.clone(), dir.path().join("raft"), "127.0.0.1:0")
             .await
             .expect("start raft");
         raft.client_write(MetaRaftRequest::Create {
@@ -204,8 +215,13 @@ mod tests {
             builder.build_snapshot().await.expect("build snapshot")
         };
         assert!(snapshot.snapshot.get_ref().len() > 20);
+        assert!(!snapshot
+            .snapshot
+            .get_ref()
+            .starts_with(b"fluxfs-meta-snapshot"));
 
-        let empty = Arc::new(RocksMetaStore::open(dir.path().join("meta2")).unwrap());
+        // Wipe app state then install snapshot.
+        let empty = Arc::new(HeedMetaStore::open(dir.path().join("meta2")).unwrap());
         let mut sm2 = MetaStateMachine::new(empty.clone()).expect("sm2");
         use openraft::storage::RaftStateMachine;
         sm2.install_snapshot(&snapshot.meta, snapshot.snapshot)
@@ -214,6 +230,7 @@ mod tests {
         empty
             .lookup(ROOT_INODE, "snap.txt")
             .expect("restored from snapshot");
+        let _ = sm; // keep first sm alive until after build
         raft.shutdown().await.expect("shutdown");
     }
 }

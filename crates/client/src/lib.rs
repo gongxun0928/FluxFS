@@ -252,12 +252,12 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use fluxfs_chunk::DiskChunkStore;
-    use fluxfs_meta::RocksMetaStore;
+    use fluxfs_meta::HeedMetaStore;
 
     #[test]
     fn write_read_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let meta = RocksMetaStore::open(dir.path().join("meta")).unwrap();
+        let meta = HeedMetaStore::open(dir.path().join("meta")).unwrap();
         let chunks = DiskChunkStore::open(dir.path().join("chunks")).unwrap();
         let client = FluxClient::new(meta, chunks);
         let f = client
@@ -274,7 +274,7 @@ mod tests {
     #[test]
     fn write_splits_file_at_chunk_boundary() {
         let dir = tempfile::tempdir().unwrap();
-        let meta = RocksMetaStore::open(dir.path().join("meta")).unwrap();
+        let meta = HeedMetaStore::open(dir.path().join("meta")).unwrap();
         let chunks = DiskChunkStore::open(dir.path().join("chunks")).unwrap();
         let client = FluxClient::new(meta, chunks);
         let file = client

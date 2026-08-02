@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use fluxfs_meta::{
-    start_single_voter, FluxRaft, MetaRaftRequest, MetaRaftResponse, MetaStore, RocksMetaStore,
+    start_single_voter, FluxRaft, HeedMetaStore, MetaRaftRequest, MetaRaftResponse, MetaStore,
 };
 use fluxfs_proto::meta::v1::{
     CreateRequest, CreateResponse, GetInodeRequest, GetInodeResponse, GetManifestRequest,
@@ -23,10 +23,10 @@ use tonic::{Request, Response, Status};
 #[derive(Parser, Debug)]
 #[command(
     name = "fluxfs-metamaster",
-    about = "FluxFS MetaMaster (RocksDB + openraft single-voter + tonic)"
+    about = "FluxFS MetaMaster (heed + openraft single-voter + tonic)"
 )]
 struct Cli {
-    /// Persist MetaStore / Raft RocksDB directory.
+    /// Persist MetaStore (heed) directory.
     #[arg(long, default_value = "/tmp/fluxfs-meta")]
     data_dir: PathBuf,
     /// Listen address, e.g. 127.0.0.1:50051
@@ -35,7 +35,7 @@ struct Cli {
 }
 
 struct MetaSvc {
-    store: Arc<RocksMetaStore>,
+    store: Arc<HeedMetaStore>,
     raft: FluxRaft,
 }
 
@@ -209,15 +209,17 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     std::fs::create_dir_all(&cli.data_dir)?;
-    let store = Arc::new(RocksMetaStore::open(&cli.data_dir).context("open rocksdb meta")?);
-    let raft = start_single_voter(store.clone(), &cli.listen.to_string())
+    let store = Arc::new(HeedMetaStore::open(&cli.data_dir).context("open heed meta")?);
+    let raft_dir = cli.data_dir.join("raft");
+    let raft = start_single_voter(store.clone(), &raft_dir, &cli.listen.to_string())
         .await
         .context("start openraft single-voter")?;
     let svc = MetaSvc { store, raft };
     println!(
-        "fluxfs-metamaster listening on {} data_dir={} raft=single-voter rocksdb",
+        "fluxfs-metamaster listening on {} data_dir={} raft=single-voter durable_log={}",
         cli.listen,
-        cli.data_dir.display()
+        cli.data_dir.display(),
+        raft_dir.display()
     );
     tonic::transport::Server::builder()
         .add_service(MetaServiceServer::new(svc))

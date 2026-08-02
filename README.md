@@ -7,7 +7,7 @@ Unified write-cache (JuiceFS-like) + transparent UFS read (Alluxio-like) filesys
 ## Status
 
 The current MVP can mount a local Ephemeral (`--no-ufs`) filesystem. Metadata
-is persisted with RocksDB; authoritative chunks are acknowledged after two local
+is persisted with heed; authoritative chunks are acknowledged after two local
 replicas durably store and checksum them. Basic create/read/write, random write,
 truncate, mkdir/readdir, unlink, unmount/remount, process-crash recovery, and
 single-replica read fallback are executable. UFS-backed lazy read/write-back
@@ -18,10 +18,10 @@ three ChunkWorkers, and one FUSE/client. Meta and chunk traffic use tonic/TCP;
 worker-0/1 form the initial RF=2 set and worker-2 is a repair spare. A Worker
 topology change triggers a checksum-valid inventory sweep before the next write;
 missing replicas are copied to healthy Workers until RF=2 is restored.
-Meta writes pass through an OpenRaft single-voter on a shared RocksDB (CFs for
-vote/log/SM). Mutations and `last_applied` commit in one WriteBatch; snapshots
-export/import full meta state. Chunk blobs stay on-disk files. Multi-voter HA
-remains next.
+Meta writes pass through an OpenRaft single-voter state machine. Vote/log live
+under `meta/raft/`; inode mutations and SM `last_applied` commit in one MetaStore
+write txn. Snapshots export/import full inode/dentry/manifest state. This is
+durable single-voter recovery, not multi-voter metadata HA.
 
 Design: [`docs/mvp-v0.1.md`](docs/mvp-v0.1.md) · Alpha gates: [`docs/alpha-checklist.md`](docs/alpha-checklist.md)
 
@@ -30,9 +30,9 @@ Design: [`docs/mvp-v0.1.md`](docs/mvp-v0.1.md) · Alpha gates: [`docs/alpha-chec
 ```
 crates/
   types/    shared inode/dentry/chunk types
-  meta/     MetaStore trait, RocksDB backend, openraft single-voter wiring
+  meta/     MetaStore trait, heed backend, openraft single-voter wiring
   proto/    tonic/protobuf Meta and ChunkWorker contracts
-  metamaster/ independent RocksDB + tonic metadata process
+  metamaster/ independent heed + tonic metadata process
   chunk/    RF=2 authoritative disk store + evictable foyer facade
   chunkworker/ independent durable chunk process
   ufs/      OpenDAL adapter
