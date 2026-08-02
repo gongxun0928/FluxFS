@@ -3,7 +3,7 @@ name = "fluxfs-metamaster"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "FluxFS MetaMaster process: heed MetaStore + tonic MetaService"
+description = "FluxFS MetaMaster process: RocksDB MetaStore + tonic MetaService"
 
 [[bin]]
 name = "fluxfs-metamaster"

@@ -1,6 +1,6 @@
-//! Raft state machine: apply meta mutations into [`HeedMetaStore`].
+//! Raft state machine over [`RocksMetaStore`].
 
-#![allow(clippy::result_large_err)] // openraft StorageError is large by design
+#![allow(clippy::result_large_err)]
 
 use std::io::Cursor;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,8 +13,8 @@ use openraft::{
 };
 use tokio::sync::RwLock;
 
-use crate::heed_store::HeedMetaStore;
 use crate::raft_types::{FluxRaftTypeConfig, MetaRaftResponse, NodeId, SmAppliedMeta};
+use crate::rocks_store::RocksMetaStore;
 
 #[derive(Debug)]
 struct StoredSnapshot {
@@ -22,18 +22,15 @@ struct StoredSnapshot {
     data: Vec<u8>,
 }
 
-/// State machine backed by durable Heed for inode/dentry/manifest.
-///
-/// Normal applies persist mutation + `last_applied` in one MetaStore write txn.
 pub struct MetaStateMachine {
-    store: Arc<HeedMetaStore>,
+    store: Arc<RocksMetaStore>,
     meta: RwLock<SmAppliedMeta>,
     snapshot_idx: AtomicU64,
     current_snapshot: RwLock<Option<StoredSnapshot>>,
 }
 
 impl MetaStateMachine {
-    pub fn new(store: Arc<HeedMetaStore>) -> Result<Arc<Self>, StorageError<NodeId>> {
+    pub fn new(store: Arc<RocksMetaStore>) -> Result<Arc<Self>, StorageError<NodeId>> {
         let sm_meta = store.load_sm_meta().map_err(|e| {
             StorageError::from(StorageIOError::<NodeId>::read_state_machine(
                 &std::io::Error::other(e.to_string()),
@@ -159,7 +156,7 @@ impl RaftStateMachine<FluxRaftTypeConfig> for Arc<MetaStateMachine> {
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
         let data = snapshot.into_inner();
-        let snap: crate::heed_store::MetaSnapshotData =
+        let snap: crate::rocks_store::MetaSnapshotData =
             serde_json::from_slice(&data).map_err(|e| {
                 StorageError::from(StorageIOError::<NodeId>::read_snapshot(
                     Some(meta.signature()),
@@ -175,7 +172,6 @@ impl RaftStateMachine<FluxRaftTypeConfig> for Arc<MetaStateMachine> {
 
         let mut sm = self.meta.write().await;
         *sm = snap.sm;
-        // Prefer snapshot meta's applied markers if present.
         sm.last_applied_log = meta.last_log_id.or(sm.last_applied_log);
         sm.last_membership = meta.last_membership.clone();
         self.store.save_sm_meta_only(&sm).map_err(|e| {

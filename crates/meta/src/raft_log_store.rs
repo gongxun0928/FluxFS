@@ -1,18 +1,12 @@
-//! Heed-backed `RaftLogStorage` for MetaMaster.
-//!
-//! Stores vote / log entries / committed / last_purged under `meta/raft/`.
-//! SM applied markers live in [`crate::HeedMetaStore`] for same-txn apply.
+//! RocksDB-backed `RaftLogStorage` (CF `meta` + `logs` on shared DB).
 
-#![allow(clippy::result_large_err)] // openraft StorageError is large by design
+#![allow(clippy::result_large_err)]
 #![allow(clippy::redundant_closure)]
 
 use std::fmt::Debug;
 use std::ops::RangeBounds;
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use heed::types::{Bytes, Str};
-use heed::{Database, Env, EnvOpenOptions};
 use openraft::storage::LogFlushed;
 use openraft::storage::RaftLogStorage;
 use openraft::Entry;
@@ -23,53 +17,14 @@ use openraft::RaftLogReader;
 use openraft::StorageError;
 use openraft::StorageIOError;
 use openraft::Vote;
+use rocksdb::{Direction, IteratorMode, WriteBatch, WriteOptions, DB};
 
 use crate::raft_types::{FluxRaftTypeConfig, NodeId};
-use fluxfs_types::{FluxError, Result as FluxResult};
+use crate::rocks_store::{CF_LOGS, CF_META};
 
-type LogDb = Database<Bytes, Bytes>;
-type MetaDb = Database<Str, Bytes>;
-
-const KEY_VOTE: &str = "vote";
-const KEY_COMMITTED: &str = "committed";
-const KEY_LAST_PURGED: &str = "last_purged";
-
-/// Durable Raft vote/log store (heed env under `meta/raft/`).
-pub struct HeedRaftStore {
-    env: Env,
-    logs: LogDb,
-    meta: MetaDb,
-    write_lock: Mutex<()>,
-}
-
-impl HeedRaftStore {
-    pub fn open(path: impl AsRef<Path>) -> FluxResult<Self> {
-        std::fs::create_dir_all(path.as_ref()).map_err(|e| FluxError::Io(e.to_string()))?;
-        let env = unsafe {
-            EnvOpenOptions::new()
-                .map_size(256 * 1024 * 1024)
-                .max_dbs(8)
-                .open(path.as_ref())
-                .map_err(|e| FluxError::Meta(format!("open raft heed: {e}")))?
-        };
-        let mut wtxn = env
-            .write_txn()
-            .map_err(|e| FluxError::Meta(e.to_string()))?;
-        let logs: LogDb = env
-            .create_database(&mut wtxn, Some("raft_logs"))
-            .map_err(|e| FluxError::Meta(e.to_string()))?;
-        let meta: MetaDb = env
-            .create_database(&mut wtxn, Some("raft_meta"))
-            .map_err(|e| FluxError::Meta(e.to_string()))?;
-        wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
-        Ok(Self {
-            env,
-            logs,
-            meta,
-            write_lock: Mutex::new(()),
-        })
-    }
-}
+const KEY_VOTE: &[u8] = b"vote";
+const KEY_COMMITTED: &[u8] = b"committed";
+const KEY_LAST_PURGED: &[u8] = b"last_purged";
 
 fn io_logs(e: impl ToString) -> StorageError<NodeId> {
     StorageError::from(StorageIOError::<NodeId>::write_logs(
@@ -93,24 +48,37 @@ fn index_key(index: u64) -> [u8; 8] {
     index.to_be_bytes()
 }
 
-/// Cloneable RaftLogStorage façade over [`HeedRaftStore`].
-#[derive(Clone)]
-pub struct HeedRaftLogStore {
-    inner: Arc<HeedRaftStore>,
+fn sync_write(db: &DB, batch: WriteBatch) -> Result<(), StorageError<NodeId>> {
+    let mut wo = WriteOptions::default();
+    wo.set_sync(true);
+    db.write_opt(batch, &wo).map_err(|e| io_logs(e))
 }
 
-impl HeedRaftLogStore {
-    pub fn new(inner: Arc<HeedRaftStore>) -> Self {
-        Self { inner }
+/// Cloneable RaftLogStorage over the shared RocksDB.
+#[derive(Clone)]
+pub struct RocksRaftLogStore {
+    db: Arc<DB>,
+}
+
+impl RocksRaftLogStore {
+    pub fn new(db: Arc<DB>) -> Self {
+        Self { db }
+    }
+
+    fn cf_meta(&self) -> &rocksdb::ColumnFamily {
+        self.db.cf_handle(CF_META).expect("cf meta")
+    }
+
+    fn cf_logs(&self) -> &rocksdb::ColumnFamily {
+        self.db.cf_handle(CF_LOGS).expect("cf logs")
     }
 }
 
-impl RaftLogReader<FluxRaftTypeConfig> for HeedRaftLogStore {
+impl RaftLogReader<FluxRaftTypeConfig> for RocksRaftLogStore {
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug>(
         &mut self,
         range: RB,
     ) -> Result<Vec<Entry<FluxRaftTypeConfig>>, StorageError<NodeId>> {
-        let rtxn = self.inner.env.read_txn().map_err(|e| io_read_logs(e))?;
         let start = match range.start_bound() {
             std::ops::Bound::Included(&i) => i,
             std::ops::Bound::Excluded(&i) => i.saturating_add(1),
@@ -121,58 +89,56 @@ impl RaftLogReader<FluxRaftTypeConfig> for HeedRaftLogStore {
             std::ops::Bound::Excluded(&i) => i.checked_sub(1),
             std::ops::Bound::Unbounded => None,
         };
-
+        let cf = self.cf_logs();
         let mut out = Vec::new();
-        let iter = self.inner.logs.iter(&rtxn).map_err(|e| io_read_logs(e))?;
+        let iter = self.db.iterator_cf(
+            cf,
+            IteratorMode::From(&index_key(start), Direction::Forward),
+        );
         for item in iter {
             let (k, v) = item.map_err(|e| io_read_logs(e))?;
             if k.len() != 8 {
                 continue;
             }
-            let idx = u64::from_be_bytes(k.try_into().map_err(|_| io_read_logs("bad log key"))?);
-            if idx < start {
-                continue;
-            }
+            let idx =
+                u64::from_be_bytes(k.as_ref().try_into().map_err(|_| io_read_logs("bad key"))?);
             if let Some(end) = end_inclusive {
                 if idx > end {
                     break;
                 }
             }
             let entry: Entry<FluxRaftTypeConfig> =
-                serde_json::from_slice(v).map_err(|e| io_read_logs(e))?;
+                serde_json::from_slice(&v).map_err(|e| io_read_logs(e))?;
             out.push(entry);
         }
         Ok(out)
     }
 }
 
-impl RaftLogStorage<FluxRaftTypeConfig> for HeedRaftLogStore {
+impl RaftLogStorage<FluxRaftTypeConfig> for RocksRaftLogStore {
     type LogReader = Self;
 
     async fn get_log_state(
         &mut self,
     ) -> Result<LogState<FluxRaftTypeConfig>, StorageError<NodeId>> {
-        let rtxn = self.inner.env.read_txn().map_err(|e| io_read_logs(e))?;
+        let cf_meta = self.cf_meta();
         let last_purged = match self
-            .inner
-            .meta
-            .get(&rtxn, KEY_LAST_PURGED)
+            .db
+            .get_cf(cf_meta, KEY_LAST_PURGED)
             .map_err(|e| io_read_logs(e))?
         {
-            Some(bytes) => Some(serde_json::from_slice(bytes).map_err(|e| io_read_logs(e))?),
+            Some(bytes) => Some(serde_json::from_slice(&bytes).map_err(|e| io_read_logs(e))?),
             None => None,
         };
-        let last = {
-            let mut last = None;
-            let iter = self.inner.logs.iter(&rtxn).map_err(|e| io_read_logs(e))?;
-            for item in iter {
-                let (_k, v) = item.map_err(|e| io_read_logs(e))?;
-                let entry: Entry<FluxRaftTypeConfig> =
-                    serde_json::from_slice(v).map_err(|e| io_read_logs(e))?;
-                last = Some(*entry.get_log_id());
-            }
-            last
-        };
+        let cf_logs = self.cf_logs();
+        let mut last = None;
+        let iter = self.db.iterator_cf(cf_logs, IteratorMode::End);
+        if let Some(item) = iter.into_iter().next() {
+            let (_k, v) = item.map_err(|e| io_read_logs(e))?;
+            let entry: Entry<FluxRaftTypeConfig> =
+                serde_json::from_slice(&v).map_err(|e| io_read_logs(e))?;
+            last = Some(*entry.get_log_id());
+        }
         let last_log_id = match last {
             None => last_purged,
             Some(x) => Some(x),
@@ -187,61 +153,50 @@ impl RaftLogStorage<FluxRaftTypeConfig> for HeedRaftLogStore {
         &mut self,
         committed: Option<LogId<NodeId>>,
     ) -> Result<(), StorageError<NodeId>> {
-        let _guard = self
-            .inner
-            .write_lock
-            .lock()
-            .map_err(|_| io_logs("write lock poisoned"))?;
-        let mut wtxn = self.inner.env.write_txn().map_err(|e| io_logs(e))?;
-        let bytes = serde_json::to_vec(&committed).map_err(|e| io_logs(e))?;
-        self.inner
-            .meta
-            .put(&mut wtxn, KEY_COMMITTED, &bytes)
-            .map_err(|e| io_logs(e))?;
-        wtxn.commit().map_err(|e| io_logs(e))?;
-        Ok(())
+        let mut batch = WriteBatch::default();
+        batch.put_cf(
+            self.cf_meta(),
+            KEY_COMMITTED,
+            serde_json::to_vec(&committed).map_err(|e| io_logs(e))?,
+        );
+        sync_write(&self.db, batch)
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
-        let rtxn = self.inner.env.read_txn().map_err(|e| io_read_logs(e))?;
         match self
-            .inner
-            .meta
-            .get(&rtxn, KEY_COMMITTED)
+            .db
+            .get_cf(self.cf_meta(), KEY_COMMITTED)
             .map_err(|e| io_read_logs(e))?
         {
             Some(bytes) => Ok(Some(
-                serde_json::from_slice(bytes).map_err(|e| io_read_logs(e))?,
+                serde_json::from_slice(&bytes).map_err(|e| io_read_logs(e))?,
             )),
             None => Ok(None),
         }
     }
 
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
-        let _guard = self
-            .inner
-            .write_lock
-            .lock()
-            .map_err(|_| io_vote("write lock poisoned"))?;
-        let mut wtxn = self.inner.env.write_txn().map_err(|e| io_vote(e))?;
-        let bytes = serde_json::to_vec(vote).map_err(|e| io_vote(e))?;
-        self.inner
-            .meta
-            .put(&mut wtxn, KEY_VOTE, &bytes)
-            .map_err(|e| io_vote(e))?;
-        wtxn.commit().map_err(|e| io_vote(e))?;
+        let mut batch = WriteBatch::default();
+        batch.put_cf(
+            self.cf_meta(),
+            KEY_VOTE,
+            serde_json::to_vec(vote).map_err(|e| io_vote(e))?,
+        );
+        let mut wo = WriteOptions::default();
+        wo.set_sync(true);
+        self.db.write_opt(batch, &wo).map_err(|e| io_vote(e))?;
         Ok(())
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
-        let rtxn = self.inner.env.read_txn().map_err(|e| io_vote(e))?;
         match self
-            .inner
-            .meta
-            .get(&rtxn, KEY_VOTE)
+            .db
+            .get_cf(self.cf_meta(), KEY_VOTE)
             .map_err(|e| io_vote(e))?
         {
-            Some(bytes) => Ok(Some(serde_json::from_slice(bytes).map_err(|e| io_vote(e))?)),
+            Some(bytes) => Ok(Some(
+                serde_json::from_slice(&bytes).map_err(|e| io_vote(e))?,
+            )),
             None => Ok(None),
         }
     }
@@ -254,92 +209,56 @@ impl RaftLogStorage<FluxRaftTypeConfig> for HeedRaftLogStore {
     where
         I: IntoIterator<Item = Entry<FluxRaftTypeConfig>>,
     {
-        let _guard = self
-            .inner
-            .write_lock
-            .lock()
-            .map_err(|_| io_logs("write lock poisoned"))?;
-        let mut wtxn = self.inner.env.write_txn().map_err(|e| io_logs(e))?;
+        let mut batch = WriteBatch::default();
+        let cf = self.cf_logs();
         for entry in entries {
-            let key = index_key(entry.get_log_id().index);
-            let bytes = serde_json::to_vec(&entry).map_err(|e| io_logs(e))?;
-            self.inner
-                .logs
-                .put(&mut wtxn, &key, &bytes)
-                .map_err(|e| io_logs(e))?;
+            batch.put_cf(
+                cf,
+                index_key(entry.get_log_id().index),
+                serde_json::to_vec(&entry).map_err(|e| io_logs(e))?,
+            );
         }
-        wtxn.commit().map_err(|e| io_logs(e))?;
+        sync_write(&self.db, batch)?;
         callback.log_io_completed(Ok(()));
         Ok(())
     }
 
     async fn truncate(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
-        let _guard = self
-            .inner
-            .write_lock
-            .lock()
-            .map_err(|_| io_logs("write lock poisoned"))?;
-        let mut wtxn = self.inner.env.write_txn().map_err(|e| io_logs(e))?;
-        let keys: Vec<[u8; 8]> = {
-            let mut keys = Vec::new();
-            let iter = self.inner.logs.iter(&wtxn).map_err(|e| io_logs(e))?;
-            for item in iter {
-                let (k, _) = item.map_err(|e| io_logs(e))?;
-                if k.len() != 8 {
-                    continue;
-                }
-                let idx = u64::from_be_bytes(k.try_into().map_err(|_| io_logs("bad log key"))?);
-                if idx >= log_id.index {
-                    keys.push(idx.to_be_bytes());
-                }
-            }
-            keys
-        };
-        for key in keys {
-            self.inner
-                .logs
-                .delete(&mut wtxn, &key)
-                .map_err(|e| io_logs(e))?;
+        let cf = self.cf_logs();
+        let mut batch = WriteBatch::default();
+        let iter = self.db.iterator_cf(
+            cf,
+            IteratorMode::From(&index_key(log_id.index), Direction::Forward),
+        );
+        for item in iter {
+            let (k, _) = item.map_err(|e| io_logs(e))?;
+            batch.delete_cf(cf, k);
         }
-        wtxn.commit().map_err(|e| io_logs(e))?;
-        Ok(())
+        sync_write(&self.db, batch)
     }
 
     async fn purge(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
-        let _guard = self
-            .inner
-            .write_lock
-            .lock()
-            .map_err(|_| io_logs("write lock poisoned"))?;
-        let mut wtxn = self.inner.env.write_txn().map_err(|e| io_logs(e))?;
-        let purged_bytes = serde_json::to_vec(&log_id).map_err(|e| io_logs(e))?;
-        self.inner
-            .meta
-            .put(&mut wtxn, KEY_LAST_PURGED, &purged_bytes)
-            .map_err(|e| io_logs(e))?;
-        let keys: Vec<[u8; 8]> = {
-            let mut keys = Vec::new();
-            let iter = self.inner.logs.iter(&wtxn).map_err(|e| io_logs(e))?;
-            for item in iter {
-                let (k, _) = item.map_err(|e| io_logs(e))?;
-                if k.len() != 8 {
-                    continue;
-                }
-                let idx = u64::from_be_bytes(k.try_into().map_err(|_| io_logs("bad log key"))?);
-                if idx <= log_id.index {
-                    keys.push(idx.to_be_bytes());
-                }
+        let mut batch = WriteBatch::default();
+        batch.put_cf(
+            self.cf_meta(),
+            KEY_LAST_PURGED,
+            serde_json::to_vec(&log_id).map_err(|e| io_logs(e))?,
+        );
+        let cf = self.cf_logs();
+        let iter = self.db.iterator_cf(cf, IteratorMode::Start);
+        for item in iter {
+            let (k, _) = item.map_err(|e| io_logs(e))?;
+            if k.len() != 8 {
+                continue;
             }
-            keys
-        };
-        for key in keys {
-            self.inner
-                .logs
-                .delete(&mut wtxn, &key)
-                .map_err(|e| io_logs(e))?;
+            let idx = u64::from_be_bytes(k.as_ref().try_into().map_err(|_| io_logs("bad key"))?);
+            if idx <= log_id.index {
+                batch.delete_cf(cf, k);
+            } else {
+                break;
+            }
         }
-        wtxn.commit().map_err(|e| io_logs(e))?;
-        Ok(())
+        sync_write(&self.db, batch)
     }
 
     async fn get_log_reader(&mut self) -> Self::LogReader {

@@ -250,7 +250,7 @@ Refs:
 | # | Options | cursor-agent recommendation |
 |---|---|---|
 | D1 UFS crate | OpenDAL vs object_store | **OpenDAL** (Gongxun specified); document tradeoff |
-| D2 Meta engine | heed vs slatedb | **heed + MetaStore trait**; slatedb later (different HA model) |
+| D2 Meta engine | heed vs RocksDB vs slatedb | **RocksDB + MetaStore trait** (unified with Raft CFs); slatedb later candidate |
 | D3 Topology | distributed Master/Worker vs ZeroFS single-process | **crate-split Master/Worker; W1 co-located single binary**; split processes later — avoid rewrite trap |
 
 Locked with cc: openraft, foyer+ChunkStore trait, ZeroFS-inspired tests (gpt56 #3).
@@ -261,8 +261,8 @@ Per @gongxun: proceed with agent-recommended defaults without blocking.
 
 | Layer | Choice | W1 status |
 |---|---|---|
-| Consensus | openraft | Single-voter writes + heed-durable vote/log; same-txn `last_applied`; full meta snapshots; multi-voter HA remain |
-| Meta engine | heed + `MetaStore` trait | create/lookup/readdir/put_inode working |
+| Consensus | openraft | Single-voter writes on RocksDB CFs; WriteBatch `last_applied`; full meta snapshots; multi-voter HA remain |
+| Meta engine | RocksDB + `MetaStore` trait | create/lookup/readdir/put_inode working |
 | Chunk cache | foyer + `ChunkStore` trait | Disk durable + hybrid facade (HybridCache async wire-up next) |
 | UFS | OpenDAL | local FS + S3 features; head/range/write_full |
 | Client | internal API | shared by CLI; public SDK / get_by_key → v0.2 |
