@@ -9,6 +9,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 use thiserror::Error;
 
+/// Per-record codec schema versioning envelope (C4, task #32).
+pub mod schema;
+
 pub type InodeId = u64;
 pub type Generation = u64;
 

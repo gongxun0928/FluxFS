@@ -8,6 +8,7 @@ description = "Shared FluxFS types (inode, dentry, locality, chunk ids)"
 [dependencies]
 blake3 = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 

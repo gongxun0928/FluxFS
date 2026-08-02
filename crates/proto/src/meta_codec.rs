@@ -1,31 +1,32 @@
 use crate::meta::v1;
+use fluxfs_types::schema::{decode_versioned, encode_versioned};
 use fluxfs_types::{
     ChunkId, Dentry, FileType, FlushIntent, FluxError, GcBatch, GcPlan, GcTombstone, Inode,
     InodeId, Manifest, ManifestId, Result as FluxResult, UfsObject, WorkerTargetId,
 };
 
 pub fn encode_inode(inode: &Inode) -> FluxResult<Vec<u8>> {
-    serde_json::to_vec(inode).map_err(|e| FluxError::Meta(e.to_string()))
+    encode_versioned(inode)
 }
 
 pub fn decode_inode(bytes: &[u8]) -> FluxResult<Inode> {
-    serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))
+    decode_versioned(bytes)
 }
 
 pub fn encode_manifest(m: &Manifest) -> FluxResult<Vec<u8>> {
-    serde_json::to_vec(m).map_err(|e| FluxError::Meta(e.to_string()))
+    encode_versioned(m)
 }
 
 pub fn decode_manifest(bytes: &[u8]) -> FluxResult<Manifest> {
-    serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))
+    decode_versioned(bytes)
 }
 
 pub fn encode_flush_intent(intent: &FlushIntent) -> FluxResult<Vec<u8>> {
-    serde_json::to_vec(intent).map_err(|e| FluxError::Meta(e.to_string()))
+    encode_versioned(intent)
 }
 
 pub fn decode_flush_intent(bytes: &[u8]) -> FluxResult<FlushIntent> {
-    serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))
+    decode_versioned(bytes)
 }
 
 pub fn encode_ufs_object(object: &UfsObject) -> FluxResult<Vec<u8>> {
@@ -93,11 +94,14 @@ pub fn decode_gc_delete_acks(bytes: &[u8]) -> FluxResult<Vec<(ChunkId, WorkerTar
 }
 
 pub fn encode_dentries(d: &[Dentry]) -> FluxResult<Vec<u8>> {
-    serde_json::to_vec(d).map_err(|e| FluxError::Meta(e.to_string()))
+    // Slice → Vec to satisfy Versioned (owned) bound. Readdir payloads are
+    // small, so the clone is negligible.
+    let owned: Vec<Dentry> = d.to_vec();
+    encode_versioned(&owned)
 }
 
 pub fn decode_dentries(bytes: &[u8]) -> FluxResult<Vec<Dentry>> {
-    serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))
+    decode_versioned(bytes)
 }
 
 pub fn file_type_to_wire(ft: FileType) -> u32 {
