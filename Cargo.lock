@@ -854,6 +854,7 @@ dependencies = [
  "anyhow",
  "clap",
  "fluxfs-chunk",
+ "fluxfs-metrics",
  "fluxfs-proto",
  "fluxfs-types",
  "tokio",
@@ -913,6 +914,7 @@ dependencies = [
  "anyhow",
  "clap",
  "fluxfs-meta",
+ "fluxfs-metrics",
  "fluxfs-proto",
  "fluxfs-types",
  "serde_json",
@@ -920,6 +922,13 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "fluxfs-metrics"
+version = "0.1.0"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]

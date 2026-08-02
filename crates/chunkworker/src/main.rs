@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use fluxfs_chunk::{ChunkStore, DiskChunkStore};
+use fluxfs_metrics::{spawn_prometheus, FluxMetrics};
 use fluxfs_proto::chunk::v1::{
     ContainsChunkRequest, ContainsChunkResponse, DeleteChunkRequest, DeleteChunkResponse,
     GetChunkRequest, GetChunkResponse, HealthRequest, HealthResponse, ListChunksRequest,
@@ -28,12 +29,16 @@ struct Cli {
     /// Maximum concurrent data operations. Excess RPCs fail fast with RESOURCE_EXHAUSTED.
     #[arg(long, default_value_t = 128)]
     max_in_flight: usize,
+    /// Optional Prometheus text endpoint, e.g. 127.0.0.1:9102 (`GET /metrics`).
+    #[arg(long)]
+    metrics_listen: Option<SocketAddr>,
 }
 
 struct ChunkSvc {
     worker_id: u64,
     store: Arc<DiskChunkStore>,
     in_flight: Arc<Semaphore>,
+    metrics: Arc<FluxMetrics>,
 }
 
 impl ChunkSvc {
@@ -54,13 +59,25 @@ impl ChunkWorker for ChunkSvc {
         &self,
         request: Request<PutChunkRequest>,
     ) -> Result<Response<PutChunkResponse>, Status> {
-        let _permit = self.try_enter()?;
+        FluxMetrics::inc(&self.metrics.chunk_rpc_total);
+        let _permit = self.try_enter().map_err(|status| {
+            FluxMetrics::inc(&self.metrics.chunk_rpc_error_total);
+            status
+        })?;
         let data = request.into_inner().data;
+        let nbytes = data.len() as u64;
         let store = Arc::clone(&self.store);
         let chunk = tokio::task::spawn_blocking(move || store.put(&data))
             .await
-            .map_err(|error| Status::internal(format!("chunk put task: {error}")))?
-            .map_err(status_from_flux)?;
+            .map_err(|error| {
+                FluxMetrics::inc(&self.metrics.chunk_rpc_error_total);
+                Status::internal(format!("chunk put task: {error}"))
+            })?
+            .map_err(|error| {
+                FluxMetrics::inc(&self.metrics.chunk_rpc_error_total);
+                status_from_flux(error)
+            })?;
+        FluxMetrics::add(&self.metrics.chunk_put_bytes_total, nbytes);
         Ok(Response::new(PutChunkResponse {
             chunk_id: chunk.as_bytes().to_vec(),
             worker_id: self.worker_id,
@@ -72,14 +89,28 @@ impl ChunkWorker for ChunkSvc {
         &self,
         request: Request<GetChunkRequest>,
     ) -> Result<Response<GetChunkResponse>, Status> {
-        let _permit = self.try_enter()?;
-        let chunk = ChunkId::try_from(request.into_inner().chunk_id.as_slice())
-            .map_err(status_from_flux)?;
+        FluxMetrics::inc(&self.metrics.chunk_rpc_total);
+        let _permit = self.try_enter().map_err(|status| {
+            FluxMetrics::inc(&self.metrics.chunk_rpc_error_total);
+            status
+        })?;
+        let chunk = ChunkId::try_from(request.into_inner().chunk_id.as_slice()).map_err(
+            |error| {
+                FluxMetrics::inc(&self.metrics.chunk_rpc_error_total);
+                status_from_flux(error)
+            },
+        )?;
         let store = Arc::clone(&self.store);
         let data = tokio::task::spawn_blocking(move || store.get(&chunk))
             .await
-            .map_err(|error| Status::internal(format!("chunk get task: {error}")))?
-            .map_err(status_from_flux)?;
+            .map_err(|error| {
+                FluxMetrics::inc(&self.metrics.chunk_rpc_error_total);
+                Status::internal(format!("chunk get task: {error}"))
+            })?
+            .map_err(|error| {
+                FluxMetrics::inc(&self.metrics.chunk_rpc_error_total);
+                status_from_flux(error)
+            })?;
         Ok(Response::new(GetChunkResponse {
             data,
             worker_id: self.worker_id,
@@ -170,10 +201,16 @@ async fn main() -> Result<()> {
         anyhow::bail!("--max-in-flight must be greater than zero");
     }
     let store = Arc::new(DiskChunkStore::open(&cli.data_dir).context("open chunk store")?);
+    let metrics = FluxMetrics::new();
+    if let Some(addr) = cli.metrics_listen {
+        spawn_prometheus(addr, Arc::clone(&metrics));
+        println!("fluxfs-chunkworker metrics on http://{addr}/metrics");
+    }
     let service = ChunkSvc {
         worker_id: cli.worker_id,
         store,
         in_flight: Arc::new(Semaphore::new(cli.max_in_flight)),
+        metrics,
     };
     println!(
         "fluxfs-chunkworker id={} listening on {} data_dir={} max_in_flight={}",

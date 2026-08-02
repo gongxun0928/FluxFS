@@ -1,0 +1,12 @@
+[package]
+name = "fluxfs-metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Process-local Prometheus-text metrics for FluxFS binaries"
+
+[dependencies]
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "time"] }

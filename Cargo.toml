@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/types",
+    "crates/metrics",
     "crates/proto",
     "crates/meta",
     "crates/testkit",
@@ -43,6 +44,7 @@ tonic = { version = "0.14", features = ["transport"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 fluxfs-types = { path = "crates/types" }
+fluxfs-metrics = { path = "crates/metrics" }
 fluxfs-proto = { path = "crates/proto" }
 fluxfs-meta = { path = "crates/meta" }
 fluxfs-testkit = { path = "crates/testkit" }

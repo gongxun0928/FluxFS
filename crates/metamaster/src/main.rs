@@ -22,8 +22,9 @@ use fluxfs_proto::meta_codec::{
     encode_chunk_ids, encode_dentries, encode_flush_intents, encode_gc_batch, encode_gc_plan,
     encode_inode, encode_manifest, file_type_from_wire, status_from_flux,
 };
+use fluxfs_metrics::{spawn_prometheus, FluxMetrics};
 use fluxfs_proto::{MetaService, MetaServiceServer};
-use fluxfs_types::{FlushId, GcLeaseId, ManifestId, RequestOpId, WriteTicketId};
+use fluxfs_types::{FlushId, FluxError, GcLeaseId, ManifestId, RequestOpId, WriteTicketId};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -41,47 +42,69 @@ struct Cli {
     /// Listen address, e.g. 127.0.0.1:50051
     #[arg(long, default_value = "127.0.0.1:50051")]
     listen: SocketAddr,
+    /// Optional Prometheus text endpoint, e.g. 127.0.0.1:9101 (`GET /metrics`).
+    #[arg(long)]
+    metrics_listen: Option<SocketAddr>,
 }
 
 struct MetaSvc {
     store: Arc<HeedMetaStore>,
     raft: FluxRaft,
+    metrics: Arc<FluxMetrics>,
 }
 
 impl MetaSvc {
+    fn note_app_err(&self, err: &FluxError) {
+        FluxMetrics::inc(&self.metrics.meta_rpc_error_total);
+        match err {
+            FluxError::Busy => FluxMetrics::inc(&self.metrics.meta_busy_total),
+            FluxError::CasFailed { .. } => FluxMetrics::inc(&self.metrics.meta_cas_failed_total),
+            _ => {}
+        }
+    }
+
     async fn write(&self, req: MetaRaftRequest) -> std::result::Result<MetaRaftResponse, Status> {
-        let resp = self
-            .raft
-            .client_write(req)
-            .await
-            .map_err(|e| Status::unavailable(format!("raft write: {e}")))?;
+        FluxMetrics::inc(&self.metrics.meta_rpc_total);
+        let resp = self.raft.client_write(req).await.map_err(|e| {
+            FluxMetrics::inc(&self.metrics.meta_rpc_error_total);
+            Status::unavailable(format!("raft write: {e}"))
+        })?;
         Ok(resp.data)
     }
 
-    fn map_resp_inode(resp: MetaRaftResponse) -> std::result::Result<fluxfs_types::Inode, Status> {
+    fn map_resp_inode(&self, resp: MetaRaftResponse) -> std::result::Result<fluxfs_types::Inode, Status> {
         match resp {
             MetaRaftResponse::Inode(inode) => Ok(*inode),
-            MetaRaftResponse::Err(err) => Err(status_from_flux(err)),
+            MetaRaftResponse::Err(err) => {
+                self.note_app_err(&err);
+                Err(status_from_flux(err))
+            }
             other => Err(Status::internal(format!(
                 "unexpected raft response: {other:?}"
             ))),
         }
     }
 
-    fn map_resp_empty(resp: MetaRaftResponse) -> std::result::Result<(), Status> {
+    fn map_resp_empty(&self, resp: MetaRaftResponse) -> std::result::Result<(), Status> {
         match resp {
             MetaRaftResponse::Empty => Ok(()),
-            MetaRaftResponse::Err(err) => Err(status_from_flux(err)),
+            MetaRaftResponse::Err(err) => {
+                self.note_app_err(&err);
+                Err(status_from_flux(err))
+            }
             other => Err(Status::internal(format!(
                 "unexpected raft response: {other:?}"
             ))),
         }
     }
 
-    fn map_resp_manifest_id(resp: MetaRaftResponse) -> std::result::Result<u64, Status> {
+    fn map_resp_manifest_id(&self, resp: MetaRaftResponse) -> std::result::Result<u64, Status> {
         match resp {
             MetaRaftResponse::ManifestId(id) => Ok(id),
-            MetaRaftResponse::Err(err) => Err(status_from_flux(err)),
+            MetaRaftResponse::Err(err) => {
+                self.note_app_err(&err);
+                Err(status_from_flux(err))
+            }
             other => Err(Status::internal(format!(
                 "unexpected raft response: {other:?}"
             ))),
@@ -89,11 +112,15 @@ impl MetaSvc {
     }
 
     fn map_resp_gc_plan(
+        &self,
         resp: MetaRaftResponse,
     ) -> std::result::Result<fluxfs_types::GcPlan, Status> {
         match resp {
             MetaRaftResponse::GcPlan(plan) => Ok(*plan),
-            MetaRaftResponse::Err(err) => Err(status_from_flux(err)),
+            MetaRaftResponse::Err(err) => {
+                self.note_app_err(&err);
+                Err(status_from_flux(err))
+            }
             other => Err(Status::internal(format!(
                 "unexpected raft response: {other:?}"
             ))),
@@ -101,11 +128,15 @@ impl MetaSvc {
     }
 
     fn map_resp_gc_batch(
+        &self,
         resp: MetaRaftResponse,
     ) -> std::result::Result<fluxfs_types::GcBatch, Status> {
         match resp {
             MetaRaftResponse::GcBatch(batch) => Ok(*batch),
-            MetaRaftResponse::Err(err) => Err(status_from_flux(err)),
+            MetaRaftResponse::Err(err) => {
+                self.note_app_err(&err);
+                Err(status_from_flux(err))
+            }
             other => Err(Status::internal(format!(
                 "unexpected raft response: {other:?}"
             ))),
@@ -165,7 +196,7 @@ impl MetaService for MetaSvc {
                 expected_parent_generation: parent_gen_cas(r.expected_parent_generation),
             })
             .await?;
-        let inode = Self::map_resp_inode(resp)?;
+        let inode = self.map_resp_inode(resp)?;
         Ok(Response::new(CreateResponse {
             inode_json: encode_inode(&inode).map_err(status_from_flux)?,
         }))
@@ -193,7 +224,7 @@ impl MetaService for MetaSvc {
                 inode: Box::new(inode),
             })
             .await?;
-        Self::map_resp_empty(resp)?;
+        self.map_resp_empty(resp)?;
         Ok(Response::new(PutInodeResponse {}))
     }
 
@@ -209,7 +240,7 @@ impl MetaService for MetaSvc {
                 manifest: Box::new(manifest),
             })
             .await?;
-        let id = Self::map_resp_manifest_id(resp)?;
+        let id = self.map_resp_manifest_id(resp)?;
         Ok(Response::new(PutManifestResponse { manifest_id: id }))
     }
 
@@ -229,7 +260,7 @@ impl MetaService for MetaSvc {
                 manifest: Box::new(manifest),
             })
             .await?;
-        let inode = Self::map_resp_inode(resp)?;
+        let inode = self.map_resp_inode(resp)?;
         let manifest_id = inode
             .manifest_id
             .ok_or_else(|| Status::internal("commit missing manifest_id"))?
@@ -254,7 +285,7 @@ impl MetaService for MetaSvc {
                 chunks: decode_chunk_ids(&r.chunks_json).map_err(status_from_flux)?,
             })
             .await?;
-        Self::map_resp_empty(response)?;
+        self.map_resp_empty(response)?;
         Ok(Response::new(ReserveChunksResponse {}))
     }
 
@@ -269,7 +300,7 @@ impl MetaService for MetaSvc {
                 ticket: WriteTicketId(r.ticket),
             })
             .await?;
-        Self::map_resp_empty(response)?;
+        self.map_resp_empty(response)?;
         Ok(Response::new(AbortChunkReservationResponse {}))
     }
 
@@ -287,7 +318,7 @@ impl MetaService for MetaSvc {
                 manifest: Box::new(decode_manifest(&r.manifest_json).map_err(status_from_flux)?),
             })
             .await?;
-        let inode = Self::map_resp_inode(response)?;
+        let inode = self.map_resp_inode(response)?;
         let manifest_id = inode
             .manifest_id
             .ok_or_else(|| Status::internal("reserved commit missing manifest id"))?
@@ -309,7 +340,7 @@ impl MetaService for MetaSvc {
                 candidates: decode_chunk_ids(&r.chunks_json).map_err(status_from_flux)?,
             })
             .await?;
-        let batch = Self::map_resp_gc_batch(response)?;
+        let batch = self.map_resp_gc_batch(response)?;
         Ok(Response::new(TombstoneGcBatchResponse {
             batch_json: encode_gc_batch(&batch).map_err(status_from_flux)?,
         }))
@@ -336,7 +367,7 @@ impl MetaService for MetaSvc {
                 chunks: decode_chunk_ids(&r.chunks_json).map_err(status_from_flux)?,
             })
             .await?;
-        Self::map_resp_empty(response)?;
+        self.map_resp_empty(response)?;
         Ok(Response::new(FinalizeGcTombstonesResponse {}))
     }
 
@@ -365,7 +396,7 @@ impl MetaService for MetaSvc {
                 intent: Box::new(intent),
             })
             .await?;
-        let inode = Self::map_resp_inode(response)?;
+        let inode = self.map_resp_inode(response)?;
         Ok(Response::new(BeginFlushResponse {
             inode_json: encode_inode(&inode).map_err(status_from_flux)?,
         }))
@@ -386,7 +417,7 @@ impl MetaService for MetaSvc {
                 published_ufs: Box::new(published_ufs),
             })
             .await?;
-        let inode = Self::map_resp_inode(response)?;
+        let inode = self.map_resp_inode(response)?;
         Ok(Response::new(CommitFlushResponse {
             inode_json: encode_inode(&inode).map_err(status_from_flux)?,
         }))
@@ -406,7 +437,7 @@ impl MetaService for MetaSvc {
                 error: r.error,
             })
             .await?;
-        let inode = Self::map_resp_inode(response)?;
+        let inode = self.map_resp_inode(response)?;
         Ok(Response::new(FailFlushConflictResponse {
             inode_json: encode_inode(&inode).map_err(status_from_flux)?,
         }))
@@ -433,7 +464,7 @@ impl MetaService for MetaSvc {
                 lease_id: GcLeaseId(r.lease_id),
             })
             .await?;
-        let plan = Self::map_resp_gc_plan(response)?;
+        let plan = self.map_resp_gc_plan(response)?;
         Ok(Response::new(BeginGcResponse {
             plan_json: encode_gc_plan(&plan).map_err(status_from_flux)?,
         }))
@@ -462,7 +493,7 @@ impl MetaService for MetaSvc {
                 lease_id: GcLeaseId(r.lease_id),
             })
             .await?;
-        Self::map_resp_empty(response)?;
+        self.map_resp_empty(response)?;
         Ok(Response::new(FinishGcResponse {}))
     }
 
@@ -487,7 +518,7 @@ impl MetaService for MetaSvc {
                 expected_parent_generation: parent_gen_cas(r.expected_parent_generation),
             })
             .await?;
-        let inode = Self::map_resp_inode(resp)?;
+        let inode = self.map_resp_inode(resp)?;
         Ok(Response::new(ImportExternalResponse {
             inode_json: encode_inode(&inode).map_err(status_from_flux)?,
         }))
@@ -506,7 +537,7 @@ impl MetaService for MetaSvc {
                 expected_parent_generation: parent_gen_cas(r.expected_parent_generation),
             })
             .await?;
-        Self::map_resp_empty(resp)?;
+        self.map_resp_empty(resp)?;
         Ok(Response::new(UnlinkResponse {}))
     }
 }
@@ -568,7 +599,16 @@ async fn main() -> Result<()> {
     let raft = start_single_voter(store.clone(), &raft_dir, &cli.listen.to_string())
         .await
         .context("start openraft single-voter")?;
-    let svc = MetaSvc { store, raft };
+    let metrics = FluxMetrics::new();
+    if let Some(addr) = cli.metrics_listen {
+        spawn_prometheus(addr, Arc::clone(&metrics));
+        println!("fluxfs-metamaster metrics on http://{addr}/metrics");
+    }
+    let svc = MetaSvc {
+        store,
+        raft,
+        metrics,
+    };
     println!(
         "fluxfs-metamaster listening on {} data_dir={} raft=single-voter durable_log={}",
         cli.listen,
