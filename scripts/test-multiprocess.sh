@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ ! -c /dev/fuse ]]; then
+    echo "SKIP: /dev/fuse is unavailable" >&2
+    exit 77
+fi
+if ! command -v fusermount3 >/dev/null 2>&1; then
+    echo "SKIP: fusermount3 is unavailable" >&2
+    exit 77
+fi
+
+repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+test_root=$(mktemp -d -t fluxfs-multiprocess.XXXXXX)
+mount_dir="$test_root/mnt"
+base_port=$((30000 + ($$ % 19000)))
+meta_port=$base_port
+worker0_port=$((base_port + 1))
+worker1_port=$((base_port + 2))
+worker2_port=$((base_port + 3))
+meta_pid=""
+worker0_pid=""
+worker1_pid=""
+worker2_pid=""
+mount_pid=""
+
+cleanup() {
+    fusermount3 -u "$mount_dir" 2>/dev/null || true
+    for pid in "$mount_pid" "$meta_pid" "$worker0_pid" "$worker1_pid" "$worker2_pid"; do
+        if [[ -n "$pid" ]]; then
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+        fi
+    done
+    rm -rf -- "$test_root"
+}
+trap cleanup EXIT
+
+wait_port() {
+    local port=$1
+    for _ in $(seq 1 100); do
+        if timeout 0.1 bash -c "</dev/tcp/127.0.0.1/$port" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.05
+    done
+    echo "port $port did not become ready" >&2
+    return 1
+}
+
+start_worker0() {
+    "$repo_dir/target/debug/fluxfs-chunkworker" \
+        --worker-id 0 --listen "127.0.0.1:$worker0_port" \
+        --data-dir "$test_root/worker-0" >"$test_root/worker-0.log" 2>&1 &
+    worker0_pid=$!
+    wait_port "$worker0_port"
+}
+
+start_mount() {
+    "$repo_dir/target/debug/fluxfs" mount --no-ufs \
+        --data-dir "$test_root/client" --mountpoint "$mount_dir" \
+        --meta-addr "http://127.0.0.1:$meta_port" \
+        --chunk-worker "http://127.0.0.1:$worker0_port" \
+        --chunk-worker "http://127.0.0.1:$worker1_port" \
+        --chunk-worker "http://127.0.0.1:$worker2_port" \
+        >"$test_root/mount.log" 2>&1 &
+    mount_pid=$!
+    for _ in $(seq 1 100); do
+        if mountpoint -q "$mount_dir"; then
+            return 0
+        fi
+        if ! kill -0 "$mount_pid" 2>/dev/null; then
+            cat "$test_root/mount.log" >&2
+            wait "$mount_pid"
+            return 1
+        fi
+        sleep 0.05
+    done
+    echo "FluxFS did not mount within 5 seconds" >&2
+    return 1
+}
+
+mkdir -p "$mount_dir"
+cargo build --manifest-path "$repo_dir/Cargo.toml" \
+    -p fluxfs -p fluxfs-metamaster -p fluxfs-chunkworker
+
+"$repo_dir/target/debug/fluxfs-metamaster" \
+    --listen "127.0.0.1:$meta_port" --data-dir "$test_root/meta" \
+    >"$test_root/meta.log" 2>&1 &
+meta_pid=$!
+
+start_worker0
+"$repo_dir/target/debug/fluxfs-chunkworker" \
+    --worker-id 1 --listen "127.0.0.1:$worker1_port" \
+    --data-dir "$test_root/worker-1" >"$test_root/worker-1.log" 2>&1 &
+worker1_pid=$!
+"$repo_dir/target/debug/fluxfs-chunkworker" \
+    --worker-id 2 --listen "127.0.0.1:$worker2_port" \
+    --data-dir "$test_root/worker-2" >"$test_root/worker-2.log" 2>&1 &
+worker2_pid=$!
+
+wait_port "$meta_port"
+wait_port "$worker1_port"
+wait_port "$worker2_port"
+start_mount
+
+printf 'multiprocess durable\n' >"$mount_dir/durable.txt"
+test "$(cat "$mount_dir/durable.txt")" = "multiprocess durable"
+test "$(find "$test_root/worker-0/objects" -type f | wc -l)" -ge 1
+test "$(find "$test_root/worker-1/objects" -type f | wc -l)" -ge 1
+test "$(find "$test_root/worker-2/objects" -type f 2>/dev/null | wc -l)" -eq 0
+
+# The fixed RF=2 set is workers 0/1. With worker 0 down, old data remains
+# readable from worker 1, but a new authoritative write must not ACK.
+kill "$worker0_pid"
+wait "$worker0_pid" 2>/dev/null || true
+worker0_pid=""
+test "$(cat "$mount_dir/durable.txt")" = "multiprocess durable"
+if printf 'must-not-ack\n' >>"$mount_dir/durable.txt" 2>/dev/null; then
+    echo "write unexpectedly ACKed below RF=2" >&2
+    exit 1
+fi
+test "$(cat "$mount_dir/durable.txt")" = "multiprocess durable"
+
+start_worker0
+printf 'repaired-service\n' >>"$mount_dir/durable.txt"
+test "$(tail -n 1 "$mount_dir/durable.txt")" = "repaired-service"
+
+fusermount3 -u "$mount_dir"
+wait "$mount_pid"
+mount_pid=""
+start_mount
+test "$(tail -n 1 "$mount_dir/durable.txt")" = "repaired-service"
+fusermount3 -u "$mount_dir"
+wait "$mount_pid"
+mount_pid=""
+
+echo "multi-process Meta + 3 Workers + FUSE, RF=2 failure policy: ok"

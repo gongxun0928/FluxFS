@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use fluxfs_chunk::{DiskChunkStore, ReplicatedChunkStore};
+use fluxfs_chunk::{ChunkStore, DiskChunkStore, RemoteReplicatedChunkStore, ReplicatedChunkStore};
 use fluxfs_client::FluxClient;
 use fluxfs_meta::{HeedMetaStore, MetaStore, RemoteMetaStore};
 use fluxfs_types::{FileType, ROOT_INODE};
@@ -34,9 +34,12 @@ enum Cmd {
         #[arg(long, default_value_t = true)]
         no_ufs: bool,
         /// Optional remote MetaMaster (`host:port` or `http://host:port`).
-        /// When set, inode/dentry/manifest go over tonic; chunks stay local RF=2 for now.
         #[arg(long)]
         meta_addr: Option<String>,
+        /// Remote ChunkWorker URL. Repeat three times for the v0 multi-process topology.
+        /// The first two form the fixed RF=2 replica set; the third is a repair spare.
+        #[arg(long = "chunk-worker")]
+        chunk_workers: Vec<String>,
     },
     /// Ping a remote MetaMaster (multi-process smoke).
     MetaPing {
@@ -75,11 +78,12 @@ async fn main() -> Result<()> {
             mountpoint,
             no_ufs,
             meta_addr,
+            chunk_workers,
         } => {
             if !no_ufs {
                 bail!("v0.1 only supports --no-ufs (Ephemeral); UFS-backed mount is next");
             }
-            run_mount(data_dir, mountpoint, meta_addr)?;
+            run_mount(data_dir, mountpoint, meta_addr, chunk_workers)?;
         }
         Cmd::MetaPing { addr } => {
             run_meta_ping(&addr)?;
@@ -124,25 +128,56 @@ async fn run_smoke(data_dir: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn run_mount(data_dir: PathBuf, mountpoint: PathBuf, meta_addr: Option<String>) -> Result<()> {
+fn run_mount(
+    data_dir: PathBuf,
+    mountpoint: PathBuf,
+    meta_addr: Option<String>,
+    chunk_workers: Vec<String>,
+) -> Result<()> {
     if !fluxfs_fuse::mount_supported() {
         bail!("FUSE mount only supported on Linux in this build");
     }
     std::fs::create_dir_all(&data_dir)?;
     std::fs::create_dir_all(&mountpoint)?;
-    let chunks = ReplicatedChunkStore::open_rf2(
-        data_dir.join("chunks/worker-0"),
-        data_dir.join("chunks/worker-1"),
-    )
-    .context("open RF=2 chunks")?;
+    if chunk_workers.is_empty() {
+        let chunks = ReplicatedChunkStore::open_rf2(
+            data_dir.join("chunks/worker-0"),
+            data_dir.join("chunks/worker-1"),
+        )
+        .context("open local RF=2 chunks")?;
+        return mount_with_chunks(data_dir, mountpoint, meta_addr, chunks, "local RF=2");
+    }
+    if chunk_workers.len() != 3 {
+        bail!(
+            "multi-process v0 requires exactly three --chunk-worker URLs; got {}",
+            chunk_workers.len()
+        );
+    }
+    let chunks = RemoteReplicatedChunkStore::new(chunk_workers, 2)
+        .context("configure remote RF=2 chunks")?;
+    let available = chunks
+        .available_workers()
+        .context("probe remote ChunkWorkers")?;
+    if available.len() < 2 {
+        bail!("RF=2 requires two ready distinct ChunkWorkers; ready={available:?}");
+    }
+    mount_with_chunks(data_dir, mountpoint, meta_addr, chunks, "remote RF=2")
+}
 
+fn mount_with_chunks<C: ChunkStore + 'static>(
+    data_dir: PathBuf,
+    mountpoint: PathBuf,
+    meta_addr: Option<String>,
+    chunks: C,
+    chunk_mode: &str,
+) -> Result<()> {
     if let Some(addr) = meta_addr {
         let meta = RemoteMetaStore::connect(&addr).context("connect meta")?;
         // Touch root to fail fast if MetaMaster is down.
         meta.get_inode(ROOT_INODE).context("meta get root")?;
         let client = Arc::new(FluxClient::new(meta, chunks));
         println!(
-            "mounting Ephemeral FluxFS (RF=2 chunks, remote meta={addr}) data_dir={} mountpoint={}",
+            "mounting Ephemeral FluxFS ({chunk_mode}, remote meta={addr}) data_dir={} mountpoint={}",
             data_dir.display(),
             mountpoint.display()
         );
@@ -151,7 +186,7 @@ fn run_mount(data_dir: PathBuf, mountpoint: PathBuf, meta_addr: Option<String>) 
         let meta = HeedMetaStore::open(data_dir.join("meta")).context("open meta")?;
         let client = Arc::new(FluxClient::new(meta, chunks));
         println!(
-            "mounting Ephemeral FluxFS (RF=2) data_dir={} mountpoint={}",
+            "mounting Ephemeral FluxFS ({chunk_mode}) data_dir={} mountpoint={}",
             data_dir.display(),
             mountpoint.display()
         );
