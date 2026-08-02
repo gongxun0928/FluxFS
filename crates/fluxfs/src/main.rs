@@ -76,13 +76,13 @@ async fn main() -> Result<()> {
             println!("  ufs: OpenDAL (local FS / S3); parallel Range GET via Ufs::read_ranges");
             println!("  fuse_supported: {}", fluxfs_fuse::mount_supported());
             println!("  multi-process: fluxfs-metamaster --listen 127.0.0.1:50051 --data-dir DIR");
-            println!(
-                "  mount ephemeral: fluxfs mount --no-ufs --data-dir DIR --mountpoint MNT"
-            );
+            println!("  mount ephemeral: fluxfs mount --no-ufs --data-dir DIR --mountpoint MNT");
             println!(
                 "  mount ufs: fluxfs mount --ufs s3://bucket[/prefix]|file:///path --data-dir DIR --mountpoint MNT"
             );
-            println!("  ufs test bed: bash scripts/dev-minio.sh && cargo run -p fluxfs -- ufs-check");
+            println!(
+                "  ufs test bed: bash scripts/dev-minio.sh && cargo run -p fluxfs -- ufs-check"
+            );
         }
         Cmd::Smoke { data_dir } => {
             run_smoke(data_dir).await?;
@@ -94,19 +94,17 @@ async fn main() -> Result<()> {
             ufs,
             meta_addr,
             chunk_workers,
-        } => {
-            match (no_ufs, ufs.as_deref()) {
-                (true, None) => run_mount(data_dir, mountpoint, meta_addr, chunk_workers, None)?,
-                (false, Some(uri)) => {
-                    let ufs = open_ufs_uri(uri).context("open --ufs")?;
-                    run_mount(data_dir, mountpoint, meta_addr, chunk_workers, Some(ufs))?;
-                }
-                (true, Some(_)) => bail!("pass either --no-ufs or --ufs, not both"),
-                (false, None) => {
-                    bail!("mount requires --no-ufs (Ephemeral) or --ufs <uri> (UFS-backed)")
-                }
+        } => match (no_ufs, ufs.as_deref()) {
+            (true, None) => run_mount(data_dir, mountpoint, meta_addr, chunk_workers, None)?,
+            (false, Some(uri)) => {
+                let ufs = open_ufs_uri(uri).context("open --ufs")?;
+                run_mount(data_dir, mountpoint, meta_addr, chunk_workers, Some(ufs))?;
             }
-        }
+            (true, Some(_)) => bail!("pass either --no-ufs or --ufs, not both"),
+            (false, None) => {
+                bail!("mount requires --no-ufs (Ephemeral) or --ufs <uri> (UFS-backed)")
+            }
+        },
         Cmd::MetaPing { addr } => {
             run_meta_ping(&addr)?;
         }
@@ -128,10 +126,7 @@ async fn run_ufs_check(key: &str) -> Result<()> {
         .read_ranges(
             key,
             &[
-                RangeReq {
-                    offset: 0,
-                    len: 6,
-                },
+                RangeReq { offset: 0, len: 6 },
                 RangeReq {
                     offset: 6,
                     len: (payload.len() as u64).saturating_sub(6),
@@ -163,7 +158,10 @@ async fn run_ufs_check(key: &str) -> Result<()> {
     println!("ufs-check ok");
     println!("  endpoint={}", opts.endpoint);
     println!("  bucket={}", opts.bucket);
-    println!("  key={} size={} etag={:?}", written.key, written.size, written.etag);
+    println!(
+        "  key={} size={} etag={:?}",
+        written.key, written.size, written.etag
+    );
     println!("  list_entries={}", listed.len());
     println!(
         "  external_inode={} locality={:?}",

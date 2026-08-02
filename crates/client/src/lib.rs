@@ -7,7 +7,7 @@ use fluxfs_types::{
     LocalityFields, LocalityLabel, Manifest, OpState, Origin, Result, UfsObject, UfsVersion,
     CHUNK_SIZE, DIRTY_WRITE_CAP_BYTES, ROOT_INODE,
 };
-use fluxfs_ufs::{Ufs, UfsEntryMode, UfsProbe};
+use fluxfs_ufs::{ReadPathConfig, ReadPathStats, Ufs, UfsEntryMode, UfsProbe, UfsReadPath};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Mutex;
@@ -16,28 +16,40 @@ use tokio::runtime::{Handle, Runtime};
 
 struct UfsRuntime {
     ufs: Ufs,
+    reads: std::sync::Arc<UfsReadPath>,
+    handle: Option<Handle>,
     /// Owned runtime only when constructed outside an existing Tokio context.
     rt: Option<Runtime>,
 }
 
 impl UfsRuntime {
     fn new(ufs: Ufs) -> Result<Self> {
-        let rt = if Handle::try_current().is_ok() {
-            None
-        } else {
-            Some(Runtime::new().map_err(|e| FluxError::Ufs(e.to_string()))?)
+        let reads = UfsReadPath::new(ufs.clone(), ReadPathConfig::default())?;
+        let (handle, rt) = match Handle::try_current() {
+            Ok(handle) => (Some(handle), None),
+            Err(_) => (
+                None,
+                Some(Runtime::new().map_err(|e| FluxError::Ufs(e.to_string()))?),
+            ),
         };
-        Ok(Self { ufs, rt })
+        Ok(Self {
+            ufs,
+            reads,
+            handle,
+            rt,
+        })
     }
 
     fn block_on<T>(&self, fut: impl Future<Output = T>) -> T {
-        if let Ok(handle) = Handle::try_current() {
+        if Handle::try_current().is_ok() {
+            let handle = self.handle.as_ref().expect("runtime handle captured");
             tokio::task::block_in_place(|| handle.block_on(fut))
+        } else if let Some(handle) = &self.handle {
+            handle.block_on(fut)
         } else if let Some(rt) = &self.rt {
             rt.block_on(fut)
         } else {
-            let rt = Runtime::new().expect("create temporary runtime");
-            rt.block_on(fut)
+            unreachable!("UFS executor missing")
         }
     }
 }
@@ -72,15 +84,17 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         self.ufs.is_some()
     }
 
+    pub fn ufs_read_stats(&self) -> Option<ReadPathStats> {
+        self.ufs.as_ref().map(|ufs| ufs.reads.stats())
+    }
+
     pub fn root(&self) -> InodeId {
         self.meta.root()
     }
 
     fn reject_ufs_mutation(&self) -> Result<()> {
         if self.ufs.is_some() {
-            Err(FluxError::Capability(
-                "UFS-backed mount is read-only until Dirty copy-up is wired".into(),
-            ))
+            Err(FluxError::ReadOnly)
         } else {
             Ok(())
         }
@@ -162,66 +176,12 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
     /// Assemble full file bytes from the inode's current manifest.
     pub fn read_all(&self, ino: InodeId) -> Result<Vec<u8>> {
         let inode = self.meta.get_inode(ino)?;
-        if inode.file_type != FileType::Regular {
-            return Err(FluxError::IsDirectory);
-        }
-        if inode.size == 0 || inode.manifest_id.is_none() {
-            return Ok(Vec::new());
-        }
-        let mid = inode.manifest_id.unwrap();
-        let manifest = self.meta.get_manifest(mid)?;
-        let mut buf = vec![0u8; inode.size as usize];
-        for ext in &manifest.extents {
-            match ext {
-                Extent::Local { offset, len, chunk } => {
-                    let data = self.chunks.get(chunk)?;
-                    if data.len() as u64 != *len {
-                        return Err(FluxError::Io(format!(
-                            "chunk len mismatch: meta={len} actual={}",
-                            data.len()
-                        )));
-                    }
-                    let start = *offset as usize;
-                    let end = start + *len as usize;
-                    if end > buf.len() {
-                        return Err(FluxError::Io("extent past EOF".into()));
-                    }
-                    buf[start..end].copy_from_slice(&data);
-                }
-                Extent::UfsRange {
-                    offset,
-                    len,
-                    ufs_key,
-                    offset_in_object,
-                    ..
-                } => {
-                    let data = self.ufs_read_range(ufs_key, *offset_in_object, *len)?;
-                    if data.len() as u64 != *len {
-                        return Err(FluxError::Io(format!(
-                            "ufs range len mismatch: want={len} got={}",
-                            data.len()
-                        )));
-                    }
-                    let start = *offset as usize;
-                    let end = start + *len as usize;
-                    if end > buf.len() {
-                        return Err(FluxError::Io("extent past EOF".into()));
-                    }
-                    buf[start..end].copy_from_slice(&data);
-                }
-            }
-        }
-        Ok(buf)
+        self.read_inode_range(&inode, 0, inode.size)
     }
 
     pub fn read_at(&self, ino: InodeId, offset: u64, size: u32) -> Result<Vec<u8>> {
-        let data = self.read_all(ino)?;
-        if offset as usize >= data.len() {
-            return Ok(Vec::new());
-        }
-        let start = offset as usize;
-        let end = (start + size as usize).min(data.len());
-        Ok(data[start..end].to_vec())
+        let inode = self.meta.get_inode(ino)?;
+        self.read_inode_range(&inode, offset, size as u64)
     }
 
     /// Whole-file rewrite write path (MVP). Durable via ChunkStore + manifest CAS on inode.
@@ -329,12 +289,83 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         })
     }
 
-    fn ufs_read_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
+    fn read_inode_range(&self, inode: &Inode, offset: u64, len: u64) -> Result<Vec<u8>> {
+        if inode.file_type != FileType::Regular {
+            return Err(FluxError::IsDirectory);
+        }
+        if len == 0 || offset >= inode.size || inode.manifest_id.is_none() {
+            return Ok(Vec::new());
+        }
+        let end = offset.saturating_add(len).min(inode.size);
+        let output_len = usize::try_from(end - offset)
+            .map_err(|_| FluxError::Capability("read range exceeds address space".into()))?;
+        let mut output = vec![0u8; output_len];
+        let manifest = self.meta.get_manifest(inode.manifest_id.unwrap())?;
+
+        for extent in &manifest.extents {
+            let (extent_offset, extent_len) = match extent {
+                Extent::Local { offset, len, .. } | Extent::UfsRange { offset, len, .. } => {
+                    (*offset, *len)
+                }
+            };
+            let extent_end = extent_offset.saturating_add(extent_len);
+            let overlap_start = offset.max(extent_offset);
+            let overlap_end = end.min(extent_end);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+            let source_start = overlap_start - extent_offset;
+            let overlap_len = overlap_end - overlap_start;
+            let data = match extent {
+                Extent::Local { len, chunk, .. } => {
+                    let chunk_data = self.chunks.get(chunk)?;
+                    if chunk_data.len() as u64 != *len {
+                        return Err(FluxError::Io(format!(
+                            "chunk len mismatch: meta={len} actual={}",
+                            chunk_data.len()
+                        )));
+                    }
+                    let start = source_start as usize;
+                    let end = start + overlap_len as usize;
+                    chunk_data[start..end].to_vec()
+                }
+                Extent::UfsRange {
+                    ufs_key,
+                    offset_in_object,
+                    ..
+                } => self.ufs_read_range(
+                    ufs_key,
+                    inode.ufs.as_ref().ok_or_else(|| {
+                        FluxError::Meta("External inode missing pinned UFS object".into())
+                    })?,
+                    offset_in_object.saturating_add(source_start),
+                    overlap_len,
+                )?,
+            };
+            if data.len() as u64 != overlap_len {
+                return Err(FluxError::Io(format!(
+                    "range len mismatch: want={overlap_len} got={}",
+                    data.len()
+                )));
+            }
+            let target_start = (overlap_start - offset) as usize;
+            output[target_start..target_start + data.len()].copy_from_slice(&data);
+        }
+        Ok(output)
+    }
+
+    fn ufs_read_range(
+        &self,
+        key: &str,
+        object: &UfsObject,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<u8>> {
         let ufs = self
             .ufs
             .as_ref()
             .ok_or_else(|| FluxError::Capability("UfsRange read requires --ufs mount".into()))?;
-        ufs.block_on(ufs.ufs.read_range(key, offset, len))
+        ufs.block_on(ufs.reads.read(key, object, offset, len))
     }
 
     fn parent_ufs_path(&self, parent: InodeId) -> Result<String> {
@@ -610,6 +641,11 @@ mod tests {
 
         let hello = client.lookup(ROOT_INODE, "hello.txt").unwrap();
         assert_eq!(hello.locality, LocalityLabel::External);
+        assert_eq!(client.read_at(hello.id, 2, 4).unwrap(), b"tern");
+        assert_eq!(client.ufs_read_stats().unwrap().backend_fetches, 1);
+        assert_eq!(client.read_at(hello.id, 2, 4).unwrap(), b"tern");
+        assert_eq!(client.ufs_read_stats().unwrap().backend_fetches, 1);
+        assert!(client.ufs_read_stats().unwrap().cache_hits >= 1);
         assert_eq!(client.read_all(hello.id).unwrap(), b"external-bytes");
 
         let dents = client.readdir(ROOT_INODE).unwrap();
@@ -622,6 +658,33 @@ mod tests {
         let err = client
             .create_file(ROOT_INODE, "x", 0o644, 0, 0)
             .unwrap_err();
-        assert!(matches!(err, FluxError::Capability(_)));
+        assert_eq!(err, FluxError::ReadOnly);
+    }
+
+    #[test]
+    fn external_small_read_does_not_materialize_large_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let ufs_root = dir.path().join("ufs");
+        std::fs::create_dir_all(&ufs_root).unwrap();
+        let mut large = vec![0u8; 8 * 1024 * 1024];
+        for (index, byte) in large.iter_mut().enumerate() {
+            *byte = (index % 251) as u8;
+        }
+        std::fs::write(ufs_root.join("large.bin"), &large).unwrap();
+
+        let meta = HeedMetaStore::open(dir.path().join("meta")).unwrap();
+        let chunks = DiskChunkStore::open(dir.path().join("chunks")).unwrap();
+        let client = FluxClient::new(meta, chunks)
+            .with_ufs(Ufs::local(&ufs_root).unwrap())
+            .unwrap();
+        let inode = client.lookup(ROOT_INODE, "large.bin").unwrap();
+        let offset = 3 * 1024 * 1024 + 17;
+        assert_eq!(
+            client.read_at(inode.id, offset as u64, 64).unwrap(),
+            large[offset..offset + 64]
+        );
+        // One demanded part plus at most two background prefetch parts, never
+        // all eight MiB for this 64-byte FUSE read.
+        assert!(client.ufs_read_stats().unwrap().backend_fetches <= 3);
     }
 }

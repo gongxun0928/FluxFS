@@ -444,6 +444,8 @@ pub enum FluxError {
     DirtyConflict,
     #[error("inode busy: op in flight")]
     Busy,
+    #[error("read-only filesystem")]
+    ReadOnly,
     #[error("io: {0}")]
     Io(String),
     #[error("meta: {0}")]

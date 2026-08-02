@@ -52,7 +52,9 @@ pub fn status_from_flux(err: FluxError) -> tonic::Status {
         }
         FluxError::Capability(_) => Code::ResourceExhausted,
         FluxError::Busy => Code::Unavailable,
-        FluxError::CasFailed { .. } | FluxError::DirtyConflict => Code::FailedPrecondition,
+        FluxError::CasFailed { .. } | FluxError::DirtyConflict | FluxError::ReadOnly => {
+            Code::FailedPrecondition
+        }
         _ => Code::Internal,
     };
     tonic::Status::new(code, err.to_string())

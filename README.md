@@ -9,11 +9,12 @@ Unified write-cache (JuiceFS-like) + transparent UFS read (Alluxio-like) filesys
 The current MVP can mount a local Ephemeral (`--no-ufs`) filesystem. Metadata
 is persisted with heed; authoritative chunks are acknowledged after two local
 replicas durably store and checksum them. UFS I/O is OpenDAL (local FS + S3/MinIO
-via `scripts/dev-minio.sh` / `fluxfs ufs-check`); External FUSE mount is next.
+via `scripts/dev-minio.sh` / `fluxfs ufs-check`); External objects are lazily
+imported into a read-only FUSE namespace and read with pinned, bounded Range GETs.
 Basic create/read/write, random write,
 truncate, mkdir/readdir, unlink, unmount/remount, process-crash recovery, and
-single-replica read fallback are executable. UFS-backed lazy read/write-back
-remains next-stage work.
+single-replica read fallback are executable. Dirty copy-up and safe UFS
+write-back remain next-stage work.
 
 The same Ephemeral path also runs as five localhost processes: one MetaMaster,
 three ChunkWorkers, and one FUSE/client. Meta and chunk traffic use tonic/TCP;
@@ -37,7 +38,7 @@ crates/
   metamaster/ independent heed + tonic metadata process
   chunk/    RF=2 authoritative disk store + evictable foyer facade
   chunkworker/ independent durable chunk process
-  ufs/      OpenDAL adapter
+  ufs/      OpenDAL adapter + bounded range cache/single-flight prefetch
   client/   internal API (not public SDK)
   fuse/     Ephemeral FUSE operations
   fluxfs/   co-located binary + CLI
@@ -54,6 +55,7 @@ cargo run -p fluxfs -- smoke --data-dir /tmp/fluxfs-smoke
 ./scripts/test-local-mount.sh
 ./scripts/test-local-crash-restart.sh
 ./scripts/test-multiprocess.sh
+./scripts/test-ufs-minio.sh
 
 # Ephemeral local mount (no UFS)
 mkdir -p /tmp/fluxfs-data /tmp/fluxfs-mnt
@@ -71,6 +73,9 @@ export FLUXFS_UFS_REGION=us-east-1
 export FLUXFS_UFS_ACCESS_KEY=minioadmin
 export FLUXFS_UFS_SECRET_KEY=minioadmin
 cargo run -p fluxfs -- ufs-check
+
+# Read-only External mount over the test bucket
+cargo run -p fluxfs -- mount --ufs s3://fluxfs --data-dir /tmp/fluxfs-external-data --mountpoint /tmp/fluxfs-mnt
 ```
 
 ## Locked product boundaries (alpha)
