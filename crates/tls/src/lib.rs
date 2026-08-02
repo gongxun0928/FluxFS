@@ -303,6 +303,35 @@ impl InsecureDev {
         // Bare "host:port" — caller normalizes to http(s):// before calling.
         Ok(())
     }
+
+    /// Validate that the URL scheme matches whether TLS is configured. Cursor
+    /// review nit (msg 1e5c04e0 #2/#3): if a caller passes `https://` but no
+    /// TLS options, that's a misconfiguration (tonic would attempt TLS without
+    /// any trust anchor); if they pass `http://` with TLS options, likewise.
+    /// Catch both explicitly so the failure is actionable, not a mystery
+    /// handshake error from deep in hyper.
+    pub fn check_scheme_matches_tls(
+        &self,
+        endpoint_url: &str,
+        tls_enabled: bool,
+    ) -> FluxResult<()> {
+        let is_https = endpoint_url.starts_with("https://");
+        let is_http = endpoint_url.starts_with("http://");
+        if is_https && !tls_enabled {
+            return Err(FluxError::InvalidArg(format!(
+                "tls: https endpoint {endpoint_url} but no --tls-ca-cert configured; pass \
+                 --tls-ca-cert (and --tls-client-cert/--tls-client-key for mTLS) or change the \
+                 URL to http:// and add --allow-insecure-dev"
+            )));
+        }
+        if is_http && tls_enabled {
+            return Err(FluxError::InvalidArg(format!(
+                "tls: http endpoint {endpoint_url} with TLS flags set; change the URL to https:// \
+                 or drop the TLS flags (and add --allow-insecure-dev for plaintext)"
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -410,5 +439,38 @@ mod tests {
         // left alone so the dialer can prepend http(s):// based on TLS flags.
         let dev = InsecureDev::allow(false);
         assert!(dev.check_endpoint("meta:50051").is_ok());
+    }
+
+    #[test]
+    fn scheme_check_rejects_https_without_tls() {
+        let dev = InsecureDev::allow(false);
+        let err = dev
+            .check_scheme_matches_tls("https://meta:50051", false)
+            .unwrap_err();
+        assert!(err.to_string().contains("no --tls-ca-cert configured"));
+    }
+
+    #[test]
+    fn scheme_check_rejects_http_with_tls() {
+        let dev = InsecureDev::allow(true);
+        let err = dev
+            .check_scheme_matches_tls("http://meta:50051", true)
+            .unwrap_err();
+        assert!(err.to_string().contains("with TLS flags set"));
+    }
+
+    #[test]
+    fn scheme_check_accepts_aligned_pairs() {
+        let dev = InsecureDev::allow(false);
+        assert!(dev
+            .check_scheme_matches_tls("https://meta:50051", true)
+            .is_ok());
+        let dev = InsecureDev::allow(true);
+        assert!(dev
+            .check_scheme_matches_tls("http://meta:50051", false)
+            .is_ok());
+        // Bare host:port is left for caller normalization.
+        assert!(dev.check_scheme_matches_tls("meta:50051", false).is_ok());
+        assert!(dev.check_scheme_matches_tls("meta:50051", true).is_ok());
     }
 }

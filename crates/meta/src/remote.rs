@@ -57,15 +57,18 @@ impl RemoteMetaStore {
         use tonic::transport::Endpoint;
 
         let addr = addr.as_ref().to_string();
+        let tls_enabled = tls.is_some();
         let url = if addr.starts_with("http://") || addr.starts_with("https://") {
             addr
-        } else if tls.is_some() {
+        } else if tls_enabled {
             format!("https://{addr}")
         } else {
             format!("http://{addr}")
         };
-        fluxfs_tls::InsecureDev::allow(insecure_dev)
-            .check_endpoint(&url)
+        let gate = fluxfs_tls::InsecureDev::allow(insecure_dev);
+        gate.check_endpoint(&url)
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        gate.check_scheme_matches_tls(&url, tls_enabled)
             .map_err(|e| FluxError::Meta(e.to_string()))?;
 
         let build_endpoint = || -> Result<Endpoint> {

@@ -595,8 +595,13 @@ fn configured_endpoint(
     } else {
         format!("http://{endpoint}")
     };
-    fluxfs_tls::InsecureDev::allow(insecure_dev)
+    let tls_enabled = tls_cfg.is_some();
+    let insecure = fluxfs_tls::InsecureDev::allow(insecure_dev);
+    insecure
         .check_endpoint(&url)
+        .map_err(|error| FluxError::InvalidArg(error.to_string()))?;
+    insecure
+        .check_scheme_matches_tls(&url, tls_enabled)
         .map_err(|error| FluxError::InvalidArg(error.to_string()))?;
     let mut configured = Endpoint::from_shared(url)
         .map_err(|error| FluxError::InvalidArg(format!("{endpoint}: {error}")))?
