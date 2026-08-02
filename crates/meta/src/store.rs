@@ -1,6 +1,6 @@
 use fluxfs_types::{
-    Dentry, FileType, FlushId, FlushIntent, GcLeaseId, GcPlan, Inode, InodeId, Manifest,
-    ManifestId, RequestOpId, Result, UfsObject, ROOT_INODE,
+    ChunkId, Dentry, FileType, FlushId, FlushIntent, GcBatch, GcLeaseId, GcPlan, Inode, InodeId,
+    Manifest, ManifestId, RequestOpId, Result, UfsObject, WriteTicketId, ROOT_INODE,
 };
 
 /// Engine-agnostic metadata API frozen for W1.
@@ -81,6 +81,33 @@ pub trait MetaStore: Send + Sync {
         inode: &Inode,
         manifest: &Manifest,
     ) -> Result<Inode>;
+
+    fn reserve_chunks(
+        &self,
+        ticket: WriteTicketId,
+        inode: InodeId,
+        expected_generation: u64,
+        chunks: &[ChunkId],
+    ) -> Result<()>;
+
+    fn abort_chunk_reservation(&self, ticket: WriteTicketId) -> Result<()>;
+
+    fn commit_inode_manifest_reserved_with_id(
+        &self,
+        op_id: RequestOpId,
+        ticket: WriteTicketId,
+        expected_generation: u64,
+        inode: &Inode,
+        manifest: &Manifest,
+    ) -> Result<Inode>;
+
+    /// Tombstone a bounded candidate set iff no current manifest or active
+    /// pre-Put reservation references it. Also reclaims unreachable manifests.
+    fn tombstone_gc_batch(&self, candidates: &[ChunkId]) -> Result<GcBatch>;
+
+    fn list_gc_tombstones(&self) -> Result<Vec<ChunkId>>;
+
+    fn finalize_gc_tombstones(&self, chunks: &[ChunkId]) -> Result<()>;
 
     fn get_manifest(&self, id: ManifestId) -> Result<Manifest>;
 

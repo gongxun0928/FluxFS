@@ -61,6 +61,36 @@ pub struct GcPlan {
     pub removed_manifests: usize,
 }
 
+/// Durable pre-Put reservation. It prevents concurrent GC from tombstoning a
+/// content address until the manifest commit consumes or aborts this ticket.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct WriteTicketId(pub u64);
+
+impl WriteTicketId {
+    pub fn random() -> Self {
+        let bytes = uuid::Uuid::new_v4().into_bytes();
+        Self(u64::from_le_bytes(
+            bytes[..8].try_into().expect("UUID prefix"),
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChunkReservation {
+    pub ticket: WriteTicketId,
+    pub inode: InodeId,
+    pub expected_generation: u64,
+    pub chunks: Vec<ChunkId>,
+}
+
+/// One bounded concurrent-GC batch. Tombstones fence new reservations while
+/// the client deletes the corresponding physical Worker objects.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GcBatch {
+    pub tombstoned_chunks: Vec<ChunkId>,
+    pub removed_manifests: usize,
+}
+
 /// In-flight External lazy-load tracking token.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HydrateToken(pub u64);

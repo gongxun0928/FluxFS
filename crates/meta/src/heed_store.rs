@@ -1,9 +1,10 @@
 use crate::raft_types::{MetaRaftRequest, MetaRaftResponse, SmAppliedMeta};
 use crate::store::MetaStore;
 use fluxfs_types::{
-    BackingMode, ChunkId, DataGen, DataState, Dentry, Extent, FileType, FlushId, FlushIntent,
-    FluxError, GcLeaseId, GcPlan, Inode, InodeId, LocalityFields, LocalityLabel, Manifest,
-    ManifestId, OpState, Origin, Result, UfsObject, UfsVersion, ROOT_INODE,
+    BackingMode, ChunkId, ChunkReservation, DataGen, DataState, Dentry, Extent, FileType, FlushId,
+    FlushIntent, FluxError, GcBatch, GcLeaseId, GcPlan, Inode, InodeId, LocalityFields,
+    LocalityLabel, Manifest, ManifestId, OpState, Origin, Result, UfsObject, UfsVersion,
+    WriteTicketId, ROOT_INODE,
 };
 use heed::types::{Bytes, Str};
 use heed::{Database, Env, EnvOpenOptions};
@@ -24,6 +25,8 @@ type RequestDb = Database<Str, Bytes>;
 const KEY_SM_LAST_APPLIED: &str = "raft_sm_last_applied";
 const KEY_SM_LAST_MEMBERSHIP: &str = "raft_sm_last_membership";
 const KEY_GC_LEASE: &str = "gc_lease";
+const RESERVATION_PREFIX: &str = "write_reservation:";
+const TOMBSTONE_PREFIX: &str = "gc_tombstone:";
 
 /// Full MetaStore snapshot payload for OpenRaft install/build.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +43,10 @@ pub struct MetaSnapshotData {
     /// A persistent stop-the-world lease makes physical chunk sweeping safe.
     #[serde(default)]
     pub gc_lease: Option<GcLeaseId>,
+    #[serde(default)]
+    pub chunk_reservations: Vec<ChunkReservation>,
+    #[serde(default)]
+    pub gc_tombstones: Vec<ChunkId>,
 }
 
 pub struct HeedMetaStore {
@@ -265,13 +272,69 @@ impl HeedMetaStore {
                     manifest,
                     ..
                 } => {
-                    match self.commit_inode_manifest_in_txn(
-                        &mut wtxn,
-                        *expected_generation,
-                        inode.as_ref(),
-                        manifest.as_ref(),
-                    ) {
-                        Ok(inode) => MetaRaftResponse::Inode(Box::new(inode)),
+                    if manifest_has_local(manifest) {
+                        MetaRaftResponse::Err(FluxError::InvalidArg(
+                            "Local manifest commit requires a pre-Put reservation".into(),
+                        ))
+                    } else {
+                        match self.commit_inode_manifest_in_txn(
+                            &mut wtxn,
+                            *expected_generation,
+                            inode.as_ref(),
+                            manifest.as_ref(),
+                        ) {
+                            Ok(inode) => MetaRaftResponse::Inode(Box::new(inode)),
+                            Err(e) => MetaRaftResponse::Err(e),
+                        }
+                    }
+                }
+                MetaRaftRequest::ReserveChunks {
+                    ticket,
+                    inode,
+                    expected_generation,
+                    chunks,
+                    ..
+                } => match self.reserve_chunks_in_txn(
+                    &mut wtxn,
+                    *ticket,
+                    *inode,
+                    *expected_generation,
+                    chunks,
+                ) {
+                    Ok(()) => MetaRaftResponse::Empty,
+                    Err(e) => MetaRaftResponse::Err(e),
+                },
+                MetaRaftRequest::AbortChunkReservation { ticket, .. } => {
+                    match self.abort_reservation_in_txn(&mut wtxn, *ticket) {
+                        Ok(()) => MetaRaftResponse::Empty,
+                        Err(e) => MetaRaftResponse::Err(e),
+                    }
+                }
+                MetaRaftRequest::CommitInodeManifestReserved {
+                    ticket,
+                    expected_generation,
+                    inode,
+                    manifest,
+                    ..
+                } => match self.commit_reserved_in_txn(
+                    &mut wtxn,
+                    *ticket,
+                    *expected_generation,
+                    inode,
+                    manifest,
+                ) {
+                    Ok(inode) => MetaRaftResponse::Inode(Box::new(inode)),
+                    Err(e) => MetaRaftResponse::Err(e),
+                },
+                MetaRaftRequest::TombstoneGcBatch { candidates, .. } => {
+                    match self.tombstone_gc_batch_in_txn(&mut wtxn, candidates) {
+                        Ok(batch) => MetaRaftResponse::GcBatch(Box::new(batch)),
+                        Err(e) => MetaRaftResponse::Err(e),
+                    }
+                }
+                MetaRaftRequest::FinalizeGcTombstones { chunks, .. } => {
+                    match self.finalize_tombstones_in_txn(&mut wtxn, chunks) {
+                        Ok(()) => MetaRaftResponse::Empty,
                         Err(e) => MetaRaftResponse::Err(e),
                     }
                 }
@@ -488,6 +551,8 @@ impl HeedMetaStore {
             client_requests.push((k.to_string(), resp));
         }
         let gc_lease = self.gc_lease_in_txn(&rtxn)?;
+        let chunk_reservations = self.list_reservations_in_txn(&rtxn)?;
+        let gc_tombstones = self.list_tombstones_in_txn(&rtxn)?;
         drop(rtxn);
         Ok(MetaSnapshotData {
             inodes,
@@ -498,6 +563,8 @@ impl HeedMetaStore {
             sm: sm.clone(),
             client_requests,
             gc_lease,
+            chunk_reservations,
+            gc_tombstones,
         })
     }
 
@@ -606,6 +673,16 @@ impl HeedMetaStore {
                     .delete(&mut wtxn, KEY_GC_LEASE)
                     .map_err(|e| FluxError::Meta(e.to_string()))?;
             }
+        }
+        self.clear_meta_prefix_in_txn(&mut wtxn, RESERVATION_PREFIX)?;
+        self.clear_meta_prefix_in_txn(&mut wtxn, TOMBSTONE_PREFIX)?;
+        for reservation in &snap.chunk_reservations {
+            self.put_reservation_in_txn(&mut wtxn, reservation)?;
+        }
+        for chunk in &snap.gc_tombstones {
+            self.meta
+                .put(&mut wtxn, &tombstone_key(chunk), &[])
+                .map_err(|e| FluxError::Meta(e.to_string()))?;
         }
         self.put_sm_meta_raw(&mut wtxn, &snap.sm)?;
         wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
@@ -976,6 +1053,248 @@ impl HeedMetaStore {
         Ok(())
     }
 
+    fn reservation_in_txn(
+        &self,
+        txn: &heed::RoTxn<'_>,
+        ticket: WriteTicketId,
+    ) -> Result<Option<ChunkReservation>> {
+        self.meta
+            .get(txn, &reservation_key(ticket))
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+            .map(|bytes| serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string())))
+            .transpose()
+    }
+
+    fn put_reservation_in_txn(
+        &self,
+        txn: &mut heed::RwTxn<'_>,
+        reservation: &ChunkReservation,
+    ) -> Result<()> {
+        let bytes = serde_json::to_vec(reservation).map_err(|e| FluxError::Meta(e.to_string()))?;
+        self.meta
+            .put(txn, &reservation_key(reservation.ticket), &bytes)
+            .map_err(|e| FluxError::Meta(e.to_string()))
+    }
+
+    fn list_reservations_in_txn(&self, txn: &heed::RoTxn<'_>) -> Result<Vec<ChunkReservation>> {
+        let mut out = Vec::new();
+        for item in self
+            .meta
+            .prefix_iter(txn, RESERVATION_PREFIX)
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+        {
+            let (_, bytes) = item.map_err(|e| FluxError::Meta(e.to_string()))?;
+            out.push(serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))?);
+        }
+        out.sort_by_key(|reservation: &ChunkReservation| reservation.ticket.0);
+        Ok(out)
+    }
+
+    fn list_tombstones_in_txn(&self, txn: &heed::RoTxn<'_>) -> Result<Vec<ChunkId>> {
+        let mut out = Vec::new();
+        for item in self
+            .meta
+            .prefix_iter(txn, TOMBSTONE_PREFIX)
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+        {
+            let (key, _) = item.map_err(|e| FluxError::Meta(e.to_string()))?;
+            let hex = key
+                .strip_prefix(TOMBSTONE_PREFIX)
+                .ok_or_else(|| FluxError::Meta("bad tombstone key".into()))?;
+            out.push(chunk_from_hex(hex)?);
+        }
+        out.sort_by_key(ChunkId::to_hex);
+        Ok(out)
+    }
+
+    fn clear_meta_prefix_in_txn(&self, txn: &mut heed::RwTxn<'_>, prefix: &str) -> Result<()> {
+        let keys = self
+            .meta
+            .prefix_iter(txn, prefix)
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+            .map(|item| {
+                item.map(|(key, _)| key.to_string())
+                    .map_err(|e| FluxError::Meta(e.to_string()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for key in keys {
+            self.meta
+                .delete(txn, &key)
+                .map_err(|e| FluxError::Meta(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn reserve_chunks_in_txn(
+        &self,
+        txn: &mut heed::RwTxn<'_>,
+        ticket: WriteTicketId,
+        inode: InodeId,
+        expected_generation: u64,
+        chunks: &[ChunkId],
+    ) -> Result<()> {
+        let current = get_inode_raw(&self.inodes, txn, inode)?;
+        check_generation(&current, expected_generation)?;
+        let mut chunks = chunks.to_vec();
+        chunks.sort_by_key(ChunkId::to_hex);
+        chunks.dedup();
+        for chunk in &chunks {
+            if self
+                .meta
+                .get(txn, &tombstone_key(chunk))
+                .map_err(|e| FluxError::Meta(e.to_string()))?
+                .is_some()
+            {
+                return Err(FluxError::Busy);
+            }
+        }
+        let reservation = ChunkReservation {
+            ticket,
+            inode,
+            expected_generation,
+            chunks,
+        };
+        if let Some(existing) = self.reservation_in_txn(txn, ticket)? {
+            return if existing == reservation {
+                Ok(())
+            } else {
+                Err(FluxError::AlreadyExists)
+            };
+        }
+        self.put_reservation_in_txn(txn, &reservation)
+    }
+
+    fn abort_reservation_in_txn(
+        &self,
+        txn: &mut heed::RwTxn<'_>,
+        ticket: WriteTicketId,
+    ) -> Result<()> {
+        self.meta
+            .delete(txn, &reservation_key(ticket))
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        Ok(())
+    }
+
+    fn commit_reserved_in_txn(
+        &self,
+        txn: &mut heed::RwTxn<'_>,
+        ticket: WriteTicketId,
+        expected_generation: u64,
+        inode: &Inode,
+        manifest: &Manifest,
+    ) -> Result<Inode> {
+        let reservation = self
+            .reservation_in_txn(txn, ticket)?
+            .ok_or(FluxError::Busy)?;
+        if reservation.inode != inode.id || reservation.expected_generation != expected_generation {
+            return Err(FluxError::InvalidArg(
+                "write reservation does not match inode generation".into(),
+            ));
+        }
+        let mut local = manifest
+            .extents
+            .iter()
+            .filter_map(|extent| match extent {
+                Extent::Local { chunk, .. } => Some(*chunk),
+                Extent::UfsRange { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        local.sort_by_key(ChunkId::to_hex);
+        local.dedup();
+        if local != reservation.chunks {
+            return Err(FluxError::InvalidArg(
+                "manifest Local chunks do not match write reservation".into(),
+            ));
+        }
+        let committed =
+            self.commit_inode_manifest_in_txn(txn, expected_generation, inode, manifest)?;
+        self.abort_reservation_in_txn(txn, ticket)?;
+        Ok(committed)
+    }
+
+    fn tombstone_gc_batch_in_txn(
+        &self,
+        txn: &mut heed::RwTxn<'_>,
+        candidates: &[ChunkId],
+    ) -> Result<GcBatch> {
+        let mut active_manifests = BTreeSet::new();
+        for item in self
+            .inodes
+            .iter(txn)
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+        {
+            let (_, bytes) = item.map_err(|e| FluxError::Meta(e.to_string()))?;
+            let inode: Inode =
+                serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))?;
+            if let Some(id) = inode.manifest_id {
+                active_manifests.insert(id.0);
+            }
+        }
+        let manifests = self
+            .manifests
+            .iter(txn)
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+            .map(|item| {
+                item.map_err(|e| FluxError::Meta(e.to_string()))
+                    .and_then(|(key, bytes)| {
+                        Ok((
+                            u64_from_bytes(key)?,
+                            serde_json::from_slice::<Manifest>(bytes)
+                                .map_err(|e| FluxError::Meta(e.to_string()))?,
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut live = BTreeSet::new();
+        let mut removed_manifests = 0;
+        for (id, manifest) in manifests {
+            if active_manifests.contains(&id) {
+                for extent in manifest.extents {
+                    if let Extent::Local { chunk, .. } = extent {
+                        live.insert(chunk);
+                    }
+                }
+            } else {
+                self.manifests
+                    .delete(txn, &inode_key(id))
+                    .map_err(|e| FluxError::Meta(e.to_string()))?;
+                removed_manifests += 1;
+            }
+        }
+        for reservation in self.list_reservations_in_txn(txn)? {
+            live.extend(reservation.chunks);
+        }
+        let mut tombstoned = Vec::new();
+        let mut unique = candidates.iter().copied().collect::<BTreeSet<_>>();
+        for chunk in unique.iter() {
+            if live.contains(chunk) {
+                continue;
+            }
+            self.meta
+                .put(txn, &tombstone_key(chunk), &[])
+                .map_err(|e| FluxError::Meta(e.to_string()))?;
+            tombstoned.push(*chunk);
+        }
+        unique.clear();
+        Ok(GcBatch {
+            tombstoned_chunks: tombstoned,
+            removed_manifests,
+        })
+    }
+
+    fn finalize_tombstones_in_txn(
+        &self,
+        txn: &mut heed::RwTxn<'_>,
+        chunks: &[ChunkId],
+    ) -> Result<()> {
+        for chunk in chunks {
+            self.meta
+                .delete(txn, &tombstone_key(chunk))
+                .map_err(|e| FluxError::Meta(e.to_string()))?;
+        }
+        Ok(())
+    }
+
     fn gc_lease_in_txn(&self, txn: &heed::RoTxn<'_>) -> Result<Option<GcLeaseId>> {
         self.meta
             .get(txn, KEY_GC_LEASE)
@@ -1281,6 +1600,11 @@ impl MetaStore for HeedMetaStore {
         inode: &Inode,
         manifest: &Manifest,
     ) -> Result<Inode> {
+        if manifest_has_local(manifest) {
+            return Err(FluxError::InvalidArg(
+                "Local manifest commit requires a pre-Put reservation".into(),
+            ));
+        }
         let _guard = self
             .write_lock
             .lock()
@@ -1333,6 +1657,51 @@ impl MetaStore for HeedMetaStore {
         };
         wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
         Ok(next)
+    }
+
+    fn reserve_chunks(
+        &self,
+        ticket: WriteTicketId,
+        inode: InodeId,
+        expected_generation: u64,
+        chunks: &[ChunkId],
+    ) -> Result<()> {
+        self.with_write_txn(|store, txn| {
+            store.reserve_chunks_in_txn(txn, ticket, inode, expected_generation, chunks)
+        })
+    }
+
+    fn abort_chunk_reservation(&self, ticket: WriteTicketId) -> Result<()> {
+        self.with_write_txn(|store, txn| store.abort_reservation_in_txn(txn, ticket))
+    }
+
+    fn commit_inode_manifest_reserved_with_id(
+        &self,
+        _op_id: fluxfs_types::RequestOpId,
+        ticket: WriteTicketId,
+        expected_generation: u64,
+        inode: &Inode,
+        manifest: &Manifest,
+    ) -> Result<Inode> {
+        self.with_write_txn(|store, txn| {
+            store.commit_reserved_in_txn(txn, ticket, expected_generation, inode, manifest)
+        })
+    }
+
+    fn tombstone_gc_batch(&self, candidates: &[ChunkId]) -> Result<GcBatch> {
+        self.with_write_txn(|store, txn| store.tombstone_gc_batch_in_txn(txn, candidates))
+    }
+
+    fn list_gc_tombstones(&self) -> Result<Vec<ChunkId>> {
+        let txn = self
+            .env
+            .read_txn()
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        self.list_tombstones_in_txn(&txn)
+    }
+
+    fn finalize_gc_tombstones(&self, chunks: &[ChunkId]) -> Result<()> {
+        self.with_write_txn(|store, txn| store.finalize_tombstones_in_txn(txn, chunks))
     }
 
     fn get_manifest(&self, id: ManifestId) -> Result<Manifest> {
@@ -1549,6 +1918,13 @@ fn matching_flush_intent(inode: &Inode, flush_id: FlushId) -> Result<&FlushInten
     }
 }
 
+fn manifest_has_local(manifest: &Manifest) -> bool {
+    manifest
+        .extents
+        .iter()
+        .any(|extent| matches!(extent, Extent::Local { .. }))
+}
+
 fn put_inode_raw(db: &InodeDb, wtxn: &mut heed::RwTxn, inode: &Inode) -> Result<()> {
     let bytes = serde_json::to_vec(inode).map_err(|e| FluxError::Meta(e.to_string()))?;
     db.put(wtxn, &inode_key(inode.id), &bytes)
@@ -1561,6 +1937,27 @@ fn inode_key(id: InodeId) -> [u8; 8] {
 
 fn dentry_key(parent: InodeId, name: &str) -> String {
     format!("{parent:016x}\0{name}")
+}
+
+fn reservation_key(ticket: WriteTicketId) -> String {
+    format!("{RESERVATION_PREFIX}{:016x}", ticket.0)
+}
+
+fn tombstone_key(chunk: &ChunkId) -> String {
+    format!("{TOMBSTONE_PREFIX}{}", chunk.to_hex())
+}
+
+fn chunk_from_hex(value: &str) -> Result<ChunkId> {
+    if value.len() != 64 {
+        return Err(FluxError::Meta("bad tombstone chunk id".into()));
+    }
+    let mut raw = [0u8; 32];
+    for (index, byte) in raw.iter_mut().enumerate() {
+        let offset = index * 2;
+        *byte = u8::from_str_radix(&value[offset..offset + 2], 16)
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+    }
+    Ok(ChunkId::from_raw(raw))
 }
 
 fn u64_bytes(v: u64) -> [u8; 8] {
@@ -1747,8 +2144,18 @@ mod tests {
                     chunk: live,
                 }],
             };
+            let ticket = WriteTicketId(7);
+            store
+                .reserve_chunks(ticket, file.id, file.generation, &[live])
+                .unwrap();
             let committed = store
-                .commit_inode_manifest(file.generation, &next, &active)
+                .commit_inode_manifest_reserved_with_id(
+                    RequestOpId::random(),
+                    ticket,
+                    file.generation,
+                    &next,
+                    &active,
+                )
                 .unwrap();
             active_mid = committed.manifest_id.unwrap();
             orphan_mid = store
@@ -1794,6 +2201,74 @@ mod tests {
         store
             .create(ROOT_INODE, "unblocked", FileType::Regular, 0o644, 0, 0)
             .unwrap();
+    }
+
+    #[test]
+    fn reservations_and_tombstones_fence_concurrent_gc() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HeedMetaStore::open(dir.path()).unwrap();
+        let file = store
+            .create(ROOT_INODE, "race", FileType::Regular, 0o644, 0, 0)
+            .unwrap();
+        let reserved = ChunkId::from_bytes(b"reserved-before-put");
+        let orphan = ChunkId::from_bytes(b"orphan-candidate");
+        let ticket = WriteTicketId(100);
+        store
+            .reserve_chunks(ticket, file.id, file.generation, &[reserved])
+            .unwrap();
+
+        let batch = store.tombstone_gc_batch(&[reserved, orphan]).unwrap();
+        assert_eq!(batch.tombstoned_chunks, vec![orphan]);
+        assert_eq!(store.list_gc_tombstones().unwrap(), vec![orphan]);
+        assert_eq!(
+            store.reserve_chunks(WriteTicketId(101), file.id, file.generation, &[orphan]),
+            Err(FluxError::Busy)
+        );
+
+        let snapshot = store.export_snapshot(&SmAppliedMeta::default()).unwrap();
+        let restored_dir = tempfile::tempdir().unwrap();
+        let restored = HeedMetaStore::open(restored_dir.path()).unwrap();
+        restored.install_snapshot_data(&snapshot).unwrap();
+        assert_eq!(restored.list_gc_tombstones().unwrap(), vec![orphan]);
+        assert!(restored
+            .reservation_in_txn(&restored.env.read_txn().unwrap(), ticket)
+            .unwrap()
+            .is_some());
+
+        store.finalize_gc_tombstones(&[orphan]).unwrap();
+        store
+            .reserve_chunks(WriteTicketId(101), file.id, file.generation, &[orphan])
+            .unwrap();
+        store.abort_chunk_reservation(WriteTicketId(101)).unwrap();
+
+        let mut next = file.clone();
+        next.generation += 1;
+        next.head_gen = DataGen(2);
+        next.size = 19;
+        let manifest = Manifest {
+            inode: file.id,
+            gen: DataGen(2),
+            size: 19,
+            extents: vec![Extent::Local {
+                offset: 0,
+                len: 19,
+                chunk: reserved,
+            }],
+        };
+        store
+            .commit_inode_manifest_reserved_with_id(
+                RequestOpId::random(),
+                ticket,
+                file.generation,
+                &next,
+                &manifest,
+            )
+            .unwrap();
+        assert!(store
+            .tombstone_gc_batch(&[reserved])
+            .unwrap()
+            .tombstoned_chunks
+            .is_empty());
     }
 
     #[test]

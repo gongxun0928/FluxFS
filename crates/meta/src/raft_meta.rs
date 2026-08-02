@@ -4,8 +4,8 @@ use crate::heed_store::HeedMetaStore;
 use crate::raft_types::{FluxRaft, MetaRaftRequest, MetaRaftResponse};
 use crate::store::MetaStore;
 use fluxfs_types::{
-    Dentry, FileType, FlushId, FlushIntent, FluxError, GcLeaseId, GcPlan, Inode, InodeId, Manifest,
-    ManifestId, RequestOpId, Result, UfsObject, ROOT_INODE,
+    ChunkId, Dentry, FileType, FlushId, FlushIntent, FluxError, GcBatch, GcLeaseId, GcPlan, Inode,
+    InodeId, Manifest, ManifestId, RequestOpId, Result, UfsObject, WriteTicketId, ROOT_INODE,
 };
 use std::future::Future;
 use std::sync::Arc;
@@ -105,6 +105,16 @@ impl RaftMetaStore {
             ))),
         }
     }
+
+    fn map_gc_batch(resp: MetaRaftResponse) -> Result<GcBatch> {
+        match resp {
+            MetaRaftResponse::GcBatch(batch) => Ok(*batch),
+            MetaRaftResponse::Err(err) => Err(err),
+            other => Err(FluxError::Meta(format!(
+                "unexpected raft response: {other:?}"
+            ))),
+        }
+    }
 }
 
 impl MetaStore for RaftMetaStore {
@@ -191,6 +201,64 @@ impl MetaStore for RaftMetaStore {
             manifest: Box::new(manifest.clone()),
         })?;
         Self::map_inode(resp)
+    }
+
+    fn reserve_chunks(
+        &self,
+        ticket: WriteTicketId,
+        inode: InodeId,
+        expected_generation: u64,
+        chunks: &[ChunkId],
+    ) -> Result<()> {
+        Self::map_empty(self.write(MetaRaftRequest::ReserveChunks {
+            request_id: Some(RequestOpId::random()),
+            ticket,
+            inode,
+            expected_generation,
+            chunks: chunks.to_vec(),
+        })?)
+    }
+
+    fn abort_chunk_reservation(&self, ticket: WriteTicketId) -> Result<()> {
+        Self::map_empty(self.write(MetaRaftRequest::AbortChunkReservation {
+            request_id: Some(RequestOpId::random()),
+            ticket,
+        })?)
+    }
+
+    fn commit_inode_manifest_reserved_with_id(
+        &self,
+        op_id: RequestOpId,
+        ticket: WriteTicketId,
+        expected_generation: u64,
+        inode: &Inode,
+        manifest: &Manifest,
+    ) -> Result<Inode> {
+        Self::map_inode(self.write(MetaRaftRequest::CommitInodeManifestReserved {
+            request_id: Some(op_id),
+            ticket,
+            expected_generation,
+            inode: Box::new(inode.clone()),
+            manifest: Box::new(manifest.clone()),
+        })?)
+    }
+
+    fn tombstone_gc_batch(&self, candidates: &[ChunkId]) -> Result<GcBatch> {
+        Self::map_gc_batch(self.write(MetaRaftRequest::TombstoneGcBatch {
+            request_id: Some(RequestOpId::random()),
+            candidates: candidates.to_vec(),
+        })?)
+    }
+
+    fn list_gc_tombstones(&self) -> Result<Vec<ChunkId>> {
+        self.store.list_gc_tombstones()
+    }
+
+    fn finalize_gc_tombstones(&self, chunks: &[ChunkId]) -> Result<()> {
+        Self::map_empty(self.write(MetaRaftRequest::FinalizeGcTombstones {
+            request_id: Some(RequestOpId::random()),
+            chunks: chunks.to_vec(),
+        })?)
     }
 
     fn get_manifest(&self, id: ManifestId) -> Result<Manifest> {

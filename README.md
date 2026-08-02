@@ -15,8 +15,10 @@ up only touched 4 MiB windows into RF=2 Local extents, keep untouched bytes as
 pinned UFS ranges, then atomically CAS the inode to Dirty. Basic create/read/write, random write,
 truncate, mkdir/readdir, unlink, unmount/remount, process-crash recovery, and
 single-replica read fallback are executable. `fsync` performs conditional,
-digest-verified UFS write-back; startup reconciles durable flush intents and
-reclaims unreachable manifests/chunks before serving FUSE.
+digest-verified UFS write-back; startup reconciles durable flush intents without
+waiting for a full GC sweep. Chunk writes reserve their content addresses in
+Meta before RF Put, and GC uses bounded durable tombstone batches so physical
+deletion can run concurrently without racing a manifest commit.
 
 The same Ephemeral path also runs as five localhost processes: one MetaMaster,
 three ChunkWorkers, and one FUSE/client. Meta and chunk traffic use tonic/TCP;

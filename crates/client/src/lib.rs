@@ -4,8 +4,8 @@ use fluxfs_chunk::ChunkStore;
 use fluxfs_meta::MetaStore;
 use fluxfs_types::{
     BackingMode, ChunkId, DataGen, DataState, Extent, FileType, FlushId, FlushIntent, FluxError,
-    GcLeaseId, Inode, InodeId, LocalityFields, LocalityLabel, Manifest, OpState, Origin,
-    RequestOpId, Result, UfsObject, UfsVersion, CHUNK_SIZE, DIRTY_WRITE_CAP_BYTES, ROOT_INODE,
+    Inode, InodeId, LocalityFields, LocalityLabel, Manifest, OpState, Origin, RequestOpId, Result,
+    UfsObject, UfsVersion, WriteTicketId, CHUNK_SIZE, DIRTY_WRITE_CAP_BYTES, ROOT_INODE,
 };
 use fluxfs_ufs::{ReadPathConfig, ReadPathStats, Ufs, UfsEntryMode, UfsProbe, UfsReadPath};
 use std::collections::{BTreeSet, HashMap};
@@ -289,18 +289,38 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         Ok(true)
     }
 
-    /// Atomically freeze metadata mutations, remove unreachable manifests, and
-    /// sweep physical chunks not referenced by any active inode manifest.
-    ///
-    /// Historical quiesced API: safe only when no writer can stage chunks that
-    /// commit after the lease snapshot. Mount no longer invokes this on the
-    /// critical path; use explicit tooling/tests until online GC lands.
+    /// Concurrent mark/tombstone/delete pass. Durable pre-Put reservations and
+    /// tombstones close the writer-vs-delete race without a global Meta lease.
     pub fn run_orphan_gc(&self) -> Result<OrphanGcReport> {
-        let plan = match self.meta.current_gc_plan()? {
-            Some(plan) => plan,
-            None => self.meta.begin_gc(GcLeaseId::random())?,
-        };
-        self.execute_gc_plan(plan)
+        self.run_concurrent_gc_pass(256)
+    }
+
+    pub fn run_concurrent_gc_pass(&self, batch_size: usize) -> Result<OrphanGcReport> {
+        if batch_size == 0 {
+            return Err(FluxError::InvalidArg(
+                "GC batch size must be non-zero".into(),
+            ));
+        }
+        let mut report = OrphanGcReport::default();
+        let pending = self.meta.list_gc_tombstones()?;
+        for batch in pending.chunks(batch_size) {
+            for chunk in batch {
+                self.chunks.delete(chunk)?;
+                report.removed_chunks += 1;
+            }
+            self.meta.finalize_gc_tombstones(batch)?;
+        }
+        let inventory = self.chunks.list_chunks()?;
+        for candidates in inventory.chunks(batch_size) {
+            let batch = self.meta.tombstone_gc_batch(candidates)?;
+            report.removed_manifests += batch.removed_manifests;
+            for chunk in &batch.tombstoned_chunks {
+                self.chunks.delete(chunk)?;
+                report.removed_chunks += 1;
+            }
+            self.meta.finalize_gc_tombstones(&batch.tombstoned_chunks)?;
+        }
+        Ok(report)
     }
 
     fn execute_gc_plan(&self, plan: fluxfs_types::GcPlan) -> Result<OrphanGcReport> {
@@ -479,19 +499,18 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         buf[start..start + data.len()].copy_from_slice(data);
 
         let gen = DataGen(inode.head_gen.0.saturating_add(1));
-        let manifest = self.build_local_manifest(ino, gen, &buf)?;
+        let (manifest, staged) = self.build_local_manifest(ino, gen, &buf);
         let now = now_ms();
         inode.size = buf.len() as u64;
         inode.head_gen = gen;
         inode.generation = inode.generation.saturating_add(1);
         inode.mtime_ms = now;
         inode.ctime_ms = now;
-        let op_id = RequestOpId::random();
-        self.meta.commit_inode_manifest_with_id(
-            op_id,
+        self.commit_staged_manifest(
             inode.generation.saturating_sub(1),
             &inode,
             &manifest,
+            &staged,
         )?;
         Ok(data.len() as u32)
     }
@@ -513,6 +532,7 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
             Some(id) => self.meta.get_manifest(id)?,
             None => Manifest::empty(inode.id, inode.head_gen),
         };
+        let mut staged = Vec::new();
 
         let first_window = offset / CHUNK_SIZE;
         let last_window = (end - 1) / CHUNK_SIZE;
@@ -543,7 +563,8 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
 
             // ChunkStore::put is the RF=2 durability boundary. Metadata remains
             // unreachable until commit_inode_manifest succeeds below.
-            let chunk = self.chunks.put(&bytes)?;
+            let chunk = ChunkId::from_bytes(&bytes);
+            staged.push((chunk, bytes));
             manifest = manifest.replace_range(
                 Extent::Local {
                     offset: window_start,
@@ -576,9 +597,7 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         );
         inode.mtime_ms = now;
         inode.ctime_ms = now;
-        let op_id = RequestOpId::random();
-        self.meta
-            .commit_inode_manifest_with_id(op_id, expected_generation, inode, &manifest)?;
+        self.commit_staged_manifest(expected_generation, inode, &manifest, &staged)?;
         Ok(data.len() as u32)
     }
 
@@ -600,45 +619,89 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         }
         let mut buf = self.read_all(ino)?;
         buf.resize(size as usize, 0);
-        let mid = if size == 0 {
-            None
-        } else {
-            let gen = DataGen(inode.head_gen.0.saturating_add(1));
-            let manifest = self.build_local_manifest(ino, gen, &buf)?;
-            inode.head_gen = gen;
-            Some(self.meta.put_manifest(&manifest)?)
-        };
+        let gen = DataGen(inode.head_gen.0.saturating_add(1));
+        let (manifest, staged) = self.build_local_manifest(ino, gen, &buf);
+        inode.head_gen = gen;
         let now = now_ms();
-        if size == 0 {
-            inode.head_gen = DataGen(inode.head_gen.0.saturating_add(1));
-        }
         inode.size = size;
-        inode.manifest_id = mid;
         inode.generation = inode.generation.saturating_add(1);
         inode.mtime_ms = now;
         inode.ctime_ms = now;
-        self.meta.put_inode(&inode)?;
-        Ok(inode)
+        self.commit_staged_manifest(
+            inode.generation.saturating_sub(1),
+            &inode,
+            &manifest,
+            &staged,
+        )
     }
 
     /// Split one logical file image into bounded content-addressed RPC/storage chunks.
-    /// A failure leaves only unreachable chunks because the manifest is committed last.
-    fn build_local_manifest(&self, ino: InodeId, gen: DataGen, data: &[u8]) -> Result<Manifest> {
+    /// Build hashes before Put so Meta can durably reserve every content address.
+    fn build_local_manifest(
+        &self,
+        ino: InodeId,
+        gen: DataGen,
+        data: &[u8],
+    ) -> (Manifest, Vec<(ChunkId, Vec<u8>)>) {
         let mut extents = Vec::with_capacity(data.len().div_ceil(CHUNK_SIZE as usize));
+        let mut staged = Vec::with_capacity(extents.capacity());
         for (index, bytes) in data.chunks(CHUNK_SIZE as usize).enumerate() {
-            let chunk = self.chunks.put(bytes)?;
+            let chunk = ChunkId::from_bytes(bytes);
             extents.push(Extent::Local {
                 offset: index as u64 * CHUNK_SIZE,
                 len: bytes.len() as u64,
                 chunk,
             });
+            staged.push((chunk, bytes.to_vec()));
         }
-        Ok(Manifest {
-            inode: ino,
-            gen,
-            size: data.len() as u64,
-            extents,
-        })
+        (
+            Manifest {
+                inode: ino,
+                gen,
+                size: data.len() as u64,
+                extents,
+            },
+            staged,
+        )
+    }
+
+    fn commit_staged_manifest(
+        &self,
+        expected_generation: u64,
+        inode: &Inode,
+        manifest: &Manifest,
+        staged: &[(ChunkId, Vec<u8>)],
+    ) -> Result<Inode> {
+        let ticket = WriteTicketId::random();
+        let local_chunks = manifest
+            .extents
+            .iter()
+            .filter_map(|extent| match extent {
+                Extent::Local { chunk, .. } => Some(*chunk),
+                Extent::UfsRange { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        self.meta
+            .reserve_chunks(ticket, inode.id, expected_generation, &local_chunks)?;
+        let result = (|| {
+            for (expected, bytes) in staged {
+                let actual = self.chunks.put(bytes)?;
+                if actual != *expected {
+                    return Err(FluxError::Io("ChunkStore returned wrong content id".into()));
+                }
+            }
+            self.meta.commit_inode_manifest_reserved_with_id(
+                RequestOpId::random(),
+                ticket,
+                expected_generation,
+                inode,
+                manifest,
+            )
+        })();
+        if result.is_err() {
+            let _ = self.meta.abort_chunk_reservation(ticket);
+        }
+        result
     }
 
     fn read_inode_range(&self, inode: &Inode, offset: u64, len: u64) -> Result<Vec<u8>> {
@@ -1021,6 +1084,44 @@ mod tests {
         assert!(!client.chunks.contains(&old[0]).unwrap());
         assert_eq!(client.read_all(file.id).unwrap(), b"new bytes");
         assert!(client.meta.current_gc_plan().unwrap().is_none());
+    }
+
+    #[test]
+    fn concurrent_gc_respects_reservations_and_resumes_tombstones() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta_path = dir.path().join("meta");
+        let chunks_path = dir.path().join("chunks");
+        let client = FluxClient::new(
+            HeedMetaStore::open(&meta_path).unwrap(),
+            DiskChunkStore::open(&chunks_path).unwrap(),
+        );
+        let file = client
+            .create_file(ROOT_INODE, "reservation", 0o644, 0, 0)
+            .unwrap();
+        let bytes = b"staged-but-not-committed";
+        let chunk = client.chunks.put(bytes).unwrap();
+        let ticket = WriteTicketId(500);
+        client
+            .meta
+            .reserve_chunks(ticket, file.id, file.generation, &[chunk])
+            .unwrap();
+        assert_eq!(client.run_concurrent_gc_pass(1).unwrap().removed_chunks, 0);
+        assert!(client.chunks.contains(&chunk).unwrap());
+
+        client.meta.abort_chunk_reservation(ticket).unwrap();
+        let batch = client.meta.tombstone_gc_batch(&[chunk]).unwrap();
+        assert_eq!(batch.tombstoned_chunks, vec![chunk]);
+        // Crash after physical delete but before tombstone finalize.
+        client.chunks.delete(&chunk).unwrap();
+        drop(client);
+
+        let recovered = FluxClient::new(
+            HeedMetaStore::open(&meta_path).unwrap(),
+            DiskChunkStore::open(&chunks_path).unwrap(),
+        );
+        recovered.run_concurrent_gc_pass(1).unwrap();
+        assert!(recovered.meta.list_gc_tombstones().unwrap().is_empty());
+        assert!(!recovered.chunks.contains(&chunk).unwrap());
     }
 
     #[test]

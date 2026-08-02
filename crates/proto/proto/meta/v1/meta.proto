@@ -14,6 +14,12 @@ service MetaService {
   rpc PutManifest(PutManifestRequest) returns (PutManifestResponse);
   // Atomically store a new manifest and CAS-update the inode head.
   rpc CommitInodeManifest(CommitInodeManifestRequest) returns (CommitInodeManifestResponse);
+  rpc ReserveChunks(ReserveChunksRequest) returns (ReserveChunksResponse);
+  rpc AbortChunkReservation(AbortChunkReservationRequest) returns (AbortChunkReservationResponse);
+  rpc CommitInodeManifestReserved(CommitInodeManifestReservedRequest) returns (CommitInodeManifestResponse);
+  rpc TombstoneGcBatch(TombstoneGcBatchRequest) returns (TombstoneGcBatchResponse);
+  rpc ListGcTombstones(ListGcTombstonesRequest) returns (ListGcTombstonesResponse);
+  rpc FinalizeGcTombstones(FinalizeGcTombstonesRequest) returns (FinalizeGcTombstonesResponse);
   rpc GetManifest(GetManifestRequest) returns (GetManifestResponse);
   rpc BeginFlush(BeginFlushRequest) returns (BeginFlushResponse);
   rpc CommitFlush(CommitFlushRequest) returns (CommitFlushResponse);
@@ -72,6 +78,30 @@ message CommitInodeManifestResponse {
   bytes inode_json = 1;
   uint64 manifest_id = 2;
 }
+
+message ReserveChunksRequest {
+  uint64 ticket = 1;
+  uint64 inode = 2;
+  uint64 expected_generation = 3;
+  bytes chunks_json = 4;
+  string request_id = 5;
+}
+message ReserveChunksResponse {}
+message AbortChunkReservationRequest { uint64 ticket = 1; string request_id = 2; }
+message AbortChunkReservationResponse {}
+message CommitInodeManifestReservedRequest {
+  uint64 ticket = 1;
+  uint64 expected_generation = 2;
+  bytes inode_json = 3;
+  bytes manifest_json = 4;
+  string request_id = 5;
+}
+message TombstoneGcBatchRequest { bytes chunks_json = 1; string request_id = 2; }
+message TombstoneGcBatchResponse { bytes batch_json = 1; }
+message ListGcTombstonesRequest {}
+message ListGcTombstonesResponse { bytes chunks_json = 1; }
+message FinalizeGcTombstonesRequest { bytes chunks_json = 1; string request_id = 2; }
+message FinalizeGcTombstonesResponse {}
 
 message GetManifestRequest { uint64 id = 1; }
 message GetManifestResponse { bytes manifest_json = 1; }

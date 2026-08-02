@@ -4,23 +4,26 @@ use fluxfs_meta::{
     start_single_voter, FluxRaft, HeedMetaStore, MetaRaftRequest, MetaRaftResponse, MetaStore,
 };
 use fluxfs_proto::meta::v1::{
-    BeginFlushRequest, BeginFlushResponse, BeginGcRequest, BeginGcResponse, CommitFlushRequest,
-    CommitFlushResponse, CommitInodeManifestRequest, CommitInodeManifestResponse, CreateRequest,
-    CreateResponse, CurrentGcPlanRequest, CurrentGcPlanResponse, FailFlushConflictRequest,
-    FailFlushConflictResponse, FinishGcRequest, FinishGcResponse, GetInodeRequest,
+    AbortChunkReservationRequest, AbortChunkReservationResponse, BeginFlushRequest,
+    BeginFlushResponse, BeginGcRequest, BeginGcResponse, CommitFlushRequest, CommitFlushResponse,
+    CommitInodeManifestRequest, CommitInodeManifestReservedRequest, CommitInodeManifestResponse,
+    CreateRequest, CreateResponse, CurrentGcPlanRequest, CurrentGcPlanResponse,
+    FailFlushConflictRequest, FailFlushConflictResponse, FinalizeGcTombstonesRequest,
+    FinalizeGcTombstonesResponse, FinishGcRequest, FinishGcResponse, GetInodeRequest,
     GetInodeResponse, GetManifestRequest, GetManifestResponse, ImportExternalRequest,
-    ImportExternalResponse, ListFlushIntentsRequest, ListFlushIntentsResponse, LookupRequest,
-    LookupResponse, PingRequest, PingResponse, PutInodeRequest, PutInodeResponse,
-    PutManifestRequest, PutManifestResponse, ReaddirRequest, ReaddirResponse, UnlinkRequest,
-    UnlinkResponse,
+    ImportExternalResponse, ListFlushIntentsRequest, ListFlushIntentsResponse,
+    ListGcTombstonesRequest, ListGcTombstonesResponse, LookupRequest, LookupResponse, PingRequest,
+    PingResponse, PutInodeRequest, PutInodeResponse, PutManifestRequest, PutManifestResponse,
+    ReaddirRequest, ReaddirResponse, ReserveChunksRequest, ReserveChunksResponse,
+    TombstoneGcBatchRequest, TombstoneGcBatchResponse, UnlinkRequest, UnlinkResponse,
 };
 use fluxfs_proto::meta_codec::{
-    decode_flush_intent, decode_inode, decode_manifest, decode_ufs_object, encode_dentries,
-    encode_flush_intents, encode_gc_plan, encode_inode, encode_manifest, file_type_from_wire,
-    status_from_flux,
+    decode_chunk_ids, decode_flush_intent, decode_inode, decode_manifest, decode_ufs_object,
+    encode_chunk_ids, encode_dentries, encode_flush_intents, encode_gc_batch, encode_gc_plan,
+    encode_inode, encode_manifest, file_type_from_wire, status_from_flux,
 };
 use fluxfs_proto::{MetaService, MetaServiceServer};
-use fluxfs_types::{FlushId, GcLeaseId, ManifestId, RequestOpId};
+use fluxfs_types::{FlushId, GcLeaseId, ManifestId, RequestOpId, WriteTicketId};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -90,6 +93,18 @@ impl MetaSvc {
     ) -> std::result::Result<fluxfs_types::GcPlan, Status> {
         match resp {
             MetaRaftResponse::GcPlan(plan) => Ok(*plan),
+            MetaRaftResponse::Err(err) => Err(status_from_flux(err)),
+            other => Err(Status::internal(format!(
+                "unexpected raft response: {other:?}"
+            ))),
+        }
+    }
+
+    fn map_resp_gc_batch(
+        resp: MetaRaftResponse,
+    ) -> std::result::Result<fluxfs_types::GcBatch, Status> {
+        match resp {
+            MetaRaftResponse::GcBatch(batch) => Ok(*batch),
             MetaRaftResponse::Err(err) => Err(status_from_flux(err)),
             other => Err(Status::internal(format!(
                 "unexpected raft response: {other:?}"
@@ -223,6 +238,106 @@ impl MetaService for MetaSvc {
             inode_json: encode_inode(&inode).map_err(status_from_flux)?,
             manifest_id,
         }))
+    }
+
+    async fn reserve_chunks(
+        &self,
+        req: Request<ReserveChunksRequest>,
+    ) -> Result<Response<ReserveChunksResponse>, Status> {
+        let r = req.into_inner();
+        let response = self
+            .write(MetaRaftRequest::ReserveChunks {
+                request_id: parse_request_op_id(&r.request_id),
+                ticket: WriteTicketId(r.ticket),
+                inode: r.inode,
+                expected_generation: r.expected_generation,
+                chunks: decode_chunk_ids(&r.chunks_json).map_err(status_from_flux)?,
+            })
+            .await?;
+        Self::map_resp_empty(response)?;
+        Ok(Response::new(ReserveChunksResponse {}))
+    }
+
+    async fn abort_chunk_reservation(
+        &self,
+        req: Request<AbortChunkReservationRequest>,
+    ) -> Result<Response<AbortChunkReservationResponse>, Status> {
+        let r = req.into_inner();
+        let response = self
+            .write(MetaRaftRequest::AbortChunkReservation {
+                request_id: parse_request_op_id(&r.request_id),
+                ticket: WriteTicketId(r.ticket),
+            })
+            .await?;
+        Self::map_resp_empty(response)?;
+        Ok(Response::new(AbortChunkReservationResponse {}))
+    }
+
+    async fn commit_inode_manifest_reserved(
+        &self,
+        req: Request<CommitInodeManifestReservedRequest>,
+    ) -> Result<Response<CommitInodeManifestResponse>, Status> {
+        let r = req.into_inner();
+        let response = self
+            .write(MetaRaftRequest::CommitInodeManifestReserved {
+                request_id: parse_request_op_id(&r.request_id),
+                ticket: WriteTicketId(r.ticket),
+                expected_generation: r.expected_generation,
+                inode: Box::new(decode_inode(&r.inode_json).map_err(status_from_flux)?),
+                manifest: Box::new(decode_manifest(&r.manifest_json).map_err(status_from_flux)?),
+            })
+            .await?;
+        let inode = Self::map_resp_inode(response)?;
+        let manifest_id = inode
+            .manifest_id
+            .ok_or_else(|| Status::internal("reserved commit missing manifest id"))?
+            .0;
+        Ok(Response::new(CommitInodeManifestResponse {
+            inode_json: encode_inode(&inode).map_err(status_from_flux)?,
+            manifest_id,
+        }))
+    }
+
+    async fn tombstone_gc_batch(
+        &self,
+        req: Request<TombstoneGcBatchRequest>,
+    ) -> Result<Response<TombstoneGcBatchResponse>, Status> {
+        let r = req.into_inner();
+        let response = self
+            .write(MetaRaftRequest::TombstoneGcBatch {
+                request_id: parse_request_op_id(&r.request_id),
+                candidates: decode_chunk_ids(&r.chunks_json).map_err(status_from_flux)?,
+            })
+            .await?;
+        let batch = Self::map_resp_gc_batch(response)?;
+        Ok(Response::new(TombstoneGcBatchResponse {
+            batch_json: encode_gc_batch(&batch).map_err(status_from_flux)?,
+        }))
+    }
+
+    async fn list_gc_tombstones(
+        &self,
+        _req: Request<ListGcTombstonesRequest>,
+    ) -> Result<Response<ListGcTombstonesResponse>, Status> {
+        let chunks = self.store.list_gc_tombstones().map_err(status_from_flux)?;
+        Ok(Response::new(ListGcTombstonesResponse {
+            chunks_json: encode_chunk_ids(&chunks).map_err(status_from_flux)?,
+        }))
+    }
+
+    async fn finalize_gc_tombstones(
+        &self,
+        req: Request<FinalizeGcTombstonesRequest>,
+    ) -> Result<Response<FinalizeGcTombstonesResponse>, Status> {
+        let r = req.into_inner();
+        let response = self
+            .write(MetaRaftRequest::FinalizeGcTombstones {
+                request_id: parse_request_op_id(&r.request_id),
+                chunks: decode_chunk_ids(&r.chunks_json).map_err(status_from_flux)?,
+            })
+            .await?;
+        Self::map_resp_empty(response)?;
+        Ok(Response::new(FinalizeGcTombstonesResponse {}))
     }
 
     async fn get_manifest(

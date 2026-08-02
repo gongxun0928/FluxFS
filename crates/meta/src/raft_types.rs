@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 
 use fluxfs_types::{
-    FileType, FlushId, FlushIntent, FluxError, GcLeaseId, GcPlan, Inode, Manifest, RequestOpId,
-    UfsObject,
+    ChunkId, FileType, FlushId, FlushIntent, FluxError, GcBatch, GcLeaseId, GcPlan, Inode,
+    Manifest, RequestOpId, UfsObject, WriteTicketId,
 };
 
 pub type NodeId = u64;
@@ -61,6 +61,37 @@ pub enum MetaRaftRequest {
         expected_generation: u64,
         inode: Box<Inode>,
         manifest: Box<Manifest>,
+    },
+    ReserveChunks {
+        #[serde(default)]
+        request_id: Option<RequestOpId>,
+        ticket: WriteTicketId,
+        inode: u64,
+        expected_generation: u64,
+        chunks: Vec<ChunkId>,
+    },
+    AbortChunkReservation {
+        #[serde(default)]
+        request_id: Option<RequestOpId>,
+        ticket: WriteTicketId,
+    },
+    CommitInodeManifestReserved {
+        #[serde(default)]
+        request_id: Option<RequestOpId>,
+        ticket: WriteTicketId,
+        expected_generation: u64,
+        inode: Box<Inode>,
+        manifest: Box<Manifest>,
+    },
+    TombstoneGcBatch {
+        #[serde(default)]
+        request_id: Option<RequestOpId>,
+        candidates: Vec<ChunkId>,
+    },
+    FinalizeGcTombstones {
+        #[serde(default)]
+        request_id: Option<RequestOpId>,
+        chunks: Vec<ChunkId>,
     },
     BeginFlush {
         #[serde(default)]
@@ -126,6 +157,11 @@ impl MetaRaftRequest {
             | Self::PutInode { request_id, .. }
             | Self::PutManifest { request_id, .. }
             | Self::CommitInodeManifest { request_id, .. }
+            | Self::ReserveChunks { request_id, .. }
+            | Self::AbortChunkReservation { request_id, .. }
+            | Self::CommitInodeManifestReserved { request_id, .. }
+            | Self::TombstoneGcBatch { request_id, .. }
+            | Self::FinalizeGcTombstones { request_id, .. }
             | Self::BeginFlush { request_id, .. }
             | Self::CommitFlush { request_id, .. }
             | Self::FailFlushConflict { request_id, .. }
@@ -142,6 +178,11 @@ impl MetaRaftRequest {
             | Self::PutInode { request_id, .. }
             | Self::PutManifest { request_id, .. }
             | Self::CommitInodeManifest { request_id, .. }
+            | Self::ReserveChunks { request_id, .. }
+            | Self::AbortChunkReservation { request_id, .. }
+            | Self::CommitInodeManifestReserved { request_id, .. }
+            | Self::TombstoneGcBatch { request_id, .. }
+            | Self::FinalizeGcTombstones { request_id, .. }
             | Self::BeginFlush { request_id, .. }
             | Self::CommitFlush { request_id, .. }
             | Self::FailFlushConflict { request_id, .. }
@@ -163,6 +204,7 @@ pub enum MetaRaftResponse {
     Inode(Box<Inode>),
     ManifestId(u64),
     GcPlan(Box<GcPlan>),
+    GcBatch(Box<GcBatch>),
     Err(FluxError),
 }
 

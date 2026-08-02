@@ -44,9 +44,13 @@ write-back, full POSIX behavior, multi-tenant security, or production operations
    reconstruct/Put/verify, conditional publication, generation CAS, replay after
    crash, and explicit DirtyConflict handling. Never mark Clean merely because a
    Put returned success.
-6. **Garbage collection is absent.** CAS losers and superseded manifests/chunks
-   intentionally leave orphans today. Add reference tracking, safe epochs, GC,
-   reconciliation, and deletion retry before unbounded service operation.
+6. **Concurrent garbage collection has a correctness core but incomplete lifecycle.**
+   Writers durably reserve all Local content addresses before RF Put; bounded
+   Meta transactions compute current manifest/reservation references, tombstone
+   only zero-reference candidates, and fence new reservations until idempotent
+   Worker deletion is finalized. Tombstones survive snapshots/restarts. Remaining
+   work includes abandoned-reservation expiry, inode reclamation after unlink,
+   down-Worker retry accounting, metrics, and production-scale reference indexes.
 7. **Error contracts are lossy.** Some typed tonic errors are reconstructed from
    strings. Use structured error details with stable wire codes and retryability.
 

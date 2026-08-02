@@ -1,7 +1,7 @@
 use crate::meta::v1;
 use fluxfs_types::{
-    Dentry, FileType, FlushIntent, FluxError, GcPlan, Inode, InodeId, Manifest, ManifestId,
-    Result as FluxResult, UfsObject,
+    ChunkId, Dentry, FileType, FlushIntent, FluxError, GcBatch, GcPlan, Inode, InodeId, Manifest,
+    ManifestId, Result as FluxResult, UfsObject,
 };
 
 pub fn encode_inode(inode: &Inode) -> FluxResult<Vec<u8>> {
@@ -49,6 +49,22 @@ pub fn encode_gc_plan(plan: &GcPlan) -> FluxResult<Vec<u8>> {
 }
 
 pub fn decode_gc_plan(bytes: &[u8]) -> FluxResult<GcPlan> {
+    serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))
+}
+
+pub fn encode_chunk_ids(chunks: &[ChunkId]) -> FluxResult<Vec<u8>> {
+    serde_json::to_vec(chunks).map_err(|e| FluxError::Meta(e.to_string()))
+}
+
+pub fn decode_chunk_ids(bytes: &[u8]) -> FluxResult<Vec<ChunkId>> {
+    serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))
+}
+
+pub fn encode_gc_batch(batch: &GcBatch) -> FluxResult<Vec<u8>> {
+    serde_json::to_vec(batch).map_err(|e| FluxError::Meta(e.to_string()))
+}
+
+pub fn decode_gc_batch(bytes: &[u8]) -> FluxResult<GcBatch> {
     serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))
 }
 

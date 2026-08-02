@@ -2,20 +2,22 @@
 
 use crate::store::MetaStore;
 use fluxfs_proto::meta::v1::{
-    BeginFlushRequest, BeginGcRequest, CommitFlushRequest, CommitInodeManifestRequest,
-    CreateRequest, CurrentGcPlanRequest, FailFlushConflictRequest, FinishGcRequest,
+    AbortChunkReservationRequest, BeginFlushRequest, BeginGcRequest, CommitFlushRequest,
+    CommitInodeManifestRequest, CommitInodeManifestReservedRequest, CreateRequest,
+    CurrentGcPlanRequest, FailFlushConflictRequest, FinalizeGcTombstonesRequest, FinishGcRequest,
     GetInodeRequest, GetManifestRequest, ImportExternalRequest, ListFlushIntentsRequest,
-    LookupRequest, PutInodeRequest, PutManifestRequest, ReaddirRequest, UnlinkRequest,
+    ListGcTombstonesRequest, LookupRequest, PutInodeRequest, PutManifestRequest, ReaddirRequest,
+    ReserveChunksRequest, TombstoneGcBatchRequest, UnlinkRequest,
 };
 use fluxfs_proto::meta_codec::{
-    decode_dentries, decode_flush_intents, decode_gc_plan, decode_inode, decode_manifest,
-    encode_flush_intent, encode_inode, encode_manifest, encode_ufs_object, file_type_to_wire,
-    flux_from_status,
+    decode_chunk_ids, decode_dentries, decode_flush_intents, decode_gc_batch, decode_gc_plan,
+    decode_inode, decode_manifest, encode_chunk_ids, encode_flush_intent, encode_inode,
+    encode_manifest, encode_ufs_object, file_type_to_wire, flux_from_status,
 };
 use fluxfs_proto::MetaServiceClient;
 use fluxfs_types::{
-    Dentry, FileType, FlushId, FlushIntent, FluxError, GcLeaseId, GcPlan, Inode, InodeId, Manifest,
-    ManifestId, RequestOpId, Result, UfsObject, ROOT_INODE,
+    ChunkId, Dentry, FileType, FlushId, FlushIntent, FluxError, GcBatch, GcLeaseId, GcPlan, Inode,
+    InodeId, Manifest, ManifestId, RequestOpId, Result, UfsObject, WriteTicketId, ROOT_INODE,
 };
 use std::future::Future;
 use std::sync::Mutex;
@@ -186,6 +188,108 @@ impl MetaStore for RemoteMetaStore {
             .map_err(flux_from_status)?
             .into_inner();
         decode_inode(&resp.inode_json)
+    }
+
+    fn reserve_chunks(
+        &self,
+        ticket: WriteTicketId,
+        inode: InodeId,
+        expected_generation: u64,
+        chunks: &[ChunkId],
+    ) -> Result<()> {
+        let mut c = self.client()?;
+        let chunks_json = encode_chunk_ids(chunks)?;
+        self.block_on(async {
+            c.reserve_chunks(ReserveChunksRequest {
+                ticket: ticket.0,
+                inode,
+                expected_generation,
+                chunks_json,
+                request_id: RequestOpId::random().to_hex(),
+            })
+            .await
+        })
+        .map_err(flux_from_status)?;
+        Ok(())
+    }
+
+    fn abort_chunk_reservation(&self, ticket: WriteTicketId) -> Result<()> {
+        let mut c = self.client()?;
+        self.block_on(async {
+            c.abort_chunk_reservation(AbortChunkReservationRequest {
+                ticket: ticket.0,
+                request_id: RequestOpId::random().to_hex(),
+            })
+            .await
+        })
+        .map_err(flux_from_status)?;
+        Ok(())
+    }
+
+    fn commit_inode_manifest_reserved_with_id(
+        &self,
+        op_id: RequestOpId,
+        ticket: WriteTicketId,
+        expected_generation: u64,
+        inode: &Inode,
+        manifest: &Manifest,
+    ) -> Result<Inode> {
+        let mut c = self.client()?;
+        let inode_json = encode_inode(inode)?;
+        let manifest_json = encode_manifest(manifest)?;
+        let response = self
+            .block_on(async {
+                c.commit_inode_manifest_reserved(CommitInodeManifestReservedRequest {
+                    ticket: ticket.0,
+                    expected_generation,
+                    inode_json,
+                    manifest_json,
+                    request_id: op_id.to_hex(),
+                })
+                .await
+            })
+            .map_err(flux_from_status)?
+            .into_inner();
+        decode_inode(&response.inode_json)
+    }
+
+    fn tombstone_gc_batch(&self, candidates: &[ChunkId]) -> Result<GcBatch> {
+        let mut c = self.client()?;
+        let chunks_json = encode_chunk_ids(candidates)?;
+        let response = self
+            .block_on(async {
+                c.tombstone_gc_batch(TombstoneGcBatchRequest {
+                    chunks_json,
+                    request_id: RequestOpId::random().to_hex(),
+                })
+                .await
+            })
+            .map_err(flux_from_status)?
+            .into_inner();
+        decode_gc_batch(&response.batch_json)
+    }
+
+    fn list_gc_tombstones(&self) -> Result<Vec<ChunkId>> {
+        let mut c = self.client()?;
+        let response = self
+            .block_on(async { c.list_gc_tombstones(ListGcTombstonesRequest {}).await })
+            .map_err(flux_from_status)?
+            .into_inner();
+        decode_chunk_ids(&response.chunks_json)
+    }
+
+    fn finalize_gc_tombstones(&self, chunks: &[ChunkId]) -> Result<()> {
+        let mut c = self.client()?;
+        let chunks_json = encode_chunk_ids(chunks)?;
+        self.block_on(async {
+            c.finalize_gc_tombstones(FinalizeGcTombstonesRequest {
+                chunks_json,
+                request_id: RequestOpId::random().to_hex(),
+            })
+            .await
+        })
+        .map_err(flux_from_status)?;
+        Ok(())
     }
 
     fn get_manifest(&self, id: ManifestId) -> Result<Manifest> {
