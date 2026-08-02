@@ -30,67 +30,72 @@ pub fn decode_flush_intent(bytes: &[u8]) -> FluxResult<FlushIntent> {
 }
 
 pub fn encode_ufs_object(object: &UfsObject) -> FluxResult<Vec<u8>> {
-    serde_json::to_vec(object).map_err(|e| FluxError::Meta(e.to_string()))
+    encode_versioned(object)
 }
 
 pub fn decode_ufs_object(bytes: &[u8]) -> FluxResult<UfsObject> {
-    serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))
+    decode_versioned(bytes)
 }
 
 pub fn encode_flush_intents(intents: &[(InodeId, FlushIntent)]) -> FluxResult<Vec<u8>> {
-    serde_json::to_vec(intents).map_err(|e| FluxError::Meta(e.to_string()))
+    let owned: Vec<(InodeId, FlushIntent)> = intents.to_vec();
+    encode_versioned(&owned)
 }
 
 pub fn decode_flush_intents(bytes: &[u8]) -> FluxResult<Vec<(InodeId, FlushIntent)>> {
-    serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))
+    decode_versioned(bytes)
 }
 
 pub fn encode_gc_plan(plan: &GcPlan) -> FluxResult<Vec<u8>> {
-    serde_json::to_vec(plan).map_err(|e| FluxError::Meta(e.to_string()))
+    encode_versioned(plan)
 }
 
 pub fn decode_gc_plan(bytes: &[u8]) -> FluxResult<GcPlan> {
-    serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))
+    decode_versioned(bytes)
 }
 
 pub fn encode_chunk_ids(chunks: &[ChunkId]) -> FluxResult<Vec<u8>> {
-    serde_json::to_vec(chunks).map_err(|e| FluxError::Meta(e.to_string()))
+    let owned: Vec<ChunkId> = chunks.to_vec();
+    encode_versioned(&owned)
 }
 
 pub fn decode_chunk_ids(bytes: &[u8]) -> FluxResult<Vec<ChunkId>> {
-    serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))
+    decode_versioned(bytes)
 }
 
 pub fn encode_gc_batch(batch: &GcBatch) -> FluxResult<Vec<u8>> {
-    serde_json::to_vec(batch).map_err(|e| FluxError::Meta(e.to_string()))
+    encode_versioned(batch)
 }
 
 pub fn decode_gc_batch(bytes: &[u8]) -> FluxResult<GcBatch> {
-    serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))
+    decode_versioned(bytes)
 }
 
 pub fn encode_gc_tombstones(value: &[GcTombstone]) -> FluxResult<Vec<u8>> {
-    serde_json::to_vec(value).map_err(|e| FluxError::Meta(e.to_string()))
+    let owned: Vec<GcTombstone> = value.to_vec();
+    encode_versioned(&owned)
 }
 
 pub fn decode_gc_tombstones(bytes: &[u8]) -> FluxResult<Vec<GcTombstone>> {
-    serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))
+    decode_versioned(bytes)
 }
 
 pub fn encode_worker_targets(value: &[WorkerTargetId]) -> FluxResult<Vec<u8>> {
-    serde_json::to_vec(value).map_err(|e| FluxError::Meta(e.to_string()))
+    let owned: Vec<WorkerTargetId> = value.to_vec();
+    encode_versioned(&owned)
 }
 
 pub fn decode_worker_targets(bytes: &[u8]) -> FluxResult<Vec<WorkerTargetId>> {
-    serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))
+    decode_versioned(bytes)
 }
 
 pub fn encode_gc_delete_acks(value: &[(ChunkId, WorkerTargetId)]) -> FluxResult<Vec<u8>> {
-    serde_json::to_vec(value).map_err(|e| FluxError::Meta(e.to_string()))
+    let owned: Vec<(ChunkId, WorkerTargetId)> = value.to_vec();
+    encode_versioned(&owned)
 }
 
 pub fn decode_gc_delete_acks(bytes: &[u8]) -> FluxResult<Vec<(ChunkId, WorkerTargetId)>> {
-    serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))
+    decode_versioned(bytes)
 }
 
 pub fn encode_dentries(d: &[Dentry]) -> FluxResult<Vec<u8>> {

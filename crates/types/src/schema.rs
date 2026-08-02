@@ -53,7 +53,10 @@
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::fmt;
 
-use crate::{DedupEntry, Dentry, FlushIntent, FluxError, Inode, Manifest, Result};
+use crate::{
+    ChunkId, DedupEntry, Dentry, FlushIntent, FluxError, GcBatch, GcPlan, GcTombstone, Inode,
+    InodeId, Manifest, Result, UfsObject, WorkerTargetId,
+};
 
 /// Monotonic codec schema stamp. `LEGACY` (= 0) denotes pre-versioning data
 /// written before this infrastructure landed; `V1` is the first explicitly
@@ -185,10 +188,24 @@ impl Versioned for Manifest {}
 impl Versioned for FlushIntent {}
 impl Versioned for DedupEntry {}
 impl Versioned for Dentry {}
+impl Versioned for UfsObject {}
+
+// GC + Worker topology persisted state. Default impls cover these (only
+// layout-compatible field extensions have happened so far).
+impl Versioned for GcPlan {}
+impl Versioned for GcBatch {}
+impl Versioned for GcTombstone {}
 
 // Wire payloads that are themselves the top-level encoded value (readdir
-// returns a Vec<Dentry>). The envelope wraps the whole slice.
+// returns a Vec<Dentry>; GC persistence stores Vec<ChunkId> / tombstone
+// lists / flush-intent lists / delete-ack lists). The envelope wraps the
+// whole collection.
 impl Versioned for Vec<Dentry> {}
+impl Versioned for Vec<ChunkId> {}
+impl Versioned for Vec<WorkerTargetId> {}
+impl Versioned for Vec<GcTombstone> {}
+impl Versioned for Vec<(InodeId, FlushIntent)> {}
+impl Versioned for Vec<(ChunkId, WorkerTargetId)> {}
 
 #[cfg(test)]
 mod tests {
@@ -322,6 +339,118 @@ mod tests {
         let decoded: Vec<Dentry> = decode_versioned(&bytes).expect("decode vec");
         assert_eq!(decoded.len(), 3);
         assert_eq!(decoded[2].child, 9);
+    }
+
+    // ---- 1b. Round-trip for GC + topology persisted types (C4 incremental) ----
+
+    fn sample_gc_plan() -> GcPlan {
+        GcPlan {
+            lease_id: crate::GcLeaseId(7),
+            live_chunks: vec![ChunkId([1; 32]), ChunkId([2; 32])],
+            removed_manifests: 3,
+        }
+    }
+
+    fn sample_gc_batch() -> GcBatch {
+        GcBatch {
+            tombstoned_chunks: vec![ChunkId([9; 32])],
+            removed_manifests: 1,
+        }
+    }
+
+    fn sample_gc_tombstone() -> GcTombstone {
+        GcTombstone {
+            chunk: ChunkId([5; 32]),
+            targets_initialized: true,
+            pending_targets: vec![WorkerTargetId(1), WorkerTargetId(2)],
+        }
+    }
+
+    #[test]
+    fn gc_plan_roundtrip_through_envelope() {
+        let p = sample_gc_plan();
+        let bytes = encode_versioned(&p).expect("encode");
+        let decoded: GcPlan = decode_versioned(&bytes).expect("decode");
+        assert_eq!(decoded.live_chunks.len(), 2);
+        assert_eq!(decoded.removed_manifests, 3);
+    }
+
+    #[test]
+    fn gc_batch_roundtrip_through_envelope() {
+        let b = sample_gc_batch();
+        let bytes = encode_versioned(&b).expect("encode");
+        let decoded: GcBatch = decode_versioned(&bytes).expect("decode");
+        assert_eq!(decoded.tombstoned_chunks.len(), 1);
+    }
+
+    #[test]
+    fn gc_tombstone_vec_roundtrip_through_envelope() {
+        let v = vec![sample_gc_tombstone(), sample_gc_tombstone()];
+        let bytes = encode_versioned(&v).expect("encode");
+        let decoded: Vec<GcTombstone> = decode_versioned(&bytes).expect("decode");
+        assert_eq!(decoded.len(), 2);
+        assert!(decoded[0].targets_initialized);
+    }
+
+    #[test]
+    fn chunk_id_list_roundtrip_through_envelope() {
+        let v: Vec<ChunkId> = vec![ChunkId([1; 32]), ChunkId([2; 32]), ChunkId([3; 32])];
+        let bytes = encode_versioned(&v).expect("encode");
+        let decoded: Vec<ChunkId> = decode_versioned(&bytes).expect("decode");
+        assert_eq!(decoded.len(), 3);
+    }
+
+    #[test]
+    fn worker_target_list_roundtrip_through_envelope() {
+        let v: Vec<WorkerTargetId> = vec![WorkerTargetId(1), WorkerTargetId(2), WorkerTargetId(3)];
+        let bytes = encode_versioned(&v).expect("encode");
+        let decoded: Vec<WorkerTargetId> = decode_versioned(&bytes).expect("decode");
+        assert_eq!(decoded.len(), 3);
+    }
+
+    #[test]
+    fn flush_intent_list_roundtrip_through_envelope() {
+        let v: Vec<(InodeId, FlushIntent)> =
+            vec![(7, sample_flush_intent()), (9, sample_flush_intent())];
+        let bytes = encode_versioned(&v).expect("encode");
+        let decoded: Vec<(InodeId, FlushIntent)> = decode_versioned(&bytes).expect("decode");
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].0, 7);
+    }
+
+    #[test]
+    fn gc_delete_ack_list_roundtrip_through_envelope() {
+        let v: Vec<(ChunkId, WorkerTargetId)> = vec![
+            (ChunkId([1; 32]), WorkerTargetId(1)),
+            (ChunkId([2; 32]), WorkerTargetId(2)),
+        ];
+        let bytes = encode_versioned(&v).expect("encode");
+        let decoded: Vec<(ChunkId, WorkerTargetId)> = decode_versioned(&bytes).expect("decode");
+        assert_eq!(decoded.len(), 2);
+    }
+
+    #[test]
+    fn ufs_object_roundtrip_through_envelope() {
+        let o = UfsObject {
+            key: "bucket/obj".into(),
+            size: 1024,
+            etag: Some("abc".into()),
+            mtime_ms: Some(42),
+        };
+        let bytes = encode_versioned(&o).expect("encode");
+        let decoded: UfsObject = decode_versioned(&bytes).expect("decode");
+        assert_eq!(decoded.key, o.key);
+        assert_eq!(decoded.size, 1024);
+    }
+
+    // Legacy bare-JSON forward-read for a GC type (proves envelope fallback
+    // works for newly-versioned types too).
+    #[test]
+    fn gc_plan_legacy_bare_json_decodes() {
+        let p = sample_gc_plan();
+        let legacy = serde_json::to_vec(&p).expect("bare encode");
+        let decoded: GcPlan = decode_versioned(&legacy).expect("legacy decode");
+        assert_eq!(decoded.live_chunks.len(), p.live_chunks.len());
     }
 
     // ---- 2. Legacy forward-read (bare JSON, no envelope) ----
