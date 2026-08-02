@@ -123,7 +123,7 @@ test "$(find "$test_root/worker-2/objects" -type f 2>/dev/null | wc -l)" -eq 0
 
 # The initial RF=2 set is workers 0/1. With worker 0 down, reads from worker 1
 # lazily copy accessed chunks to spare worker 2. Before the next write ACKs, a
-# full inventory sweep restores every reachable authoritative chunk to RF=2.
+# paginated inventory scrub restores every reachable authoritative chunk to RF=2.
 kill "$worker0_pid"
 wait "$worker0_pid" 2>/dev/null || true
 worker0_pid=""
@@ -137,8 +137,8 @@ start_worker0
 printf 'worker-zero-returned\n' >>"$mount_dir/durable.txt"
 test "$(tail -n 1 "$mount_dir/durable.txt")" = "worker-zero-returned"
 
-# A second topology change repairs the mixed 0/1 and 1/2 placements to 0/2
-# before allowing a new write.
+# A second topology change paginated-repairs the mixed 0/1 and 1/2 placements
+# to 0/2 before allowing a new write.
 kill "$worker1_pid"
 wait "$worker1_pid" 2>/dev/null || true
 worker1_pid=""

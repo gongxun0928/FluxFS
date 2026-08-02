@@ -309,9 +309,12 @@ fn run_mount(
     if available.len() < 2 {
         bail!("RF=2 requires two ready distinct ChunkWorkers; ready={available:?}");
     }
-    chunks
-        .repair()
-        .context("repair remote RF=2 chunks before mount")?;
+    // Topology catch-up is paginated + background-scrubbed inside the remote
+    // chunk store (B5). Mount must not STW on a full inventory sweep.
+    println!(
+        "remote RF=2: background repair scrub page={} (non-blocking mount)",
+        fluxfs_chunk::REPAIR_PAGE_SIZE
+    );
     mount_with_chunks(data_dir, mountpoint, meta_addr, chunks, "remote RF=2", ufs)
 }
 

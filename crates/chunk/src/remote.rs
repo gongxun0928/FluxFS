@@ -13,13 +13,17 @@ use fluxfs_proto::chunk::v1::{
 use fluxfs_proto::ChunkWorkerClient;
 use fluxfs_types::{ChunkId, ChunkPage, FluxError, Result, WorkerTargetId, CHUNK_SIZE};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 use tonic::transport::{Channel, Endpoint};
 
 const MAX_CHUNK_RPC_MESSAGE: usize = CHUNK_SIZE as usize + 64 * 1024;
 pub const DEFAULT_MAX_PENDING_CHUNK_OPS: usize = 64;
+/// Bounded inventory page for repair/scrub (replaces `limit=u32::MAX` sweeps).
+pub const REPAIR_PAGE_SIZE: usize = 256;
+const BACKGROUND_REPAIR_IDLE: Duration = Duration::from_secs(2);
 
 type RpcReply<T> = mpsc::Sender<Result<T>>;
 
@@ -42,6 +46,11 @@ enum Command {
     Repair {
         reply: RpcReply<RepairReport>,
     },
+    /// One bounded scrub page (cursor advanced inside the RPC thread).
+    RepairPass {
+        limit: usize,
+        reply: RpcReply<RepairReport>,
+    },
     ListChunksPage {
         cursor: Option<ChunkId>,
         limit: usize,
@@ -62,6 +71,8 @@ pub struct RepairReport {
     pub healthy_workers: Vec<u64>,
     pub checked_chunks: usize,
     pub repaired_replicas: usize,
+    /// `true` when another [`RemoteReplicatedChunkStore::repair_pass`] is needed.
+    pub more: bool,
 }
 
 /// RF=N client whose ACK requires distinct durable Worker process responses.
@@ -70,6 +81,8 @@ pub struct RemoteReplicatedChunkStore {
     rpc_thread: Option<thread::JoinHandle<()>>,
     gc_sender: Option<mpsc::SyncSender<Command>>,
     gc_thread: Option<thread::JoinHandle<()>>,
+    scrub_stop: Option<Arc<AtomicBool>>,
+    scrub_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl RemoteReplicatedChunkStore {
@@ -114,11 +127,49 @@ impl RemoteReplicatedChunkStore {
             .name("fluxfs-chunk-gc-rpc".into())
             .spawn(move || rpc_loop(gc_channels, required, gc_receiver))
             .map_err(|error| FluxError::Io(format!("spawn chunk GC RPC thread: {error}")))?;
+
+        let scrub_stop = Arc::new(AtomicBool::new(false));
+        let scrub_flag = Arc::clone(&scrub_stop);
+        let scrub_sender = gc_sender.clone();
+        let scrub_thread = thread::Builder::new()
+            .name("fluxfs-chunk-repair-scrub".into())
+            .spawn(move || {
+                while !scrub_flag.load(Ordering::Relaxed) {
+                    let (reply, response) = mpsc::channel();
+                    match scrub_sender.try_send(Command::RepairPass {
+                        limit: REPAIR_PAGE_SIZE,
+                        reply,
+                    }) {
+                        Ok(()) => {
+                            let more = matches!(
+                                response.recv(),
+                                Ok(Ok(report)) if report.more || report.repaired_replicas > 0
+                            );
+                            let sleep = if more {
+                                Duration::from_millis(50)
+                            } else {
+                                BACKGROUND_REPAIR_IDLE
+                            };
+                            let mut left = sleep;
+                            while left > Duration::ZERO && !scrub_flag.load(Ordering::Relaxed) {
+                                let step = Duration::from_millis(50).min(left);
+                                thread::sleep(step);
+                                left = left.saturating_sub(step);
+                            }
+                        }
+                        Err(_) => thread::sleep(BACKGROUND_REPAIR_IDLE),
+                    }
+                }
+            })
+            .map_err(|error| FluxError::Io(format!("spawn chunk repair scrub: {error}")))?;
+
         Ok(Self {
             sender: Some(sender),
             rpc_thread: Some(rpc_thread),
             gc_sender: Some(gc_sender),
             gc_thread: Some(gc_thread),
+            scrub_stop: Some(scrub_stop),
+            scrub_thread: Some(scrub_thread),
         })
     }
 
@@ -127,8 +178,16 @@ impl RemoteReplicatedChunkStore {
     }
 
     /// Scrub all reachable Worker inventories and restore every known chunk to RF=N.
+    ///
+    /// Inventory is walked in bounded pages ([`REPAIR_PAGE_SIZE`]); the call still
+    /// waits until catch-up finishes (used when topology changes before Put ACK).
     pub fn repair(&self) -> Result<RepairReport> {
         self.call(|reply| Command::Repair { reply })
+    }
+
+    /// One throttled scrub page on the low-priority GC RPC pool.
+    pub fn repair_pass(&self, limit: usize) -> Result<RepairReport> {
+        self.call_gc(|reply| Command::RepairPass { limit, reply })
     }
 
     fn call<T>(&self, command: impl FnOnce(RpcReply<T>) -> Command) -> Result<T> {
@@ -211,8 +270,14 @@ impl ChunkStore for RemoteReplicatedChunkStore {
 
 impl Drop for RemoteReplicatedChunkStore {
     fn drop(&mut self) {
+        if let Some(stop) = self.scrub_stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
         self.sender.take();
         self.gc_sender.take();
+        if let Some(thread) = self.scrub_thread.take() {
+            let _ = thread.join();
+        }
         if let Some(thread) = self.rpc_thread.take() {
             let _ = thread.join();
         }
@@ -239,11 +304,13 @@ fn rpc_loop(channels: Vec<Channel>, required: usize, receiver: mpsc::Receiver<Co
         })
         .collect::<Vec<_>>();
     let mut last_healthy = BTreeSet::new();
+    let mut repair_cursor: Option<ChunkId> = None;
     while let Ok(command) = receiver.recv() {
         runtime.block_on(handle_command(
             &mut clients,
             required,
             &mut last_healthy,
+            &mut repair_cursor,
             command,
         ));
     }
@@ -253,6 +320,7 @@ async fn handle_command(
     clients: &mut [ChunkWorkerClient<Channel>],
     required: usize,
     last_healthy: &mut BTreeSet<u64>,
+    repair_cursor: &mut Option<ChunkId>,
     command: Command,
 ) {
     match command {
@@ -267,7 +335,8 @@ async fn handle_command(
             };
             let current = healthy.keys().copied().collect::<BTreeSet<_>>();
             if &current != last_healthy {
-                match repair_with_health(clients, required, &healthy).await {
+                *repair_cursor = None;
+                match repair_with_health(clients, required, &healthy, repair_cursor).await {
                     Ok(_) => *last_healthy = current,
                     Err(error) => {
                         let _ = reply.send(Err(error));
@@ -393,9 +462,23 @@ async fn handle_command(
         Command::Repair { reply } => {
             let result = async {
                 let healthy = healthy_workers(clients).await?;
-                let report = repair_with_health(clients, required, &healthy).await?;
+                *repair_cursor = None;
+                let report = repair_with_health(clients, required, &healthy, repair_cursor).await?;
                 *last_healthy = healthy.keys().copied().collect();
                 Ok(report)
+            }
+            .await;
+            let _ = reply.send(result);
+        }
+        Command::RepairPass { limit, reply } => {
+            let result = async {
+                let healthy = healthy_workers(clients).await?;
+                let current = healthy.keys().copied().collect::<BTreeSet<_>>();
+                if &current != last_healthy {
+                    *repair_cursor = None;
+                    *last_healthy = current;
+                }
+                repair_pass_with_health(clients, required, &healthy, repair_cursor, limit).await
             }
             .await;
             let _ = reply.send(result);
@@ -530,6 +613,34 @@ async fn repair_with_health(
     clients: &mut [ChunkWorkerClient<Channel>],
     required: usize,
     healthy: &BTreeMap<u64, usize>,
+    repair_cursor: &mut Option<ChunkId>,
+) -> Result<RepairReport> {
+    *repair_cursor = None;
+    let mut checked_chunks = 0usize;
+    let mut repaired_replicas = 0usize;
+    loop {
+        let page =
+            repair_pass_with_health(clients, required, healthy, repair_cursor, REPAIR_PAGE_SIZE)
+                .await?;
+        checked_chunks += page.checked_chunks;
+        repaired_replicas += page.repaired_replicas;
+        if !page.more {
+            return Ok(RepairReport {
+                healthy_workers: healthy.keys().copied().collect(),
+                checked_chunks,
+                repaired_replicas,
+                more: false,
+            });
+        }
+    }
+}
+
+async fn repair_pass_with_health(
+    clients: &mut [ChunkWorkerClient<Channel>],
+    required: usize,
+    healthy: &BTreeMap<u64, usize>,
+    repair_cursor: &mut Option<ChunkId>,
+    limit: usize,
 ) -> Result<RepairReport> {
     if healthy.len() < required {
         return Err(FluxError::Io(format!(
@@ -537,34 +648,17 @@ async fn repair_with_health(
             healthy.len()
         )));
     }
-
-    let mut inventory = BTreeMap::<ChunkId, BTreeSet<u64>>::new();
-    for (worker_id, index) in healthy {
-        let response = clients[*index]
-            .list_chunks(ListChunksRequest {
-                after_chunk_id: Vec::new(),
-                limit: u32::MAX,
-            })
-            .await
-            .map_err(rpc_status_error)?
-            .into_inner();
-        if response.worker_id != *worker_id {
-            return Err(FluxError::Io(format!(
-                "inventory worker id mismatch: expected {worker_id}, got {}",
-                response.worker_id
-            )));
-        }
-        for raw in response.chunk_ids {
-            inventory
-                .entry(ChunkId::try_from(raw.as_slice())?)
-                .or_default()
-                .insert(*worker_id);
-        }
+    if limit == 0 {
+        return Err(FluxError::InvalidArg(
+            "repair page limit must be non-zero".into(),
+        ));
     }
 
-    let checked_chunks = inventory.len();
-    let mut repaired_replicas = 0;
-    for (chunk, mut holders) in inventory {
+    let page = inventory_page_with_holders(clients, healthy, *repair_cursor, limit).await?;
+    let checked_chunks = page.chunks.len();
+    let mut repaired_replicas = 0usize;
+
+    for (chunk, mut holders) in page.chunks {
         if holders.len() >= required {
             continue;
         }
@@ -608,10 +702,69 @@ async fn repair_with_health(
         }
     }
 
+    *repair_cursor = page.next_cursor;
     Ok(RepairReport {
         healthy_workers: healthy.keys().copied().collect(),
         checked_chunks,
         repaired_replicas,
+        more: page.next_cursor.is_some(),
+    })
+}
+
+struct InventoryPage {
+    chunks: BTreeMap<ChunkId, BTreeSet<u64>>,
+    next_cursor: Option<ChunkId>,
+}
+
+async fn inventory_page_with_holders(
+    clients: &mut [ChunkWorkerClient<Channel>],
+    healthy: &BTreeMap<u64, usize>,
+    cursor: Option<ChunkId>,
+    limit: usize,
+) -> Result<InventoryPage> {
+    let mut inventory = BTreeMap::<ChunkId, BTreeSet<u64>>::new();
+    let mut worker_has_more = false;
+    let after = cursor
+        .map(|chunk| chunk.as_bytes().to_vec())
+        .unwrap_or_default();
+    for (worker_id, index) in healthy {
+        let response = clients[*index]
+            .list_chunks(ListChunksRequest {
+                after_chunk_id: after.clone(),
+                limit: limit.try_into().unwrap_or(u32::MAX),
+            })
+            .await
+            .map_err(rpc_status_error)?
+            .into_inner();
+        if response.worker_id != *worker_id {
+            return Err(FluxError::Io(format!(
+                "inventory worker id mismatch: expected {worker_id}, got {}",
+                response.worker_id
+            )));
+        }
+        worker_has_more |= !response.next_cursor.is_empty();
+        for raw in response.chunk_ids {
+            inventory
+                .entry(ChunkId::try_from(raw.as_slice())?)
+                .or_default()
+                .insert(*worker_id);
+        }
+    }
+
+    let mut keys = inventory.keys().copied().collect::<Vec<_>>();
+    keys.sort_by_key(ChunkId::to_hex);
+    let has_more = worker_has_more || keys.len() > limit;
+    keys.truncate(limit);
+    let next_cursor = has_more.then(|| *keys.last().expect("non-empty inventory page"));
+    let mut page_chunks = BTreeMap::new();
+    for key in keys {
+        if let Some(holders) = inventory.remove(&key) {
+            page_chunks.insert(key, holders);
+        }
+    }
+    Ok(InventoryPage {
+        chunks: page_chunks,
+        next_cursor,
     })
 }
 
@@ -648,8 +801,18 @@ mod tests {
             rpc_thread: None,
             gc_sender: None,
             gc_thread: None,
+            scrub_stop: None,
+            scrub_thread: None,
         };
         assert_eq!(store.available_workers(), Err(FluxError::Busy));
+    }
+
+    #[test]
+    fn repair_page_size_is_bounded() {
+        const {
+            assert!(REPAIR_PAGE_SIZE > 0);
+            assert!(REPAIR_PAGE_SIZE < u32::MAX as usize);
+        }
     }
 
     #[test]
@@ -670,6 +833,8 @@ mod tests {
             rpc_thread: None,
             gc_sender: Some(gc_sender),
             gc_thread: Some(gc_thread),
+            scrub_stop: None,
+            scrub_thread: None,
         };
         assert_eq!(
             store.gc_delete_targets().unwrap(),
