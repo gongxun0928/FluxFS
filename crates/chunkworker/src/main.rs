@@ -6,11 +6,13 @@ use fluxfs_proto::chunk::v1::{
     HealthResponse, PutChunkRequest, PutChunkResponse,
 };
 use fluxfs_proto::{ChunkWorker, ChunkWorkerServer};
-use fluxfs_types::{ChunkId, FluxError};
+use fluxfs_types::{ChunkId, FluxError, CHUNK_SIZE};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
+
+const MAX_CHUNK_RPC_MESSAGE: usize = CHUNK_SIZE as usize + 64 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(name = "fluxfs-chunkworker", about = "FluxFS durable ChunkWorker")]
@@ -119,7 +121,11 @@ async fn main() -> Result<()> {
         cli.data_dir.display()
     );
     tonic::transport::Server::builder()
-        .add_service(ChunkWorkerServer::new(service))
+        .add_service(
+            ChunkWorkerServer::new(service)
+                .max_decoding_message_size(MAX_CHUNK_RPC_MESSAGE)
+                .max_encoding_message_size(MAX_CHUNK_RPC_MESSAGE),
+        )
         .serve(cli.listen)
         .await
         .context("serve chunk worker")?;

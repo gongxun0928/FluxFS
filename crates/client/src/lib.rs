@@ -3,7 +3,7 @@
 use fluxfs_chunk::ChunkStore;
 use fluxfs_meta::MetaStore;
 use fluxfs_types::{
-    ChunkId, DataGen, Extent, FileType, FluxError, Inode, InodeId, Manifest, Result,
+    ChunkId, DataGen, Extent, FileType, FluxError, Inode, InodeId, Manifest, Result, CHUNK_SIZE,
     DIRTY_WRITE_CAP_BYTES, ROOT_INODE,
 };
 use std::sync::Mutex;
@@ -168,18 +168,8 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         let start = offset as usize;
         buf[start..start + data.len()].copy_from_slice(data);
 
-        let chunk = self.chunks.put(&buf)?;
         let gen = DataGen(inode.head_gen.0.saturating_add(1));
-        let manifest = Manifest {
-            inode: ino,
-            gen,
-            size: buf.len() as u64,
-            extents: vec![Extent::Local {
-                offset: 0,
-                len: buf.len() as u64,
-                chunk,
-            }],
-        };
+        let manifest = self.build_local_manifest(ino, gen, &buf)?;
         let mid = self.meta.put_manifest(&manifest)?;
         let now = now_ms();
         inode.size = buf.len() as u64;
@@ -212,18 +202,8 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         let mid = if size == 0 {
             None
         } else {
-            let chunk = self.chunks.put(&buf)?;
             let gen = DataGen(inode.head_gen.0.saturating_add(1));
-            let manifest = Manifest {
-                inode: ino,
-                gen,
-                size,
-                extents: vec![Extent::Local {
-                    offset: 0,
-                    len: size,
-                    chunk,
-                }],
-            };
+            let manifest = self.build_local_manifest(ino, gen, &buf)?;
             inode.head_gen = gen;
             Some(self.meta.put_manifest(&manifest)?)
         };
@@ -238,6 +218,26 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         inode.ctime_ms = now;
         self.meta.put_inode(&inode)?;
         Ok(inode)
+    }
+
+    /// Split one logical file image into bounded content-addressed RPC/storage chunks.
+    /// A failure leaves only unreachable chunks because the manifest is committed last.
+    fn build_local_manifest(&self, ino: InodeId, gen: DataGen, data: &[u8]) -> Result<Manifest> {
+        let mut extents = Vec::with_capacity(data.len().div_ceil(CHUNK_SIZE as usize));
+        for (index, bytes) in data.chunks(CHUNK_SIZE as usize).enumerate() {
+            let chunk = self.chunks.put(bytes)?;
+            extents.push(Extent::Local {
+                offset: index as u64 * CHUNK_SIZE,
+                len: bytes.len() as u64,
+                chunk,
+            });
+        }
+        Ok(Manifest {
+            inode: ino,
+            gen,
+            size: data.len() as u64,
+            extents,
+        })
     }
 }
 
@@ -269,5 +269,25 @@ mod tests {
         assert_eq!(got, b"hello world");
         let part = client.read_at(f.id, 6, 5).unwrap();
         assert_eq!(part, b"world");
+    }
+
+    #[test]
+    fn write_splits_file_at_chunk_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = HeedMetaStore::open(dir.path().join("meta")).unwrap();
+        let chunks = DiskChunkStore::open(dir.path().join("chunks")).unwrap();
+        let client = FluxClient::new(meta, chunks);
+        let file = client
+            .create_file(ROOT_INODE, "large.bin", 0o644, 0, 0)
+            .unwrap();
+        let data = vec![0x5a; CHUNK_SIZE as usize + 17];
+        client.write_at(file.id, 0, &data).unwrap();
+        let inode = client.get_inode(file.id).unwrap();
+        let manifest = client
+            .meta
+            .get_manifest(inode.manifest_id.unwrap())
+            .unwrap();
+        assert_eq!(manifest.extents.len(), 2);
+        assert_eq!(client.read_all(file.id).unwrap(), data);
     }
 }

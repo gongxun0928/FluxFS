@@ -109,6 +109,10 @@ start_mount
 
 printf 'multiprocess durable\n' >"$mount_dir/durable.txt"
 test "$(cat "$mount_dir/durable.txt")" = "multiprocess durable"
+dd if=/dev/zero of="$test_root/large.expected" bs=1M count=4 status=none
+printf 'chunk-boundary-ok' >>"$test_root/large.expected"
+cp "$test_root/large.expected" "$mount_dir/large.bin"
+cmp "$test_root/large.expected" "$mount_dir/large.bin"
 test "$(find "$test_root/worker-0/objects" -type f | wc -l)" -ge 1
 test "$(find "$test_root/worker-1/objects" -type f | wc -l)" -ge 1
 test "$(find "$test_root/worker-2/objects" -type f 2>/dev/null | wc -l)" -eq 0
@@ -119,6 +123,7 @@ kill "$worker0_pid"
 wait "$worker0_pid" 2>/dev/null || true
 worker0_pid=""
 test "$(cat "$mount_dir/durable.txt")" = "multiprocess durable"
+cmp "$test_root/large.expected" "$mount_dir/large.bin"
 if printf 'must-not-ack\n' >>"$mount_dir/durable.txt" 2>/dev/null; then
     echo "write unexpectedly ACKed below RF=2" >&2
     exit 1
@@ -147,6 +152,7 @@ wait "$mount_pid"
 mount_pid=""
 start_mount
 test "$(tail -n 1 "$mount_dir/durable.txt")" = "repaired-service"
+cmp "$test_root/large.expected" "$mount_dir/large.bin"
 fusermount3 -u "$mount_dir"
 wait "$mount_pid"
 mount_pid=""

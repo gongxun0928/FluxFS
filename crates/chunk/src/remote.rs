@@ -10,12 +10,14 @@ use fluxfs_proto::chunk::v1::{
     ContainsChunkRequest, GetChunkRequest, HealthRequest, PutChunkRequest,
 };
 use fluxfs_proto::ChunkWorkerClient;
-use fluxfs_types::{ChunkId, FluxError, Result};
+use fluxfs_types::{ChunkId, FluxError, Result, CHUNK_SIZE};
 use std::collections::BTreeSet;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use tonic::transport::{Channel, Endpoint};
+
+const MAX_CHUNK_RPC_MESSAGE: usize = CHUNK_SIZE as usize + 64 * 1024;
 
 type RpcReply<T> = mpsc::Sender<Result<T>>;
 
@@ -123,7 +125,11 @@ fn rpc_loop(channels: Vec<Channel>, required: usize, receiver: mpsc::Receiver<Co
     };
     let mut clients = channels
         .into_iter()
-        .map(ChunkWorkerClient::new)
+        .map(|channel| {
+            ChunkWorkerClient::new(channel)
+                .max_decoding_message_size(MAX_CHUNK_RPC_MESSAGE)
+                .max_encoding_message_size(MAX_CHUNK_RPC_MESSAGE)
+        })
         .collect::<Vec<_>>();
     while let Ok(command) = receiver.recv() {
         runtime.block_on(handle_command(&mut clients, required, command));
