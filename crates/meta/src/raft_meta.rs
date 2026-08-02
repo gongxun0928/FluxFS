@@ -4,8 +4,9 @@ use crate::heed_store::HeedMetaStore;
 use crate::raft_types::{FluxRaft, MetaRaftRequest, MetaRaftResponse};
 use crate::store::MetaStore;
 use fluxfs_types::{
-    ChunkId, Dentry, FileType, FlushId, FlushIntent, FluxError, GcBatch, GcLeaseId, GcPlan, Inode,
-    InodeId, Manifest, ManifestId, RequestOpId, Result, UfsObject, WriteTicketId, ROOT_INODE,
+    ChunkId, Dentry, FileType, FlushId, FlushIntent, FluxError, GcBatch, GcLeaseId, GcPlan,
+    GcTombstone, Inode, InodeId, Manifest, ManifestId, RequestOpId, Result, UfsObject,
+    WorkerTargetId, WriteTicketId, ROOT_INODE,
 };
 use std::future::Future;
 use std::sync::Arc;
@@ -259,8 +260,27 @@ impl MetaStore for RaftMetaStore {
         })?)
     }
 
-    fn list_gc_tombstones(&self) -> Result<Vec<ChunkId>> {
+    fn list_gc_tombstones(&self) -> Result<Vec<GcTombstone>> {
         self.store.list_gc_tombstones()
+    }
+
+    fn initialize_gc_delete_targets(
+        &self,
+        chunks: &[ChunkId],
+        targets: &[WorkerTargetId],
+    ) -> Result<()> {
+        Self::map_empty(self.write(MetaRaftRequest::InitializeGcDeleteTargets {
+            request_id: None,
+            chunks: chunks.to_vec(),
+            targets: targets.to_vec(),
+        })?)
+    }
+
+    fn acknowledge_gc_deletes(&self, deleted: &[(ChunkId, WorkerTargetId)]) -> Result<()> {
+        Self::map_empty(self.write(MetaRaftRequest::AcknowledgeGcDeletes {
+            request_id: None,
+            deleted: deleted.to_vec(),
+        })?)
     }
 
     fn finalize_gc_tombstones(&self, chunks: &[ChunkId]) -> Result<()> {

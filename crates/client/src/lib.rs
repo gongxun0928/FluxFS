@@ -311,11 +311,7 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         let pending = self.meta.list_gc_tombstones()?;
         if !pending.is_empty() {
             let batch = &pending[..pending.len().min(batch_size)];
-            for chunk in batch {
-                self.chunks.delete(chunk)?;
-                report.removed_chunks += 1;
-            }
-            self.meta.finalize_gc_tombstones(batch)?;
+            report.removed_chunks += self.reclaim_tombstones(batch)?;
             return Ok(report);
         }
         let mut inventory = self.chunks.list_chunks()?;
@@ -342,12 +338,54 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
 
         let batch = self.meta.tombstone_gc_batch(candidates)?;
         report.removed_manifests += batch.removed_manifests;
-        for chunk in &batch.tombstoned_chunks {
-            self.chunks.delete(chunk)?;
-            report.removed_chunks += 1;
-        }
-        self.meta.finalize_gc_tombstones(&batch.tombstoned_chunks)?;
+        let created = self
+            .meta
+            .list_gc_tombstones()?
+            .into_iter()
+            .filter(|tombstone| batch.tombstoned_chunks.contains(&tombstone.chunk))
+            .collect::<Vec<_>>();
+        report.removed_chunks += self.reclaim_tombstones(&created)?;
         Ok(report)
+    }
+
+    fn reclaim_tombstones(&self, tombstones: &[fluxfs_types::GcTombstone]) -> Result<usize> {
+        let targets = self.chunks.gc_delete_targets()?;
+        let uninitialized = tombstones
+            .iter()
+            .filter(|tombstone| !tombstone.targets_initialized)
+            .map(|tombstone| tombstone.chunk)
+            .collect::<Vec<_>>();
+        if !uninitialized.is_empty() {
+            self.meta
+                .initialize_gc_delete_targets(&uninitialized, &targets)?;
+        }
+
+        let mut acknowledged = Vec::new();
+        let mut completed = Vec::new();
+        for tombstone in tombstones {
+            let pending = if tombstone.targets_initialized {
+                tombstone.pending_targets.as_slice()
+            } else {
+                targets.as_slice()
+            };
+            let mut failed = false;
+            for target in pending {
+                match self.chunks.delete_from_target(&tombstone.chunk, *target) {
+                    Ok(()) => acknowledged.push((tombstone.chunk, *target)),
+                    Err(_) => failed = true,
+                }
+            }
+            if !failed {
+                completed.push(tombstone.chunk);
+            }
+        }
+        if !acknowledged.is_empty() {
+            self.meta.acknowledge_gc_deletes(&acknowledged)?;
+        }
+        if !completed.is_empty() {
+            self.meta.finalize_gc_tombstones(&completed)?;
+        }
+        Ok(completed.len())
     }
 
     fn execute_gc_plan(&self, plan: fluxfs_types::GcPlan) -> Result<OrphanGcReport> {
@@ -1052,6 +1090,59 @@ mod tests {
     use super::*;
     use fluxfs_chunk::DiskChunkStore;
     use fluxfs_meta::HeedMetaStore;
+    use fluxfs_types::WorkerTargetId;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    struct FailingTargetStore {
+        replicas: [DiskChunkStore; 2],
+        fail_second: Arc<AtomicBool>,
+    }
+
+    impl ChunkStore for FailingTargetStore {
+        fn put(&self, data: &[u8]) -> Result<ChunkId> {
+            let id = self.replicas[0].put(data)?;
+            assert_eq!(self.replicas[1].put(data)?, id);
+            Ok(id)
+        }
+
+        fn get(&self, id: &ChunkId) -> Result<Vec<u8>> {
+            self.replicas[0]
+                .get(id)
+                .or_else(|_| self.replicas[1].get(id))
+        }
+
+        fn contains(&self, id: &ChunkId) -> Result<bool> {
+            Ok(self.replicas[0].contains(id)? || self.replicas[1].contains(id)?)
+        }
+
+        fn list_chunks(&self) -> Result<Vec<ChunkId>> {
+            let mut chunks = self.replicas[0].list_chunks()?;
+            chunks.extend(self.replicas[1].list_chunks()?);
+            chunks.sort_by_key(ChunkId::to_hex);
+            chunks.dedup();
+            Ok(chunks)
+        }
+
+        fn delete(&self, id: &ChunkId) -> Result<()> {
+            self.delete_from_target(id, WorkerTargetId(0))?;
+            self.delete_from_target(id, WorkerTargetId(1))
+        }
+
+        fn gc_delete_targets(&self) -> Result<Vec<WorkerTargetId>> {
+            Ok(vec![WorkerTargetId(0), WorkerTargetId(1)])
+        }
+
+        fn delete_from_target(&self, id: &ChunkId, target: WorkerTargetId) -> Result<()> {
+            if target == WorkerTargetId(1) && self.fail_second.load(Ordering::SeqCst) {
+                return Err(FluxError::Io("worker 1 unavailable".into()));
+            }
+            self.replicas
+                .get(target.0 as usize)
+                .ok_or_else(|| FluxError::InvalidArg("bad target".into()))?
+                .delete(id)
+        }
+    }
 
     #[test]
     fn write_read_roundtrip() {
@@ -1149,6 +1240,48 @@ mod tests {
         recovered.run_concurrent_gc_pass(1).unwrap();
         assert!(recovered.meta.list_gc_tombstones().unwrap().is_empty());
         assert!(!recovered.chunks.contains(&chunk).unwrap());
+    }
+
+    #[test]
+    fn gc_delete_progress_survives_down_worker_and_meta_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta_path = dir.path().join("meta");
+        let replica_paths = [dir.path().join("worker-0"), dir.path().join("worker-1")];
+        let fail_second = Arc::new(AtomicBool::new(true));
+        let chunks = FailingTargetStore {
+            replicas: [
+                DiskChunkStore::open(&replica_paths[0]).unwrap(),
+                DiskChunkStore::open(&replica_paths[1]).unwrap(),
+            ],
+            fail_second: Arc::clone(&fail_second),
+        };
+        let client = FluxClient::new(HeedMetaStore::open(&meta_path).unwrap(), chunks);
+        let orphan = client.chunks.put(b"durable-delete-retry").unwrap();
+        assert_eq!(client.run_concurrent_gc_pass(1).unwrap().removed_chunks, 0);
+        let tombstone = client.meta.list_gc_tombstones().unwrap().remove(0);
+        assert!(tombstone.targets_initialized);
+        assert_eq!(tombstone.pending_targets, vec![WorkerTargetId(1)]);
+        assert!(!client.chunks.replicas[0].contains(&orphan).unwrap());
+        assert!(client.chunks.replicas[1].contains(&orphan).unwrap());
+        drop(client);
+
+        fail_second.store(false, Ordering::SeqCst);
+        let recovered = FluxClient::new(
+            HeedMetaStore::open(&meta_path).unwrap(),
+            FailingTargetStore {
+                replicas: [
+                    DiskChunkStore::open(&replica_paths[0]).unwrap(),
+                    DiskChunkStore::open(&replica_paths[1]).unwrap(),
+                ],
+                fail_second,
+            },
+        );
+        assert_eq!(
+            recovered.run_concurrent_gc_pass(1).unwrap().removed_chunks,
+            1
+        );
+        assert!(recovered.meta.list_gc_tombstones().unwrap().is_empty());
+        assert!(!recovered.chunks.replicas[1].contains(&orphan).unwrap());
     }
 
     #[test]

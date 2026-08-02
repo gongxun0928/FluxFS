@@ -1,6 +1,7 @@
 use fluxfs_types::{
-    ChunkId, Dentry, FileType, FlushId, FlushIntent, GcBatch, GcLeaseId, GcPlan, Inode, InodeId,
-    Manifest, ManifestId, RequestOpId, Result, UfsObject, WriteTicketId, ROOT_INODE,
+    ChunkId, Dentry, FileType, FlushId, FlushIntent, GcBatch, GcLeaseId, GcPlan, GcTombstone,
+    Inode, InodeId, Manifest, ManifestId, RequestOpId, Result, UfsObject, WorkerTargetId,
+    WriteTicketId, ROOT_INODE,
 };
 
 /// Engine-agnostic metadata API frozen for W1.
@@ -109,7 +110,15 @@ pub trait MetaStore: Send + Sync {
     /// pre-Put reservation references it. Also reclaims unreachable manifests.
     fn tombstone_gc_batch(&self, candidates: &[ChunkId]) -> Result<GcBatch>;
 
-    fn list_gc_tombstones(&self) -> Result<Vec<ChunkId>>;
+    fn list_gc_tombstones(&self) -> Result<Vec<GcTombstone>>;
+
+    fn initialize_gc_delete_targets(
+        &self,
+        chunks: &[ChunkId],
+        targets: &[WorkerTargetId],
+    ) -> Result<()>;
+
+    fn acknowledge_gc_deletes(&self, deleted: &[(ChunkId, WorkerTargetId)]) -> Result<()>;
 
     fn finalize_gc_tombstones(&self, chunks: &[ChunkId]) -> Result<()>;
 

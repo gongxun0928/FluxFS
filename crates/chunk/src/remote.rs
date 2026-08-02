@@ -11,7 +11,7 @@ use fluxfs_proto::chunk::v1::{
     PutChunkRequest,
 };
 use fluxfs_proto::ChunkWorkerClient;
-use fluxfs_types::{ChunkId, FluxError, Result, CHUNK_SIZE};
+use fluxfs_types::{ChunkId, FluxError, Result, WorkerTargetId, CHUNK_SIZE};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc;
 use std::thread;
@@ -45,8 +45,12 @@ enum Command {
     ListChunks {
         reply: RpcReply<Vec<ChunkId>>,
     },
-    Delete {
+    TargetCount {
+        reply: RpcReply<u64>,
+    },
+    DeleteTarget {
         id: ChunkId,
+        target: WorkerTargetId,
         reply: RpcReply<()>,
     },
 }
@@ -147,7 +151,23 @@ impl ChunkStore for RemoteReplicatedChunkStore {
     }
 
     fn delete(&self, id: &ChunkId) -> Result<()> {
-        self.call(|reply| Command::Delete { id: *id, reply })
+        for target in self.gc_delete_targets()? {
+            self.delete_from_target(id, target)?;
+        }
+        Ok(())
+    }
+
+    fn gc_delete_targets(&self) -> Result<Vec<WorkerTargetId>> {
+        let count = self.call(|reply| Command::TargetCount { reply })?;
+        Ok((0..count).map(WorkerTargetId).collect())
+    }
+
+    fn delete_from_target(&self, id: &ChunkId, target: WorkerTargetId) -> Result<()> {
+        self.call(|reply| Command::DeleteTarget {
+            id: *id,
+            target,
+            reply,
+        })
     }
 }
 
@@ -342,28 +362,25 @@ async fn handle_command(
             let result = all_chunks(clients).await;
             let _ = reply.send(result);
         }
-        Command::Delete { id, reply } => {
-            let mut reached = 0usize;
-            let mut errors = Vec::new();
-            for client in clients.iter_mut() {
-                match client
+        Command::TargetCount { reply } => {
+            let _ = reply.send(Ok(clients.len().try_into().unwrap_or(u64::MAX)));
+        }
+        Command::DeleteTarget { id, target, reply } => {
+            let result = match usize::try_from(target.0)
+                .ok()
+                .and_then(|index| clients.get_mut(index))
+            {
+                Some(client) => client
                     .delete_chunk(DeleteChunkRequest {
                         chunk_id: id.as_bytes().to_vec(),
                     })
                     .await
-                {
-                    Ok(_) => reached += 1,
-                    Err(error) => errors.push(error.to_string()),
-                }
-            }
-            let result = if reached == 0 {
-                Err(FluxError::Io(format!(
-                    "delete {} reached no workers: {}",
-                    id.to_hex(),
-                    errors.join("; ")
-                )))
-            } else {
-                Ok(())
+                    .map(|_| ())
+                    .map_err(rpc_status_error),
+                None => Err(FluxError::InvalidArg(format!(
+                    "unknown chunk delete target {}",
+                    target.0
+                ))),
             };
             let _ = reply.send(result);
         }

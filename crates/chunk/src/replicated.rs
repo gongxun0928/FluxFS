@@ -6,7 +6,7 @@
 //! the configured number of replicas report durable storage.
 
 use crate::{ChunkStore, DiskChunkStore};
-use fluxfs_types::{ChunkId, FluxError, Result};
+use fluxfs_types::{ChunkId, FluxError, Result, WorkerTargetId};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,6 +161,21 @@ impl ChunkStore for ReplicatedChunkStore {
             replica.delete(id)?;
         }
         Ok(())
+    }
+
+    fn gc_delete_targets(&self) -> Result<Vec<WorkerTargetId>> {
+        Ok((0..self.replicas.len())
+            .map(|index| WorkerTargetId(index.try_into().unwrap_or(u64::MAX)))
+            .collect())
+    }
+
+    fn delete_from_target(&self, id: &ChunkId, target: WorkerTargetId) -> Result<()> {
+        let index = usize::try_from(target.0)
+            .map_err(|_| FluxError::InvalidArg(format!("bad replica target {}", target.0)))?;
+        self.replicas
+            .get(index)
+            .ok_or_else(|| FluxError::InvalidArg(format!("bad replica target {}", target.0)))?
+            .delete(id)
     }
 }
 

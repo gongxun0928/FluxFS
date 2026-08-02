@@ -96,6 +96,29 @@ pub struct GcBatch {
     pub removed_manifests: usize,
 }
 
+/// Stable target slot in the configured ChunkStore topology. Dynamic Worker
+/// membership will replace slots with membership-issued IDs, but retry safety
+/// already requires the target set to be persisted before the first delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct WorkerTargetId(pub u64);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GcTombstone {
+    pub chunk: ChunkId,
+    pub targets_initialized: bool,
+    pub pending_targets: Vec<WorkerTargetId>,
+}
+
+impl Default for GcTombstone {
+    fn default() -> Self {
+        Self {
+            chunk: ChunkId::from_bytes(&[]),
+            targets_initialized: false,
+            pending_targets: Vec::new(),
+        }
+    }
+}
+
 /// In-flight External lazy-load tracking token.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HydrateToken(pub u64);

@@ -5,24 +5,26 @@ use fluxfs_meta::{
 };
 use fluxfs_metrics::{spawn_prometheus, FluxMetrics};
 use fluxfs_proto::meta::v1::{
-    AbortChunkReservationRequest, AbortChunkReservationResponse, BeginFlushRequest,
-    BeginFlushResponse, BeginGcRequest, BeginGcResponse, CommitFlushRequest, CommitFlushResponse,
-    CommitInodeManifestRequest, CommitInodeManifestReservedRequest, CommitInodeManifestResponse,
-    CreateRequest, CreateResponse, CurrentGcPlanRequest, CurrentGcPlanResponse,
-    ExpireChunkReservationsRequest, ExpireChunkReservationsResponse, FailFlushConflictRequest,
-    FailFlushConflictResponse, FinalizeGcTombstonesRequest, FinalizeGcTombstonesResponse,
-    FinishGcRequest, FinishGcResponse, GetInodeRequest, GetInodeResponse, GetManifestRequest,
-    GetManifestResponse, ImportExternalRequest, ImportExternalResponse, ListFlushIntentsRequest,
-    ListFlushIntentsResponse, ListGcTombstonesRequest, ListGcTombstonesResponse, LookupRequest,
-    LookupResponse, PingRequest, PingResponse, PutInodeRequest, PutInodeResponse,
-    PutManifestRequest, PutManifestResponse, ReaddirRequest, ReaddirResponse, ReserveChunksRequest,
-    ReserveChunksResponse, TombstoneGcBatchRequest, TombstoneGcBatchResponse, UnlinkRequest,
-    UnlinkResponse,
+    AbortChunkReservationRequest, AbortChunkReservationResponse, AcknowledgeGcDeletesRequest,
+    AcknowledgeGcDeletesResponse, BeginFlushRequest, BeginFlushResponse, BeginGcRequest,
+    BeginGcResponse, CommitFlushRequest, CommitFlushResponse, CommitInodeManifestRequest,
+    CommitInodeManifestReservedRequest, CommitInodeManifestResponse, CreateRequest, CreateResponse,
+    CurrentGcPlanRequest, CurrentGcPlanResponse, ExpireChunkReservationsRequest,
+    ExpireChunkReservationsResponse, FailFlushConflictRequest, FailFlushConflictResponse,
+    FinalizeGcTombstonesRequest, FinalizeGcTombstonesResponse, FinishGcRequest, FinishGcResponse,
+    GetInodeRequest, GetInodeResponse, GetManifestRequest, GetManifestResponse,
+    ImportExternalRequest, ImportExternalResponse, InitializeGcDeleteTargetsRequest,
+    InitializeGcDeleteTargetsResponse, ListFlushIntentsRequest, ListFlushIntentsResponse,
+    ListGcTombstonesRequest, ListGcTombstonesResponse, LookupRequest, LookupResponse, PingRequest,
+    PingResponse, PutInodeRequest, PutInodeResponse, PutManifestRequest, PutManifestResponse,
+    ReaddirRequest, ReaddirResponse, ReserveChunksRequest, ReserveChunksResponse,
+    TombstoneGcBatchRequest, TombstoneGcBatchResponse, UnlinkRequest, UnlinkResponse,
 };
 use fluxfs_proto::meta_codec::{
-    decode_chunk_ids, decode_flush_intent, decode_inode, decode_manifest, decode_ufs_object,
-    encode_chunk_ids, encode_dentries, encode_flush_intents, encode_gc_batch, encode_gc_plan,
-    encode_inode, encode_manifest, file_type_from_wire, status_from_flux,
+    decode_chunk_ids, decode_flush_intent, decode_gc_delete_acks, decode_inode, decode_manifest,
+    decode_ufs_object, decode_worker_targets, encode_dentries, encode_flush_intents,
+    encode_gc_batch, encode_gc_plan, encode_gc_tombstones, encode_inode, encode_manifest,
+    file_type_from_wire, status_from_flux,
 };
 use fluxfs_proto::{MetaService, MetaServiceServer};
 use fluxfs_types::{FlushId, FluxError, GcLeaseId, ManifestId, RequestOpId, WriteTicketId};
@@ -371,10 +373,41 @@ impl MetaService for MetaSvc {
         &self,
         _req: Request<ListGcTombstonesRequest>,
     ) -> Result<Response<ListGcTombstonesResponse>, Status> {
-        let chunks = self.store.list_gc_tombstones().map_err(status_from_flux)?;
+        let tombstones = self.store.list_gc_tombstones().map_err(status_from_flux)?;
         Ok(Response::new(ListGcTombstonesResponse {
-            chunks_json: encode_chunk_ids(&chunks).map_err(status_from_flux)?,
+            tombstones_json: encode_gc_tombstones(&tombstones).map_err(status_from_flux)?,
         }))
+    }
+
+    async fn initialize_gc_delete_targets(
+        &self,
+        req: Request<InitializeGcDeleteTargetsRequest>,
+    ) -> Result<Response<InitializeGcDeleteTargetsResponse>, Status> {
+        let r = req.into_inner();
+        let response = self
+            .write(MetaRaftRequest::InitializeGcDeleteTargets {
+                request_id: None,
+                chunks: decode_chunk_ids(&r.chunks_json).map_err(status_from_flux)?,
+                targets: decode_worker_targets(&r.targets_json).map_err(status_from_flux)?,
+            })
+            .await?;
+        self.map_resp_empty(response)?;
+        Ok(Response::new(InitializeGcDeleteTargetsResponse {}))
+    }
+
+    async fn acknowledge_gc_deletes(
+        &self,
+        req: Request<AcknowledgeGcDeletesRequest>,
+    ) -> Result<Response<AcknowledgeGcDeletesResponse>, Status> {
+        let r = req.into_inner();
+        let response = self
+            .write(MetaRaftRequest::AcknowledgeGcDeletes {
+                request_id: None,
+                deleted: decode_gc_delete_acks(&r.deleted_json).map_err(status_from_flux)?,
+            })
+            .await?;
+        self.map_resp_empty(response)?;
+        Ok(Response::new(AcknowledgeGcDeletesResponse {}))
     }
 
     async fn finalize_gc_tombstones(

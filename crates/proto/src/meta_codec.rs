@@ -1,7 +1,7 @@
 use crate::meta::v1;
 use fluxfs_types::{
-    ChunkId, Dentry, FileType, FlushIntent, FluxError, GcBatch, GcPlan, Inode, InodeId, Manifest,
-    ManifestId, Result as FluxResult, UfsObject,
+    ChunkId, Dentry, FileType, FlushIntent, FluxError, GcBatch, GcPlan, GcTombstone, Inode,
+    InodeId, Manifest, ManifestId, Result as FluxResult, UfsObject, WorkerTargetId,
 };
 
 pub fn encode_inode(inode: &Inode) -> FluxResult<Vec<u8>> {
@@ -65,6 +65,30 @@ pub fn encode_gc_batch(batch: &GcBatch) -> FluxResult<Vec<u8>> {
 }
 
 pub fn decode_gc_batch(bytes: &[u8]) -> FluxResult<GcBatch> {
+    serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))
+}
+
+pub fn encode_gc_tombstones(value: &[GcTombstone]) -> FluxResult<Vec<u8>> {
+    serde_json::to_vec(value).map_err(|e| FluxError::Meta(e.to_string()))
+}
+
+pub fn decode_gc_tombstones(bytes: &[u8]) -> FluxResult<Vec<GcTombstone>> {
+    serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))
+}
+
+pub fn encode_worker_targets(value: &[WorkerTargetId]) -> FluxResult<Vec<u8>> {
+    serde_json::to_vec(value).map_err(|e| FluxError::Meta(e.to_string()))
+}
+
+pub fn decode_worker_targets(bytes: &[u8]) -> FluxResult<Vec<WorkerTargetId>> {
+    serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))
+}
+
+pub fn encode_gc_delete_acks(value: &[(ChunkId, WorkerTargetId)]) -> FluxResult<Vec<u8>> {
+    serde_json::to_vec(value).map_err(|e| FluxError::Meta(e.to_string()))
+}
+
+pub fn decode_gc_delete_acks(bytes: &[u8]) -> FluxResult<Vec<(ChunkId, WorkerTargetId)>> {
     serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))
 }
 

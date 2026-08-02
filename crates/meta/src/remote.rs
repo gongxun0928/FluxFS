@@ -2,23 +2,25 @@
 
 use crate::store::MetaStore;
 use fluxfs_proto::meta::v1::{
-    AbortChunkReservationRequest, BeginFlushRequest, BeginGcRequest, CommitFlushRequest,
-    CommitInodeManifestRequest, CommitInodeManifestReservedRequest, CreateRequest,
-    CurrentGcPlanRequest, ExpireChunkReservationsRequest, FailFlushConflictRequest,
+    AbortChunkReservationRequest, AcknowledgeGcDeletesRequest, BeginFlushRequest, BeginGcRequest,
+    CommitFlushRequest, CommitInodeManifestRequest, CommitInodeManifestReservedRequest,
+    CreateRequest, CurrentGcPlanRequest, ExpireChunkReservationsRequest, FailFlushConflictRequest,
     FinalizeGcTombstonesRequest, FinishGcRequest, GetInodeRequest, GetManifestRequest,
-    ImportExternalRequest, ListFlushIntentsRequest, ListGcTombstonesRequest, LookupRequest,
-    PutInodeRequest, PutManifestRequest, ReaddirRequest, ReserveChunksRequest,
-    TombstoneGcBatchRequest, UnlinkRequest,
+    ImportExternalRequest, InitializeGcDeleteTargetsRequest, ListFlushIntentsRequest,
+    ListGcTombstonesRequest, LookupRequest, PutInodeRequest, PutManifestRequest, ReaddirRequest,
+    ReserveChunksRequest, TombstoneGcBatchRequest, UnlinkRequest,
 };
 use fluxfs_proto::meta_codec::{
-    decode_chunk_ids, decode_dentries, decode_flush_intents, decode_gc_batch, decode_gc_plan,
-    decode_inode, decode_manifest, encode_chunk_ids, encode_flush_intent, encode_inode,
-    encode_manifest, encode_ufs_object, file_type_to_wire, flux_from_status,
+    decode_dentries, decode_flush_intents, decode_gc_batch, decode_gc_plan, decode_gc_tombstones,
+    decode_inode, decode_manifest, encode_chunk_ids, encode_flush_intent, encode_gc_delete_acks,
+    encode_inode, encode_manifest, encode_ufs_object, encode_worker_targets, file_type_to_wire,
+    flux_from_status,
 };
 use fluxfs_proto::MetaServiceClient;
 use fluxfs_types::{
-    ChunkId, Dentry, FileType, FlushId, FlushIntent, FluxError, GcBatch, GcLeaseId, GcPlan, Inode,
-    InodeId, Manifest, ManifestId, RequestOpId, Result, UfsObject, WriteTicketId, ROOT_INODE,
+    ChunkId, Dentry, FileType, FlushId, FlushIntent, FluxError, GcBatch, GcLeaseId, GcPlan,
+    GcTombstone, Inode, InodeId, Manifest, ManifestId, RequestOpId, Result, UfsObject,
+    WorkerTargetId, WriteTicketId, ROOT_INODE,
 };
 use std::future::Future;
 use std::sync::Mutex;
@@ -282,13 +284,43 @@ impl MetaStore for RemoteMetaStore {
         decode_gc_batch(&response.batch_json)
     }
 
-    fn list_gc_tombstones(&self) -> Result<Vec<ChunkId>> {
+    fn list_gc_tombstones(&self) -> Result<Vec<GcTombstone>> {
         let mut c = self.client()?;
         let response = self
             .block_on(async { c.list_gc_tombstones(ListGcTombstonesRequest {}).await })
             .map_err(flux_from_status)?
             .into_inner();
-        decode_chunk_ids(&response.chunks_json)
+        decode_gc_tombstones(&response.tombstones_json)
+    }
+
+    fn initialize_gc_delete_targets(
+        &self,
+        chunks: &[ChunkId],
+        targets: &[WorkerTargetId],
+    ) -> Result<()> {
+        let mut c = self.client()?;
+        let chunks_json = encode_chunk_ids(chunks)?;
+        let targets_json = encode_worker_targets(targets)?;
+        self.block_on(async {
+            c.initialize_gc_delete_targets(InitializeGcDeleteTargetsRequest {
+                chunks_json,
+                targets_json,
+            })
+            .await
+        })
+        .map_err(flux_from_status)?;
+        Ok(())
+    }
+
+    fn acknowledge_gc_deletes(&self, deleted: &[(ChunkId, WorkerTargetId)]) -> Result<()> {
+        let mut c = self.client()?;
+        let deleted_json = encode_gc_delete_acks(deleted)?;
+        self.block_on(async {
+            c.acknowledge_gc_deletes(AcknowledgeGcDeletesRequest { deleted_json })
+                .await
+        })
+        .map_err(flux_from_status)?;
+        Ok(())
     }
 
     fn finalize_gc_tombstones(&self, chunks: &[ChunkId]) -> Result<()> {

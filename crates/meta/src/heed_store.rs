@@ -2,9 +2,9 @@ use crate::raft_types::{MetaRaftRequest, MetaRaftResponse, SmAppliedMeta};
 use crate::store::MetaStore;
 use fluxfs_types::{
     BackingMode, ChunkId, ChunkReservation, DataGen, DataState, Dentry, Extent, FileType, FlushId,
-    FlushIntent, FluxError, GcBatch, GcLeaseId, GcPlan, Inode, InodeId, LocalityFields,
-    LocalityLabel, Manifest, ManifestId, OpState, Origin, Result, UfsObject, UfsVersion,
-    WriteTicketId, ROOT_INODE,
+    FlushIntent, FluxError, GcBatch, GcLeaseId, GcPlan, GcTombstone, Inode, InodeId,
+    LocalityFields, LocalityLabel, Manifest, ManifestId, OpState, Origin, Result, UfsObject,
+    UfsVersion, WorkerTargetId, WriteTicketId, ROOT_INODE,
 };
 use heed::types::{Bytes, Str};
 use heed::{Database, Env, EnvOpenOptions};
@@ -47,6 +47,8 @@ pub struct MetaSnapshotData {
     pub chunk_reservations: Vec<ChunkReservation>,
     #[serde(default)]
     pub gc_tombstones: Vec<ChunkId>,
+    #[serde(default)]
+    pub gc_delete_tombstones: Vec<GcTombstone>,
 }
 
 pub struct HeedMetaStore {
@@ -352,6 +354,18 @@ impl HeedMetaStore {
                         Err(e) => MetaRaftResponse::Err(e),
                     }
                 }
+                MetaRaftRequest::InitializeGcDeleteTargets {
+                    chunks, targets, ..
+                } => match self.initialize_gc_targets_in_txn(&mut wtxn, chunks, targets) {
+                    Ok(()) => MetaRaftResponse::Empty,
+                    Err(e) => MetaRaftResponse::Err(e),
+                },
+                MetaRaftRequest::AcknowledgeGcDeletes { deleted, .. } => {
+                    match self.acknowledge_gc_deletes_in_txn(&mut wtxn, deleted) {
+                        Ok(()) => MetaRaftResponse::Empty,
+                        Err(e) => MetaRaftResponse::Err(e),
+                    }
+                }
                 MetaRaftRequest::BeginFlush {
                     expected_generation,
                     inode,
@@ -566,7 +580,7 @@ impl HeedMetaStore {
         }
         let gc_lease = self.gc_lease_in_txn(&rtxn)?;
         let chunk_reservations = self.list_reservations_in_txn(&rtxn)?;
-        let gc_tombstones = self.list_tombstones_in_txn(&rtxn)?;
+        let gc_delete_tombstones = self.list_tombstones_in_txn(&rtxn)?;
         drop(rtxn);
         Ok(MetaSnapshotData {
             inodes,
@@ -578,7 +592,8 @@ impl HeedMetaStore {
             client_requests,
             gc_lease,
             chunk_reservations,
-            gc_tombstones,
+            gc_tombstones: Vec::new(),
+            gc_delete_tombstones,
         })
     }
 
@@ -694,9 +709,16 @@ impl HeedMetaStore {
             self.put_reservation_in_txn(&mut wtxn, reservation)?;
         }
         for chunk in &snap.gc_tombstones {
-            self.meta
-                .put(&mut wtxn, &tombstone_key(chunk), &[])
-                .map_err(|e| FluxError::Meta(e.to_string()))?;
+            self.put_tombstone_in_txn(
+                &mut wtxn,
+                &GcTombstone {
+                    chunk: *chunk,
+                    ..GcTombstone::default()
+                },
+            )?;
+        }
+        for tombstone in &snap.gc_delete_tombstones {
+            self.put_tombstone_in_txn(&mut wtxn, tombstone)?;
         }
         self.put_sm_meta_raw(&mut wtxn, &snap.sm)?;
         wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
@@ -1128,21 +1150,40 @@ impl HeedMetaStore {
         Ok(out)
     }
 
-    fn list_tombstones_in_txn(&self, txn: &heed::RoTxn<'_>) -> Result<Vec<ChunkId>> {
+    fn list_tombstones_in_txn(&self, txn: &heed::RoTxn<'_>) -> Result<Vec<GcTombstone>> {
         let mut out = Vec::new();
         for item in self
             .meta
             .prefix_iter(txn, TOMBSTONE_PREFIX)
             .map_err(|e| FluxError::Meta(e.to_string()))?
         {
-            let (key, _) = item.map_err(|e| FluxError::Meta(e.to_string()))?;
+            let (key, bytes) = item.map_err(|e| FluxError::Meta(e.to_string()))?;
             let hex = key
                 .strip_prefix(TOMBSTONE_PREFIX)
                 .ok_or_else(|| FluxError::Meta("bad tombstone key".into()))?;
-            out.push(chunk_from_hex(hex)?);
+            let chunk = chunk_from_hex(hex)?;
+            out.push(if bytes.is_empty() {
+                GcTombstone {
+                    chunk,
+                    ..GcTombstone::default()
+                }
+            } else {
+                serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))?
+            });
         }
-        out.sort_by_key(ChunkId::to_hex);
+        out.sort_by_key(|tombstone| tombstone.chunk.to_hex());
         Ok(out)
+    }
+
+    fn put_tombstone_in_txn(
+        &self,
+        txn: &mut heed::RwTxn<'_>,
+        tombstone: &GcTombstone,
+    ) -> Result<()> {
+        let bytes = serde_json::to_vec(tombstone).map_err(|e| FluxError::Meta(e.to_string()))?;
+        self.meta
+            .put(txn, &tombstone_key(&tombstone.chunk), &bytes)
+            .map_err(|e| FluxError::Meta(e.to_string()))
     }
 
     fn clear_meta_prefix_in_txn(&self, txn: &mut heed::RwTxn<'_>, prefix: &str) -> Result<()> {
@@ -1332,9 +1373,13 @@ impl HeedMetaStore {
             if live.contains(chunk) {
                 continue;
             }
-            self.meta
-                .put(txn, &tombstone_key(chunk), &[])
-                .map_err(|e| FluxError::Meta(e.to_string()))?;
+            self.put_tombstone_in_txn(
+                txn,
+                &GcTombstone {
+                    chunk: *chunk,
+                    ..GcTombstone::default()
+                },
+            )?;
             tombstoned.push(*chunk);
         }
         unique.clear();
@@ -1350,9 +1395,61 @@ impl HeedMetaStore {
         chunks: &[ChunkId],
     ) -> Result<()> {
         for chunk in chunks {
+            let tombstone = self
+                .list_tombstones_in_txn(txn)?
+                .into_iter()
+                .find(|tombstone| tombstone.chunk == *chunk)
+                .ok_or(FluxError::NotFound)?;
+            if !tombstone.targets_initialized || !tombstone.pending_targets.is_empty() {
+                return Err(FluxError::Busy);
+            }
             self.meta
                 .delete(txn, &tombstone_key(chunk))
                 .map_err(|e| FluxError::Meta(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn initialize_gc_targets_in_txn(
+        &self,
+        txn: &mut heed::RwTxn<'_>,
+        chunks: &[ChunkId],
+        targets: &[WorkerTargetId],
+    ) -> Result<()> {
+        let targets = targets.iter().copied().collect::<BTreeSet<_>>();
+        for chunk in chunks {
+            let mut tombstone = self
+                .list_tombstones_in_txn(txn)?
+                .into_iter()
+                .find(|tombstone| tombstone.chunk == *chunk)
+                .ok_or(FluxError::NotFound)?;
+            if !tombstone.targets_initialized {
+                tombstone.targets_initialized = true;
+                tombstone.pending_targets = targets.iter().copied().collect();
+                self.put_tombstone_in_txn(txn, &tombstone)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn acknowledge_gc_deletes_in_txn(
+        &self,
+        txn: &mut heed::RwTxn<'_>,
+        deleted: &[(ChunkId, WorkerTargetId)],
+    ) -> Result<()> {
+        for (chunk, target) in deleted {
+            let mut tombstone = self
+                .list_tombstones_in_txn(txn)?
+                .into_iter()
+                .find(|tombstone| tombstone.chunk == *chunk)
+                .ok_or(FluxError::NotFound)?;
+            if !tombstone.targets_initialized {
+                return Err(FluxError::Busy);
+            }
+            tombstone
+                .pending_targets
+                .retain(|pending| pending != target);
+            self.put_tombstone_in_txn(txn, &tombstone)?;
         }
         Ok(())
     }
@@ -1769,12 +1866,24 @@ impl MetaStore for HeedMetaStore {
         self.with_write_txn(|store, txn| store.tombstone_gc_batch_in_txn(txn, candidates))
     }
 
-    fn list_gc_tombstones(&self) -> Result<Vec<ChunkId>> {
+    fn list_gc_tombstones(&self) -> Result<Vec<GcTombstone>> {
         let txn = self
             .env
             .read_txn()
             .map_err(|e| FluxError::Meta(e.to_string()))?;
         self.list_tombstones_in_txn(&txn)
+    }
+
+    fn initialize_gc_delete_targets(
+        &self,
+        chunks: &[ChunkId],
+        targets: &[WorkerTargetId],
+    ) -> Result<()> {
+        self.with_write_txn(|store, txn| store.initialize_gc_targets_in_txn(txn, chunks, targets))
+    }
+
+    fn acknowledge_gc_deletes(&self, deleted: &[(ChunkId, WorkerTargetId)]) -> Result<()> {
+        self.with_write_txn(|store, txn| store.acknowledge_gc_deletes_in_txn(txn, deleted))
     }
 
     fn finalize_gc_tombstones(&self, chunks: &[ChunkId]) -> Result<()> {
@@ -2296,7 +2405,11 @@ mod tests {
 
         let batch = store.tombstone_gc_batch(&[reserved, orphan]).unwrap();
         assert_eq!(batch.tombstoned_chunks, vec![orphan]);
-        assert_eq!(store.list_gc_tombstones().unwrap(), vec![orphan]);
+        assert_eq!(store.list_gc_tombstones().unwrap()[0].chunk, orphan);
+        assert_eq!(
+            store.finalize_gc_tombstones(&[orphan]),
+            Err(FluxError::Busy)
+        );
         assert_eq!(
             store.reserve_chunks(WriteTicketId(101), file.id, file.generation, &[orphan]),
             Err(FluxError::Busy)
@@ -2306,12 +2419,35 @@ mod tests {
         let restored_dir = tempfile::tempdir().unwrap();
         let restored = HeedMetaStore::open(restored_dir.path()).unwrap();
         restored.install_snapshot_data(&snapshot).unwrap();
-        assert_eq!(restored.list_gc_tombstones().unwrap(), vec![orphan]);
+        assert_eq!(restored.list_gc_tombstones().unwrap()[0].chunk, orphan);
         assert!(restored
             .reservation_in_txn(&restored.env.read_txn().unwrap(), ticket)
             .unwrap()
             .is_some());
 
+        store
+            .initialize_gc_delete_targets(&[orphan], &[WorkerTargetId(0), WorkerTargetId(1)])
+            .unwrap();
+        assert_eq!(
+            store.finalize_gc_tombstones(&[orphan]),
+            Err(FluxError::Busy)
+        );
+        store
+            .acknowledge_gc_deletes(&[(orphan, WorkerTargetId(0))])
+            .unwrap();
+        let progress_snapshot = store.export_snapshot(&SmAppliedMeta::default()).unwrap();
+        let progress_dir = tempfile::tempdir().unwrap();
+        let progress_restored = HeedMetaStore::open(progress_dir.path()).unwrap();
+        progress_restored
+            .install_snapshot_data(&progress_snapshot)
+            .unwrap();
+        assert_eq!(
+            progress_restored.list_gc_tombstones().unwrap()[0].pending_targets,
+            vec![WorkerTargetId(1)]
+        );
+        store
+            .acknowledge_gc_deletes(&[(orphan, WorkerTargetId(1))])
+            .unwrap();
         store.finalize_gc_tombstones(&[orphan]).unwrap();
         store
             .reserve_chunks(WriteTicketId(101), file.id, file.generation, &[orphan])

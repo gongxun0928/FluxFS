@@ -20,6 +20,8 @@ service MetaService {
   rpc CommitInodeManifestReserved(CommitInodeManifestReservedRequest) returns (CommitInodeManifestResponse);
   rpc TombstoneGcBatch(TombstoneGcBatchRequest) returns (TombstoneGcBatchResponse);
   rpc ListGcTombstones(ListGcTombstonesRequest) returns (ListGcTombstonesResponse);
+  rpc InitializeGcDeleteTargets(InitializeGcDeleteTargetsRequest) returns (InitializeGcDeleteTargetsResponse);
+  rpc AcknowledgeGcDeletes(AcknowledgeGcDeletesRequest) returns (AcknowledgeGcDeletesResponse);
   rpc FinalizeGcTombstones(FinalizeGcTombstonesRequest) returns (FinalizeGcTombstonesResponse);
   rpc GetManifest(GetManifestRequest) returns (GetManifestResponse);
   rpc BeginFlush(BeginFlushRequest) returns (BeginFlushResponse);
@@ -102,7 +104,11 @@ message CommitInodeManifestReservedRequest {
 message TombstoneGcBatchRequest { bytes chunks_json = 1; string request_id = 2; }
 message TombstoneGcBatchResponse { bytes batch_json = 1; }
 message ListGcTombstonesRequest {}
-message ListGcTombstonesResponse { bytes chunks_json = 1; }
+message ListGcTombstonesResponse { bytes tombstones_json = 1; }
+message InitializeGcDeleteTargetsRequest { bytes chunks_json = 1; bytes targets_json = 2; }
+message InitializeGcDeleteTargetsResponse {}
+message AcknowledgeGcDeletesRequest { bytes deleted_json = 1; }
+message AcknowledgeGcDeletesResponse {}
 message FinalizeGcTombstonesRequest { bytes chunks_json = 1; string request_id = 2; }
 message FinalizeGcTombstonesResponse {}
 

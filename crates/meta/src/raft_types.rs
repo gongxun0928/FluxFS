@@ -12,7 +12,7 @@ use std::io::Cursor;
 
 use fluxfs_types::{
     ChunkId, FileType, FlushId, FlushIntent, FluxError, GcBatch, GcLeaseId, GcPlan, Inode,
-    Manifest, RequestOpId, UfsObject, WriteTicketId,
+    Manifest, RequestOpId, UfsObject, WorkerTargetId, WriteTicketId,
 };
 
 pub type NodeId = u64;
@@ -101,6 +101,17 @@ pub enum MetaRaftRequest {
         request_id: Option<RequestOpId>,
         chunks: Vec<ChunkId>,
     },
+    InitializeGcDeleteTargets {
+        #[serde(default)]
+        request_id: Option<RequestOpId>,
+        chunks: Vec<ChunkId>,
+        targets: Vec<WorkerTargetId>,
+    },
+    AcknowledgeGcDeletes {
+        #[serde(default)]
+        request_id: Option<RequestOpId>,
+        deleted: Vec<(ChunkId, WorkerTargetId)>,
+    },
     BeginFlush {
         #[serde(default)]
         request_id: Option<RequestOpId>,
@@ -171,6 +182,8 @@ impl MetaRaftRequest {
             | Self::CommitInodeManifestReserved { request_id, .. }
             | Self::TombstoneGcBatch { request_id, .. }
             | Self::FinalizeGcTombstones { request_id, .. }
+            | Self::InitializeGcDeleteTargets { request_id, .. }
+            | Self::AcknowledgeGcDeletes { request_id, .. }
             | Self::BeginFlush { request_id, .. }
             | Self::CommitFlush { request_id, .. }
             | Self::FailFlushConflict { request_id, .. }
@@ -193,6 +206,8 @@ impl MetaRaftRequest {
             | Self::CommitInodeManifestReserved { request_id, .. }
             | Self::TombstoneGcBatch { request_id, .. }
             | Self::FinalizeGcTombstones { request_id, .. }
+            | Self::InitializeGcDeleteTargets { request_id, .. }
+            | Self::AcknowledgeGcDeletes { request_id, .. }
             | Self::BeginFlush { request_id, .. }
             | Self::CommitFlush { request_id, .. }
             | Self::FailFlushConflict { request_id, .. }
