@@ -277,7 +277,7 @@ mod tests {
             inode: created.id,
             gen: DataGen(1),
             size: 8,
-            extents: Vec::new(),
+            extents: fluxfs_types::ExtentTree::default(),
         };
         let committed = match raft
             .client_write(MetaRaftRequest::CommitInodeManifest {

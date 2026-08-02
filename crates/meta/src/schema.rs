@@ -3,8 +3,9 @@ use fluxfs_types::{FluxError, Result};
 /// On-disk application schema understood by this FluxFS build.
 ///
 /// Version zero is the legacy, unmarked alpha layout. Version one adds the
-/// durable marker but deliberately leaves data keys unchanged.
-pub const CURRENT_META_SCHEMA_VERSION: u32 = 1;
+/// durable marker; version two writes versioned ordered extent trees while
+/// retaining a reader for legacy manifest arrays.
+pub const CURRENT_META_SCHEMA_VERSION: u32 = 2;
 pub const LEGACY_UNMARKED_SCHEMA_VERSION: u32 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,11 +15,18 @@ pub struct MetaMigration {
     pub name: &'static str,
 }
 
-const MIGRATIONS: [MetaMigration; 1] = [MetaMigration {
-    from: LEGACY_UNMARKED_SCHEMA_VERSION,
-    to: CURRENT_META_SCHEMA_VERSION,
-    name: "mark legacy heed layout as schema v1",
-}];
+const MIGRATIONS: [MetaMigration; 2] = [
+    MetaMigration {
+        from: LEGACY_UNMARKED_SCHEMA_VERSION,
+        to: 1,
+        name: "mark legacy heed layout as schema v1",
+    },
+    MetaMigration {
+        from: 1,
+        to: 2,
+        name: "enable versioned ordered extent-tree manifests",
+    },
+];
 
 /// Return the ordered, explicit migration path for an older store.
 ///
@@ -56,9 +64,10 @@ mod tests {
 
     #[test]
     fn migration_path_is_explicit_and_rejects_downgrade() {
-        assert_eq!(migration_path(0, 1).unwrap(), MIGRATIONS);
-        assert!(migration_path(1, 1).unwrap().is_empty());
-        assert!(migration_path(2, 1)
+        assert_eq!(migration_path(0, 2).unwrap(), MIGRATIONS);
+        assert_eq!(migration_path(1, 2).unwrap(), vec![MIGRATIONS[1]]);
+        assert!(migration_path(2, 2).unwrap().is_empty());
+        assert!(migration_path(3, 2)
             .unwrap_err()
             .to_string()
             .contains("newer"));

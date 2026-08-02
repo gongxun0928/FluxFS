@@ -63,10 +63,12 @@ write-back, full POSIX behavior, multi-tenant security, or production operations
    100k-inode/1M-operation local baseline passes, so heed remains the default;
    target-hardware scale/concurrency runs decide when an LSM path is justified.
    See [metadata engine qualification](meta-engine.md).
-2. **Manifests and snapshots are whole-object structures.** Extents are a linear
-   `Vec` serialized as JSON, and Raft snapshots serialize all metadata into one
-   in-memory buffer. Use versioned binary schemas, indexed extent trees, and
-   streaming/checkpoint snapshots with incremental transfer.
+2. **Extent lookup/update is indexed; snapshots remain whole-object.** B2 adds a
+   versioned ordered extent tree with legacy-array reads, logarithmic range
+   positioning, and non-linear consuming replacement (see
+   [manifest extent tree](extent-tree.md)). MetaStore still serializes each
+   immutable manifest blob and Raft snapshots still buffer all metadata; B3
+   must add checkpointed pages and streaming/incremental transfer.
 3. **Worker membership and repair are fixed and synchronous.** Exactly three
    endpoints are configured by the client. Topology changes trigger full
    inventories and checksum reads before writes continue. Production needs a

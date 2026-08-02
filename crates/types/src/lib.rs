@@ -5,6 +5,7 @@
 //! `BackingMode × DataState × OpState × Origin` + per-extent residency.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
 use thiserror::Error;
 
@@ -483,6 +484,173 @@ impl Extent {
 
 // ===== Manifest =====
 
+/// Ordered extent index keyed by logical file offset.
+///
+/// The v1 wire form is explicit and the deserializer also accepts the legacy
+/// bare `Vec<Extent>` representation. Point/range positioning is logarithmic;
+/// callers cannot mutate keys independently from an extent's own offset.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExtentTree {
+    by_offset: BTreeMap<u64, Extent>,
+}
+
+impl ExtentTree {
+    pub const WIRE_VERSION: u32 = 1;
+
+    pub fn len(&self) -> usize {
+        self.by_offset.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_offset.is_empty()
+    }
+
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &Extent> {
+        self.by_offset.values()
+    }
+
+    pub fn get_by_offset(&self, offset: u64) -> Option<&Extent> {
+        self.by_offset.get(&offset)
+    }
+
+    pub fn singleton(extent: Extent) -> Result<Self> {
+        Self::try_from(vec![extent])
+    }
+
+    fn overlapping(&self, offset: u64, len: u64) -> Vec<&Extent> {
+        if len == 0 {
+            return Vec::new();
+        }
+        let end = offset.saturating_add(len);
+        let mut hits = Vec::new();
+        if let Some((_, extent)) = self.by_offset.range(..=offset).next_back() {
+            if extent.offset() < end && offset < extent.offset().saturating_add(extent.len()) {
+                hits.push(extent);
+            }
+        }
+        for (_, extent) in self.by_offset.range((
+            std::ops::Bound::Excluded(offset),
+            std::ops::Bound::Excluded(end),
+        )) {
+            hits.push(extent);
+        }
+        hits
+    }
+
+    fn remove(&mut self, offset: u64) {
+        self.by_offset.remove(&offset);
+    }
+
+    fn insert(&mut self, extent: Extent) -> Result<()> {
+        let offset = extent.offset();
+        if self.by_offset.insert(offset, extent).is_some() {
+            return Err(FluxError::InvalidArg(format!(
+                "duplicate extent offset {offset}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl TryFrom<Vec<Extent>> for ExtentTree {
+    type Error = FluxError;
+
+    fn try_from(extents: Vec<Extent>) -> Result<Self> {
+        let mut by_offset = BTreeMap::new();
+        for extent in extents {
+            let offset = extent.offset();
+            if by_offset.insert(offset, extent).is_some() {
+                return Err(FluxError::InvalidArg(format!(
+                    "duplicate extent offset {offset}"
+                )));
+            }
+        }
+        let mut previous_end = None;
+        for extent in by_offset.values() {
+            if extent.is_empty() {
+                return Err(FluxError::InvalidArg(format!(
+                    "zero-length extent at offset {}",
+                    extent.offset()
+                )));
+            }
+            let end = extent
+                .offset()
+                .checked_add(extent.len())
+                .ok_or_else(|| FluxError::InvalidArg("extent end overflow".into()))?;
+            if previous_end.is_some_and(|previous| extent.offset() < previous) {
+                return Err(FluxError::InvalidArg(format!(
+                    "extent overlap at offset {}",
+                    extent.offset()
+                )));
+            }
+            previous_end = Some(end);
+        }
+        Ok(Self { by_offset })
+    }
+}
+
+impl<'a> IntoIterator for &'a ExtentTree {
+    type Item = &'a Extent;
+    type IntoIter = std::collections::btree_map::Values<'a, u64, Extent>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.by_offset.values()
+    }
+}
+
+impl IntoIterator for ExtentTree {
+    type Item = Extent;
+    type IntoIter = std::collections::btree_map::IntoValues<u64, Extent>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.by_offset.into_values()
+    }
+}
+
+impl Serialize for ExtentTree {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            version: u32,
+            entries: Vec<&'a Extent>,
+        }
+        Wire {
+            version: Self::WIRE_VERSION,
+            entries: self.iter().collect(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ExtentTree {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Legacy(Vec<Extent>),
+            Versioned { version: u32, entries: Vec<Extent> },
+        }
+        let entries = match Wire::deserialize(deserializer)? {
+            Wire::Legacy(entries) => entries,
+            Wire::Versioned { version, entries } => {
+                if version != Self::WIRE_VERSION {
+                    return Err(serde::de::Error::custom(format!(
+                        "unsupported extent tree version {version}"
+                    )));
+                }
+                entries
+            }
+        };
+        Self::try_from(entries).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Immutable extent-map snapshot, identified by (inode, gen, root_hash).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
@@ -490,7 +658,7 @@ pub struct Manifest {
     pub gen: DataGen,
     pub size: u64,
     /// Sorted by offset, non-overlapping.
-    pub extents: Vec<Extent>,
+    pub extents: ExtentTree,
 }
 
 impl Manifest {
@@ -519,7 +687,7 @@ impl Manifest {
             inode,
             gen,
             size: 0,
-            extents: Vec::new(),
+            extents: ExtentTree::default(),
         }
     }
 
@@ -529,11 +697,7 @@ impl Manifest {
     /// extents read from ChunkStore, covered `UfsRange` extents do pinned-version
     /// OpenDAL range GETs.
     pub fn extents_in_range(&self, offset: u64, len: u64) -> impl Iterator<Item = &Extent> {
-        let end = offset.saturating_add(len);
-        self.extents.iter().filter(move |e| {
-            let e_end = e.offset().saturating_add(e.len());
-            e.offset() < end && offset < e_end
-        })
+        self.extents.overlapping(offset, len).into_iter()
     }
 
     /// Build a new `Manifest` (gen = `new_gen`) by inserting `new_extent` over
@@ -553,7 +717,7 @@ impl Manifest {
     /// The new manifest's `size` grows to `max(old.size, new_end)` if the new
     /// extent extends beyond the current end. The result is validated before
     /// return.
-    pub fn replace_range(&self, new_extent: Extent, new_gen: DataGen) -> Result<Manifest> {
+    pub fn replace_range(self, new_extent: Extent, new_gen: DataGen) -> Result<Manifest> {
         if new_extent.is_empty() {
             return Err(FluxError::InvalidArg(
                 "replace_range: new_extent has len=0".into(),
@@ -564,21 +728,24 @@ impl Manifest {
             .checked_add(new_extent.len())
             .ok_or_else(|| FluxError::InvalidArg("new_extent len overflow".into()))?;
 
-        let mut result: Vec<Extent> = Vec::with_capacity(self.extents.len() + 2);
+        let overlapping: Vec<Extent> = self
+            .extents
+            .overlapping(new_start, new_extent.len())
+            .into_iter()
+            .cloned()
+            .collect();
+        let inode = self.inode;
+        let old_size = self.size;
+        let mut result = self.extents;
 
-        for existing in &self.extents {
+        for existing in overlapping {
             let ex_start = existing.offset();
             let ex_end = ex_start
                 .checked_add(existing.len())
                 .ok_or_else(|| FluxError::InvalidArg("existing extent len overflow".into()))?;
+            result.remove(ex_start);
 
-            // No overlap: existing entirely before or after new range.
-            if ex_end <= new_start || ex_start >= new_end {
-                result.push(existing.clone());
-                continue;
-            }
-
-            match existing {
+            match &existing {
                 Extent::UfsRange {
                     ufs_key,
                     ufs_version,
@@ -589,25 +756,25 @@ impl Manifest {
                     // Head: [ex_start, min(ex_end, new_start)).
                     if ex_start < new_start {
                         let head_len = new_start - ex_start;
-                        result.push(Extent::UfsRange {
+                        result.insert(Extent::UfsRange {
                             offset: ex_start,
                             len: head_len,
                             ufs_key: ufs_key.clone(),
                             ufs_version: ufs_version.clone(),
                             offset_in_object: obj_base,
-                        });
+                        })?;
                     }
                     // Tail: [max(ex_start, new_end), ex_end).
                     if ex_end > new_end {
                         let tail_len = ex_end - new_end;
                         let tail_obj_offset = obj_base + (new_end - ex_start);
-                        result.push(Extent::UfsRange {
+                        result.insert(Extent::UfsRange {
                             offset: new_end,
                             len: tail_len,
                             ufs_key: ufs_key.clone(),
                             ufs_version: ufs_version.clone(),
                             offset_in_object: tail_obj_offset,
-                        });
+                        })?;
                     }
                     // Middle consumed by new_extent.
                 }
@@ -624,18 +791,11 @@ impl Manifest {
             }
         }
 
-        // Insert new_extent in sorted position. binary_search_by_key on offset
-        // gives Ok(existing_pos) only when an extent starts exactly at new_start;
-        // in that case we replace (drop the old fully-covered one already handled
-        // above and re-insert here). Err(insert_pos) is the normal path.
-        let insert_pos = result
-            .binary_search_by_key(&new_start, Extent::offset)
-            .unwrap_or_else(|p| p);
-        result.insert(insert_pos, new_extent);
+        result.insert(new_extent)?;
 
-        let new_size = std::cmp::max(self.size, new_end);
+        let new_size = std::cmp::max(old_size, new_end);
         let m = Manifest {
-            inode: self.inode,
+            inode,
             gen: new_gen,
             size: new_size,
             extents: result,
@@ -930,24 +1090,21 @@ mod tests {
     #[test]
     fn manifest_validate_detects_overlap() {
         let chunk = ChunkId([1; 32]);
-        let m = Manifest {
-            inode: 1,
-            gen: DataGen(1),
-            size: 2 * CHUNK_SIZE,
-            extents: vec![
-                Extent::Local {
-                    offset: 0,
-                    len: CHUNK_SIZE,
-                    chunk,
-                },
-                Extent::Local {
-                    offset: 0,
-                    len: CHUNK_SIZE,
-                    chunk,
-                },
-            ],
-        };
-        assert!(m.validate().is_err());
+        let duplicate = ExtentTree::try_from(vec![
+            Extent::Local {
+                offset: 0,
+                len: CHUNK_SIZE,
+                chunk,
+            },
+            Extent::Local {
+                offset: 0,
+                len: CHUNK_SIZE,
+                chunk,
+            },
+        ]);
+        assert!(duplicate.is_err());
+        assert!(ExtentTree::try_from(vec![local(0, 10, 1), local(5, 10, 2)]).is_err());
+        assert!(ExtentTree::singleton(local(0, 0, 1)).is_err());
     }
 
     #[test]
@@ -957,7 +1114,7 @@ mod tests {
             inode: 1,
             gen: DataGen(1),
             size: 2 * CHUNK_SIZE,
-            extents: vec![
+            extents: ExtentTree::try_from(vec![
                 Extent::Local {
                     offset: 0,
                     len: CHUNK_SIZE,
@@ -968,7 +1125,8 @@ mod tests {
                     len: CHUNK_SIZE,
                     chunk,
                 },
-            ],
+            ])
+            .unwrap(),
         };
         assert!(m.validate().is_ok());
     }
@@ -1017,13 +1175,21 @@ mod tests {
         }
     }
 
+    fn tree(extents: Vec<Extent>) -> ExtentTree {
+        ExtentTree::try_from(extents).unwrap()
+    }
+
     #[test]
     fn extents_in_range_returns_only_overlapping() {
         let m = Manifest {
             inode: 1,
             gen: DataGen(1),
             size: 200,
-            extents: vec![ufs_range(0, 50), local(50, 50, 1), ufs_range(100, 100)],
+            extents: tree(vec![
+                ufs_range(0, 50),
+                local(50, 50, 1),
+                ufs_range(100, 100),
+            ]),
         };
         // [40, 90) overlaps extents at 0 and 50, not 100.
         let hits: Vec<&Extent> = m.extents_in_range(40, 50).collect();
@@ -1042,26 +1208,88 @@ mod tests {
     }
 
     #[test]
+    fn extent_tree_reads_legacy_array_and_writes_versioned_wire_form() {
+        let expected = Manifest {
+            inode: 7,
+            gen: DataGen(3),
+            size: 100,
+            extents: tree(vec![ufs_range(0, 50), local(50, 50, 9)]),
+        };
+        let mut versioned = serde_json::to_value(&expected).unwrap();
+        assert_eq!(versioned["extents"]["version"], 1);
+        let legacy_entries = versioned["extents"]["entries"].take();
+        versioned["extents"] = legacy_entries;
+        let decoded: Manifest = serde_json::from_value(versioned).unwrap();
+        assert_eq!(decoded, expected);
+        assert_eq!(decoded.root_digest(), expected.root_digest());
+    }
+
+    #[test]
+    fn extent_tree_rejects_unknown_wire_version() {
+        let manifest = Manifest {
+            inode: 7,
+            gen: DataGen(3),
+            size: 1,
+            extents: ExtentTree::singleton(local(0, 1, 1)).unwrap(),
+        };
+        let mut value = serde_json::to_value(manifest).unwrap();
+        value["extents"]["version"] = serde_json::json!(99);
+        assert!(serde_json::from_value::<Manifest>(value).is_err());
+    }
+
+    #[test]
+    fn large_extent_tree_positions_tail_range_and_replaces_in_place() {
+        const COUNT: u64 = 100_000;
+        let extents = (0..COUNT)
+            .map(|index| local(index * 2, 1, (index % 251) as u8))
+            .collect();
+        let manifest = Manifest {
+            inode: 1,
+            gen: DataGen(1),
+            size: COUNT * 2,
+            extents: tree(extents),
+        };
+        let tail_offset = (COUNT - 1) * 2;
+        assert_eq!(
+            manifest
+                .extents_in_range(tail_offset, 1)
+                .next()
+                .unwrap()
+                .offset(),
+            tail_offset
+        );
+        let replaced = manifest
+            .replace_range(local(tail_offset, 1, 255), DataGen(2))
+            .unwrap();
+        assert_eq!(replaced.extents.len(), COUNT as usize);
+        assert!(matches!(
+            replaced.extents.get_by_offset(tail_offset),
+            Some(Extent::Local { chunk, .. }) if chunk == &ChunkId([255; 32])
+        ));
+    }
+
+    #[test]
     fn replace_range_splits_ufs_range_head_and_tail() {
         let m = Manifest {
             inode: 1,
             gen: DataGen(1),
             size: 100,
-            extents: vec![ufs_range(0, 100)],
+            extents: tree(vec![ufs_range(0, 100)]),
         };
         let new = local(10, 50, 9);
         let m2 = m.replace_range(new, DataGen(2)).expect("split ok");
         assert_eq!(m2.gen, DataGen(2));
         assert_eq!(m2.size, 100);
         assert_eq!(m2.extents.len(), 3, "{:?}", m2.extents);
+        let extents: Vec<_> = m2.extents.iter().collect();
         // head [0,10)
-        assert_eq!(m2.extents[0].offset(), 0);
-        assert_eq!(m2.extents[0].len(), 10);
+        assert_eq!(extents[0].offset(), 0);
+        assert_eq!(extents[0].len(), 10);
         // inserted Local [10,60)
-        assert_eq!(m2.extents[1].offset(), 10);
-        assert_eq!(m2.extents[1].len(), 50);
+        assert_eq!(extents[1].offset(), 10);
+        assert_eq!(extents[1].len(), 50);
         // tail [60,100) — ufs_version preserved, offset_in_object adjusted.
-        match &m2.extents[2] {
+        match extents[2] {
             Extent::UfsRange {
                 offset,
                 len,
@@ -1084,14 +1312,17 @@ mod tests {
             inode: 1,
             gen: DataGen(1),
             size: 100,
-            extents: vec![ufs_range(0, 100)],
+            extents: tree(vec![ufs_range(0, 100)]),
         };
         // New covers the entire UfsRange.
         let m2 = m
             .replace_range(local(0, 100, 9), DataGen(2))
             .expect("full cover ok");
         assert_eq!(m2.extents.len(), 1);
-        assert!(matches!(m2.extents[0], Extent::Local { .. }));
+        assert!(matches!(
+            m2.extents.iter().next(),
+            Some(Extent::Local { .. })
+        ));
     }
 
     #[test]
@@ -1100,16 +1331,16 @@ mod tests {
             inode: 1,
             gen: DataGen(1),
             size: 100,
-            extents: vec![local(0, 100, 1)],
+            extents: tree(vec![local(0, 100, 1)]),
         };
         let m2 = m
             .replace_range(local(0, 100, 9), DataGen(2))
             .expect("full cover local ok");
         assert_eq!(m2.extents.len(), 1);
-        match m2.extents[0] {
-            Extent::Local { chunk, .. } => assert_eq!(chunk, ChunkId([9; 32])),
+        match m2.extents.iter().next().unwrap() {
+            Extent::Local { chunk, .. } => assert_eq!(*chunk, ChunkId([9; 32])),
             _ => panic!(),
-        }
+        };
     }
 
     #[test]
@@ -1118,13 +1349,13 @@ mod tests {
             inode: 1,
             gen: DataGen(1),
             size: 100,
-            extents: vec![local(0, 100, 1)],
+            extents: tree(vec![local(0, 100, 1)]),
         };
         // Partial overlap on the right side.
-        let err = m.replace_range(local(50, 100, 9), DataGen(2));
+        let err = m.clone().replace_range(local(50, 100, 9), DataGen(2));
         assert!(err.is_err());
         // Partial overlap on the left side.
-        let err = m.replace_range(local(0, 50, 9), DataGen(2));
+        let err = m.clone().replace_range(local(0, 50, 9), DataGen(2));
         assert!(err.is_err());
         // Inner island.
         let err = m.replace_range(local(25, 50, 9), DataGen(2));
@@ -1139,15 +1370,16 @@ mod tests {
             inode: 1,
             gen: DataGen(1),
             size: 100,
-            extents: vec![ufs_range(0, 50), ufs_range(50, 50)],
+            extents: tree(vec![ufs_range(0, 50), ufs_range(50, 50)]),
         };
         let m2 = m
             .replace_range(local(50, 50, 9), DataGen(2))
             .expect("adjacent not overlap");
         assert_eq!(m2.extents.len(), 2);
-        assert_eq!(m2.extents[0].offset(), 0);
-        assert_eq!(m2.extents[0].len(), 50);
-        assert!(matches!(m2.extents[1], Extent::Local { .. }));
+        let extents: Vec<_> = m2.extents.iter().collect();
+        assert_eq!(extents[0].offset(), 0);
+        assert_eq!(extents[0].len(), 50);
+        assert!(matches!(extents[1], Extent::Local { .. }));
     }
 
     #[test]
@@ -1156,7 +1388,7 @@ mod tests {
             inode: 1,
             gen: DataGen(1),
             size: 100,
-            extents: vec![ufs_range(0, 100)],
+            extents: tree(vec![ufs_range(0, 100)]),
         };
         let m2 = m
             .replace_range(local(50, 200, 9), DataGen(2))

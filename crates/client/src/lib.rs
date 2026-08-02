@@ -3,9 +3,10 @@
 use fluxfs_chunk::ChunkStore;
 use fluxfs_meta::MetaStore;
 use fluxfs_types::{
-    BackingMode, ChunkId, DataGen, DataState, Extent, FileType, FlushId, FlushIntent, FluxError,
-    Inode, InodeId, LocalityFields, LocalityLabel, Manifest, OpState, Origin, RequestOpId, Result,
-    UfsObject, UfsVersion, WriteTicketId, CHUNK_SIZE, DIRTY_WRITE_CAP_BYTES, ROOT_INODE,
+    BackingMode, ChunkId, DataGen, DataState, Extent, ExtentTree, FileType, FlushId, FlushIntent,
+    FluxError, Inode, InodeId, LocalityFields, LocalityLabel, Manifest, OpState, Origin,
+    RequestOpId, Result, UfsObject, UfsVersion, WriteTicketId, CHUNK_SIZE, DIRTY_WRITE_CAP_BYTES,
+    ROOT_INODE,
 };
 use fluxfs_ufs::{ReadPathConfig, ReadPathStats, Ufs, UfsEntryMode, UfsProbe, UfsReadPath};
 use std::collections::{BTreeSet, HashMap};
@@ -710,7 +711,8 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
                 inode: ino,
                 gen,
                 size: data.len() as u64,
-                extents,
+                extents: ExtentTree::try_from(extents)
+                    .expect("chunked local manifest offsets are unique"),
             },
             staged,
         )
@@ -974,13 +976,13 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
                 inode: 0,
                 gen: DataGen(0),
                 size: obj.size,
-                extents: vec![Extent::UfsRange {
+                extents: ExtentTree::singleton(Extent::UfsRange {
                     offset: 0,
                     len: obj.size,
                     ufs_key: rel.to_string(),
                     ufs_version: version,
                     offset_in_object: 0,
-                }],
+                })?,
             })
         };
         let inode = match self
@@ -1393,9 +1395,10 @@ mod tests {
             .get_manifest(dirty.manifest_id.unwrap())
             .unwrap();
         assert_eq!(manifest.extents.len(), 3);
-        assert!(matches!(manifest.extents[0], Extent::UfsRange { .. }));
-        assert!(matches!(manifest.extents[1], Extent::Local { .. }));
-        assert!(matches!(manifest.extents[2], Extent::UfsRange { .. }));
+        let extents: Vec<_> = manifest.extents.iter().collect();
+        assert!(matches!(extents[0], Extent::UfsRange { .. }));
+        assert!(matches!(extents[1], Extent::Local { .. }));
+        assert!(matches!(extents[2], Extent::UfsRange { .. }));
     }
 
     #[test]
@@ -1507,8 +1510,8 @@ mod tests {
                 .get_manifest(inode.manifest_id.unwrap())
                 .unwrap();
             assert!(matches!(
-                manifest.extents.as_slice(),
-                [Extent::UfsRange { .. }]
+                manifest.extents.iter().next(),
+                Some(Extent::UfsRange { .. })
             ));
         }
     }

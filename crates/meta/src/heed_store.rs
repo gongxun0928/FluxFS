@@ -1,10 +1,10 @@
 use crate::raft_types::{MetaRaftRequest, MetaRaftResponse, SmAppliedMeta};
 use crate::store::MetaStore;
 use fluxfs_types::{
-    BackingMode, ChunkId, ChunkReservation, DataGen, DataState, Dentry, Extent, FileType, FlushId,
-    FlushIntent, FluxError, GcBatch, GcLeaseId, GcPlan, GcTombstone, Inode, InodeId,
-    LocalityFields, LocalityLabel, Manifest, ManifestId, OpState, Origin, Result, UfsObject,
-    UfsVersion, WorkerTargetId, WriteTicketId, ROOT_INODE,
+    BackingMode, ChunkId, ChunkReservation, DataGen, DataState, Dentry, Extent, ExtentTree,
+    FileType, FlushId, FlushIntent, FluxError, GcBatch, GcLeaseId, GcPlan, GcTombstone, Inode,
+    InodeId, LocalityFields, LocalityLabel, Manifest, ManifestId, OpState, Origin, Result,
+    UfsObject, UfsVersion, WorkerTargetId, WriteTicketId, ROOT_INODE,
 };
 use heed::types::{Bytes, Str};
 use heed::{Database, Env, EnvOpenOptions};
@@ -129,9 +129,9 @@ impl HeedMetaStore {
             .unwrap_or(0);
         let migrations = migration_path(stored_schema, CURRENT_META_SCHEMA_VERSION)?;
         for migration in migrations {
-            // v0 -> v1 only records the version; data keys and encodings are
-            // unchanged. Future steps belong here and run in this one txn.
-            debug_assert_eq!(migration.to, CURRENT_META_SCHEMA_VERSION);
+            // v0 -> v1 marks the store. v1 -> v2 switches future manifest
+            // writes to the versioned tree wire form; its reader accepts old
+            // arrays, so no stop-the-world rewrite is required.
             meta.put(&mut wtxn, KEY_META_SCHEMA_VERSION, &u32_bytes(migration.to))
                 .map_err(|e| FluxError::Meta(e.to_string()))?;
         }
@@ -1065,15 +1065,15 @@ impl HeedMetaStore {
                 gen: intent.snapshot_gen,
                 size: inode.size,
                 extents: if inode.size == 0 {
-                    Vec::new()
+                    ExtentTree::default()
                 } else {
-                    vec![Extent::UfsRange {
+                    ExtentTree::singleton(Extent::UfsRange {
                         offset: 0,
                         len: inode.size,
                         ufs_key: published_ufs.key.clone(),
                         ufs_version: version.clone(),
                         offset_in_object: 0,
-                    }]
+                    })?
                 },
             };
             inode.manifest_id = if inode.size == 0 {
@@ -2277,6 +2277,46 @@ mod tests {
     }
 
     #[test]
+    fn schema_v1_legacy_manifest_is_read_after_v2_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HeedMetaStore::open(dir.path()).unwrap();
+        let manifest = Manifest {
+            inode: ROOT_INODE,
+            gen: DataGen(4),
+            size: 4,
+            extents: ExtentTree::singleton(Extent::UfsRange {
+                offset: 0,
+                len: 4,
+                ufs_key: "legacy-object".into(),
+                ufs_version: UfsVersion("v1".into()),
+                offset_in_object: 0,
+            })
+            .unwrap(),
+        };
+        let id = store.put_manifest(&manifest).unwrap();
+        let mut legacy_value = serde_json::to_value(&manifest).unwrap();
+        legacy_value["extents"] = legacy_value["extents"]["entries"].take();
+        let legacy_bytes = serde_json::to_vec(&legacy_value).unwrap();
+        {
+            let mut txn = store.env.write_txn().unwrap();
+            store
+                .manifests
+                .put(&mut txn, &inode_key(id.0), &legacy_bytes)
+                .unwrap();
+            store
+                .meta
+                .put(&mut txn, KEY_META_SCHEMA_VERSION, &u32_bytes(1))
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        drop(store);
+
+        let upgraded = HeedMetaStore::open(dir.path()).unwrap();
+        assert_eq!(upgraded.schema_version().unwrap(), 2);
+        assert_eq!(upgraded.get_manifest(id).unwrap(), manifest);
+    }
+
+    #[test]
     fn newer_schema_is_rejected_without_downgrade() {
         let dir = tempfile::tempdir().unwrap();
         let store = HeedMetaStore::open(dir.path()).unwrap();
@@ -2342,7 +2382,7 @@ mod tests {
             inode: file.id,
             gen: DataGen(1),
             size: 4,
-            extents: Vec::new(),
+            extents: ExtentTree::default(),
         };
         let committed = store
             .commit_inode_manifest(base_gen, &next, &manifest)
@@ -2405,7 +2445,7 @@ mod tests {
             inode: file.id,
             gen: DataGen(3),
             size: 5,
-            extents: Vec::new(),
+            extents: ExtentTree::default(),
         };
         assert_eq!(
             store
@@ -2429,8 +2469,8 @@ mod tests {
         assert!(store.list_flush_intents().unwrap().is_empty());
         let manifest = store.get_manifest(clean.manifest_id.unwrap()).unwrap();
         assert!(matches!(
-            manifest.extents.as_slice(),
-            [Extent::UfsRange { ufs_version, .. }] if ufs_version == &UfsVersion("new-etag".into())
+            manifest.extents.iter().next(),
+            Some(Extent::UfsRange { ufs_version, .. }) if ufs_version == &UfsVersion("new-etag".into())
         ));
     }
 
@@ -2455,11 +2495,12 @@ mod tests {
                 inode: file.id,
                 gen: DataGen(2),
                 size: 4,
-                extents: vec![Extent::Local {
+                extents: ExtentTree::singleton(Extent::Local {
                     offset: 0,
                     len: 4,
                     chunk: live,
-                }],
+                })
+                .unwrap(),
             };
             let ticket = WriteTicketId(7);
             store
@@ -2480,11 +2521,12 @@ mod tests {
                     inode: file.id,
                     gen: DataGen(1),
                     size: 6,
-                    extents: vec![Extent::Local {
+                    extents: ExtentTree::singleton(Extent::Local {
                         offset: 0,
                         len: 6,
                         chunk: orphan,
-                    }],
+                    })
+                    .unwrap(),
                 })
                 .unwrap();
 
@@ -2593,11 +2635,12 @@ mod tests {
             inode: file.id,
             gen: DataGen(2),
             size: 19,
-            extents: vec![Extent::Local {
+            extents: ExtentTree::singleton(Extent::Local {
                 offset: 0,
                 len: 19,
                 chunk: reserved,
-            }],
+            })
+            .unwrap(),
         };
         store
             .commit_inode_manifest_reserved_with_id(
@@ -2692,11 +2735,12 @@ mod tests {
             inode: file.id,
             gen: DataGen(2),
             size: 1,
-            extents: vec![Extent::Local {
+            extents: ExtentTree::singleton(Extent::Local {
                 offset: 0,
                 len: 1,
                 chunk: second,
-            }],
+            })
+            .unwrap(),
         };
         assert!(matches!(
             restored.commit_inode_manifest_reserved_with_id(
@@ -2760,13 +2804,14 @@ mod tests {
             inode: 0,
             gen: DataGen(0),
             size: 12,
-            extents: vec![Extent::UfsRange {
+            extents: ExtentTree::singleton(Extent::UfsRange {
                 offset: 0,
                 len: 12,
                 ufs_key: "obj.bin".into(),
                 ufs_version: version,
                 offset_in_object: 0,
-            }],
+            })
+            .unwrap(),
         };
         let file = store
             .import_external(ROOT_INODE, "obj.bin", &template, Some(&manifest))
@@ -2970,11 +3015,12 @@ mod tests {
             inode: file.id,
             gen: DataGen(1),
             size: 4,
-            extents: vec![Extent::Local {
+            extents: ExtentTree::singleton(Extent::Local {
                 offset: 0,
                 len: 4,
                 chunk,
-            }],
+            })
+            .unwrap(),
         };
         let ticket = WriteTicketId(11);
         store

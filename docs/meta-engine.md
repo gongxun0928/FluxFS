@@ -49,8 +49,9 @@ concurrency, or operational constraints make its map/checkpoint model unsuitable
 ## Schema and engine migration contract
 
 Every Meta database now carries `meta_schema_version`. An unmarked legacy
-database is version 0 and is transactionally marked version 1 on open; a newer
-schema is rejected, so an older binary cannot silently downgrade or corrupt it.
+database is version 0; the current v2 path applies the v1 marker step and the v2
+extent-tree encoding step transactionally on open. A newer schema is rejected,
+so an older binary cannot silently downgrade or corrupt it.
 Each future version must add one explicit step to `migration_path` plus upgrade,
 reopen, snapshot/restore, and future-version rejection tests.
 
