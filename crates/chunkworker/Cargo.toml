@@ -1,0 +1,21 @@
+[package]
+name = "fluxfs-chunkworker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "FluxFS ChunkWorker process: durable local chunks over tonic"
+
+[[bin]]
+name = "fluxfs-chunkworker"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+fluxfs-chunk = { workspace = true }
+fluxfs-proto = { workspace = true }
+fluxfs-types = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

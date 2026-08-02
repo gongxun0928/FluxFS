@@ -2,12 +2,15 @@
 resolver = "2"
 members = [
     "crates/types",
+    "crates/proto",
     "crates/meta",
     "crates/testkit",
     "crates/chunk",
+    "crates/chunkworker",
     "crates/ufs",
     "crates/client",
     "crates/fuse",
+    "crates/metamaster",
     "crates/fluxfs",
 ]
 default-members = ["crates/fluxfs"]
@@ -29,17 +32,21 @@ opendal = { version = "0.58", features = ["services-fs", "services-s3"] }
 openraft = { version = "0.9", features = ["serde"] }
 proptest = "1.11"
 fail = "0.5"
+prost = "0.14"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tempfile = "3"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "sync", "time"] }
+tonic = { version = "0.14", features = ["transport"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 fluxfs-types = { path = "crates/types" }
+fluxfs-proto = { path = "crates/proto" }
 fluxfs-meta = { path = "crates/meta" }
 fluxfs-testkit = { path = "crates/testkit" }
 fluxfs-chunk = { path = "crates/chunk" }
+fluxfs-chunkworker = { path = "crates/chunkworker" }
 fluxfs-ufs = { path = "crates/ufs" }
 fluxfs-client = { path = "crates/client" }
 fluxfs-fuse = { path = "crates/fuse" }

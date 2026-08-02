@@ -1,0 +1,58 @@
+syntax = "proto3";
+
+package fluxfs.meta.v1;
+
+// Domain objects travel as JSON bytes so prost types do not leak into VFS/Manifest.
+// Convert at the crate boundary via fluxfs_proto::meta_codec.
+
+service MetaService {
+  rpc GetInode(GetInodeRequest) returns (GetInodeResponse);
+  rpc Lookup(LookupRequest) returns (LookupResponse);
+  rpc Create(CreateRequest) returns (CreateResponse);
+  rpc Readdir(ReaddirRequest) returns (ReaddirResponse);
+  rpc PutInode(PutInodeRequest) returns (PutInodeResponse);
+  rpc PutManifest(PutManifestRequest) returns (PutManifestResponse);
+  rpc GetManifest(GetManifestRequest) returns (GetManifestResponse);
+  rpc Unlink(UnlinkRequest) returns (UnlinkResponse);
+  rpc Ping(PingRequest) returns (PingResponse);
+}
+
+message PingRequest {}
+message PingResponse { string version = 1; }
+
+message GetInodeRequest { uint64 id = 1; }
+message GetInodeResponse { bytes inode_json = 1; }
+
+message LookupRequest {
+  uint64 parent = 1;
+  string name = 2;
+}
+message LookupResponse { bytes inode_json = 1; }
+
+message CreateRequest {
+  uint64 parent = 1;
+  string name = 2;
+  uint32 file_type = 3; // 0=dir, 1=regular
+  uint32 mode = 4;
+  uint32 uid = 5;
+  uint32 gid = 6;
+}
+message CreateResponse { bytes inode_json = 1; }
+
+message ReaddirRequest { uint64 dir = 1; }
+message ReaddirResponse { bytes dentries_json = 1; }
+
+message PutInodeRequest { bytes inode_json = 1; }
+message PutInodeResponse {}
+
+message PutManifestRequest { bytes manifest_json = 1; }
+message PutManifestResponse { uint64 manifest_id = 1; }
+
+message GetManifestRequest { uint64 id = 1; }
+message GetManifestResponse { bytes manifest_json = 1; }
+
+message UnlinkRequest {
+  uint64 parent = 1;
+  string name = 2;
+}
+message UnlinkResponse {}

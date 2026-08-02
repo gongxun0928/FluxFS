@@ -1,0 +1,22 @@
+[package]
+name = "fluxfs-metamaster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "FluxFS MetaMaster process: heed MetaStore + tonic MetaService"
+
+[[bin]]
+name = "fluxfs-metamaster"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+fluxfs-meta = { workspace = true }
+fluxfs-proto = { workspace = true }
+fluxfs-types = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

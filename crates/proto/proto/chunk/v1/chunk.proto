@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package fluxfs.chunk.v1;
+
+service ChunkWorker {
+  rpc PutChunk(PutChunkRequest) returns (PutChunkResponse);
+  rpc GetChunk(GetChunkRequest) returns (GetChunkResponse);
+  rpc ContainsChunk(ContainsChunkRequest) returns (ContainsChunkResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message PutChunkRequest { bytes data = 1; }
+message PutChunkResponse {
+  bytes chunk_id = 1;
+  uint64 worker_id = 2;
+  bool durable = 3;
+}
+
+message GetChunkRequest { bytes chunk_id = 1; }
+message GetChunkResponse {
+  bytes data = 1;
+  uint64 worker_id = 2;
+}
+
+message ContainsChunkRequest { bytes chunk_id = 1; }
+message ContainsChunkResponse {
+  bool present = 1;
+  uint64 worker_id = 2;
+}
+
+message HealthRequest {}
+message HealthResponse {
+  uint64 worker_id = 1;
+  bool ready = 2;
+}

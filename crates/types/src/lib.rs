@@ -46,8 +46,14 @@ pub struct ChunkIndex(pub u32);
 pub struct ChunkId([u8; 32]);
 
 impl ChunkId {
+    /// Content-addressed id: blake3(data).
     pub fn from_bytes(data: &[u8]) -> Self {
         Self(*blake3::hash(data).as_bytes())
+    }
+
+    /// Parse a raw 32-byte chunk id (wire / RPC).
+    pub fn from_raw(bytes: [u8; 32]) -> Self {
+        Self(bytes)
     }
 
     pub fn as_bytes(&self) -> &[u8; 32] {
@@ -56,6 +62,17 @@ impl ChunkId {
 
     pub fn to_hex(&self) -> String {
         hex::encode(self.0)
+    }
+}
+
+impl TryFrom<&[u8]> for ChunkId {
+    type Error = FluxError;
+
+    fn try_from(bytes: &[u8]) -> std::result::Result<Self, Self::Error> {
+        let arr: [u8; 32] = bytes.try_into().map_err(|_| {
+            FluxError::InvalidArg(format!("chunk id must be 32 bytes, got {}", bytes.len()))
+        })?;
+        Ok(ChunkId::from_raw(arr))
     }
 }
 

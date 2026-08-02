@@ -4,10 +4,12 @@
 
 mod disk;
 mod foyer_store;
+mod remote;
 mod replicated;
 mod store;
 
 pub use disk::DiskChunkStore;
 pub use foyer_store::FoyerChunkStore;
+pub use remote::RemoteReplicatedChunkStore;
 pub use replicated::{PutReceipt, ReplicaHealth, ReplicatedChunkStore};
 pub use store::ChunkStore;

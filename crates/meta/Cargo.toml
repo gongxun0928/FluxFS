@@ -3,15 +3,18 @@ name = "fluxfs-meta"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "MetaMaster: MetaStore trait, heed backend, openraft type stubs"
+description = "MetaMaster: MetaStore trait, heed backend, remote client, openraft stubs"
 
 [dependencies]
 fluxfs-types = { workspace = true }
+fluxfs-proto = { workspace = true }
 heed = { workspace = true }
 openraft = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

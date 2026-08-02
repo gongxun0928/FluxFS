@@ -1,0 +1,16 @@
+[package]
+name = "fluxfs-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Wire protobuf/tonic contracts for FluxFS (prost types stay here)"
+
+[dependencies]
+prost = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = "0.14"
+fluxfs-types = { workspace = true }
+serde_json = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
