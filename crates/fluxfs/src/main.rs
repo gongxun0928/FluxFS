@@ -6,7 +6,10 @@ use fluxfs_meta::{start_single_voter, HeedMetaStore, MetaStore, RaftMetaStore, R
 use fluxfs_types::{FileType, ROOT_INODE};
 use fluxfs_ufs::{RangeReq, S3Options, Ufs};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(name = "fluxfs", about = "FluxFS MVP co-located control binary")]
@@ -336,7 +339,7 @@ fn mount_with_chunks<C: ChunkStore + 'static>(
             data_dir.display(),
             mountpoint.display()
         );
-        fluxfs_fuse::mount_ephemeral(client, &mountpoint).context("fuse mount")?;
+        mount_with_background_gc(client, &mountpoint)?;
     } else {
         // Co-located mount: embed single-voter Raft so mutations share the
         // production write path (request-id ledger + SM apply), not direct Heed.
@@ -366,9 +369,64 @@ fn mount_with_chunks<C: ChunkStore + 'static>(
                 mountpoint.display()
             );
         }
-        fluxfs_fuse::mount_ephemeral(client, &mountpoint).context("fuse mount")?;
+        mount_with_background_gc(client, &mountpoint)?;
     }
     Ok(())
+}
+
+/// Small-batch concurrent GC while FUSE serves. Does not take a global Meta lease.
+const BACKGROUND_GC_BATCH: usize = 32;
+const BACKGROUND_GC_IDLE: Duration = Duration::from_secs(5);
+const BACKGROUND_GC_BUSY: Duration = Duration::from_millis(200);
+
+fn sleep_interruptible(stop: &AtomicBool, total: Duration) {
+    let slice = Duration::from_millis(100);
+    let mut left = total;
+    while left > Duration::ZERO && !stop.load(Ordering::Relaxed) {
+        let step = slice.min(left);
+        std::thread::sleep(step);
+        left = left.saturating_sub(step);
+    }
+}
+
+fn spawn_background_gc<M: MetaStore + 'static, C: ChunkStore + 'static>(
+    client: Arc<FluxClient<M, C>>,
+) -> (Arc<AtomicBool>, JoinHandle<()>) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_flag = Arc::clone(&stop);
+    let handle = std::thread::Builder::new()
+        .name("fluxfs-bg-gc".into())
+        .spawn(move || {
+            while !stop_flag.load(Ordering::Relaxed) {
+                match client.run_concurrent_gc_pass(BACKGROUND_GC_BATCH) {
+                    Ok(report) if report.removed_chunks > 0 || report.removed_manifests > 0 => {
+                        sleep_interruptible(&stop_flag, BACKGROUND_GC_BUSY);
+                    }
+                    Ok(_) => sleep_interruptible(&stop_flag, BACKGROUND_GC_IDLE),
+                    Err(err) => {
+                        eprintln!("background GC pass failed: {err}");
+                        sleep_interruptible(&stop_flag, BACKGROUND_GC_IDLE);
+                    }
+                }
+            }
+        })
+        .expect("spawn background GC thread");
+    (stop, handle)
+}
+
+fn mount_with_background_gc<M: MetaStore + 'static, C: ChunkStore + 'static>(
+    client: Arc<FluxClient<M, C>>,
+    mountpoint: &PathBuf,
+) -> Result<()> {
+    let (gc_stop, gc_handle) = spawn_background_gc(Arc::clone(&client));
+    println!(
+        "background GC: batch={BACKGROUND_GC_BATCH} idle={}s (non-blocking)",
+        BACKGROUND_GC_IDLE.as_secs()
+    );
+    let mount_result = fluxfs_fuse::mount_ephemeral(client, mountpoint).context("fuse mount");
+    gc_stop.store(true, Ordering::Relaxed);
+    let _ = gc_handle.join();
+    mount_result
 }
 
 fn run_orphan_gc_cmd(
