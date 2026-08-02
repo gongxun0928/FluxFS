@@ -912,11 +912,8 @@ impl HeedMetaStore {
                 next_manifest,
                 sm: sm.clone(),
                 gc_lease,
+                worker_membership: self.worker_membership_in_txn(&rtxn)?,
             },
-        )?;
-        write_record(
-            &mut file,
-            &SnapshotRecord::WorkerMembership(self.worker_membership_in_txn(&rtxn)?),
         )?;
 
         let iter = self
@@ -1108,6 +1105,7 @@ impl HeedMetaStore {
                     next_manifest,
                     sm,
                     gc_lease,
+                    worker_membership,
                 } => {
                     self.meta
                         .put(&mut wtxn, "next_inode", &u64_bytes(next_inode))
@@ -1125,6 +1123,7 @@ impl HeedMetaStore {
                         }
                     }
                     self.put_sm_meta_raw(&mut wtxn, &sm)?;
+                    self.put_worker_membership_in_txn(&mut wtxn, &worker_membership)?;
                     header_sm = Some(sm);
                 }
                 SnapshotRecord::Inode(inode) => {
@@ -1154,9 +1153,6 @@ impl HeedMetaStore {
                 }
                 SnapshotRecord::DeleteTombstone(tombstone) => {
                     self.put_tombstone_in_txn(&mut wtxn, &tombstone)?;
-                }
-                SnapshotRecord::WorkerMembership(membership) => {
-                    self.put_worker_membership_in_txn(&mut wtxn, &membership)?;
                 }
                 SnapshotRecord::End => {
                     saw_end = true;

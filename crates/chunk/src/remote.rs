@@ -459,11 +459,14 @@ fn rpc_loop(
         .collect::<Vec<_>>();
     let mut last_healthy = BTreeSet::new();
     let mut repair_cursor: Option<ChunkId> = None;
-    let mut meta_client = meta_endpoint.and_then(|endpoint| {
-        configured_endpoint(&endpoint, tls_cfg.as_ref(), insecure_dev)
-            .ok()
-            .map(|endpoint| MetaServiceClient::new(endpoint.connect_lazy()))
-    });
+    let mut meta_client = {
+        let _enter = runtime.enter();
+        meta_endpoint.and_then(|endpoint| {
+            configured_endpoint(&endpoint, tls_cfg.as_ref(), insecure_dev)
+                .ok()
+                .map(|endpoint| MetaServiceClient::new(endpoint.connect_lazy()))
+        })
+    };
     let mut last_membership_refresh = Instant::now() - Duration::from_secs(2);
     while let Ok(command) = receiver.recv() {
         if last_membership_refresh.elapsed() >= Duration::from_secs(1) {
@@ -488,11 +491,15 @@ fn rpc_loop(
                         .is_none_or(|old| old.epoch != refreshed.epoch)
                         || desired != current;
                     if routing_changed {
-                        if let Ok(next_clients) = worker_clients_from_membership(
-                            &refreshed,
-                            tls_cfg.as_ref(),
-                            insecure_dev,
-                        ) {
+                        let next_clients = {
+                            let _enter = runtime.enter();
+                            worker_clients_from_membership(
+                                &refreshed,
+                                tls_cfg.as_ref(),
+                                insecure_dev,
+                            )
+                        };
+                        if let Ok(next_clients) = next_clients {
                             clients = next_clients;
                             last_healthy.clear();
                             repair_cursor = None;
@@ -582,7 +589,9 @@ async fn handle_command(
             let current = healthy.keys().copied().collect::<BTreeSet<_>>();
             if &current != last_healthy {
                 *repair_cursor = None;
-                match repair_with_health(clients, required, &healthy, repair_cursor).await {
+                match repair_with_health(clients, membership, required, &healthy, repair_cursor)
+                    .await
+                {
                     Ok(_) => *last_healthy = current,
                     Err(error) => {
                         let _ = reply.send(Err(error));
@@ -675,11 +684,37 @@ async fn handle_command(
             if let (Some(data), Some(source_worker)) = (result.as_ref(), source_worker) {
                 if let Ok(healthy) = healthy_workers(clients).await {
                     let mut repaired = BTreeSet::from([source_worker]);
+                    let desired = membership
+                        .and_then(|membership| {
+                            crate::select_worker_targets(
+                                membership,
+                                &id,
+                                required,
+                                unix_time_millis(),
+                            )
+                            .ok()
+                        })
+                        .map(|workers| {
+                            workers
+                                .into_iter()
+                                .map(|worker| worker.id.0)
+                                .collect::<BTreeSet<_>>()
+                        });
                     for (worker_id, index) in healthy {
-                        if repaired.len() == required {
+                        let placed = desired.as_ref().map_or_else(
+                            || repaired.len(),
+                            |desired| repaired.intersection(desired).count(),
+                        );
+                        if placed == required {
                             break;
                         }
                         if repaired.contains(&worker_id) {
+                            continue;
+                        }
+                        if desired
+                            .as_ref()
+                            .is_some_and(|desired| !desired.contains(&worker_id))
+                        {
                             continue;
                         }
                         if put_one(&mut clients[index], worker_id, data, id)
@@ -732,7 +767,9 @@ async fn handle_command(
             let result = async {
                 let healthy = healthy_workers(clients).await?;
                 *repair_cursor = None;
-                let report = repair_with_health(clients, required, &healthy, repair_cursor).await?;
+                let report =
+                    repair_with_health(clients, membership, required, &healthy, repair_cursor)
+                        .await?;
                 *last_healthy = healthy.keys().copied().collect();
                 Ok(report)
             }
@@ -747,7 +784,15 @@ async fn handle_command(
                     *repair_cursor = None;
                     *last_healthy = current;
                 }
-                repair_pass_with_health(clients, required, &healthy, repair_cursor, limit).await
+                repair_pass_with_health(
+                    clients,
+                    membership,
+                    required,
+                    &healthy,
+                    repair_cursor,
+                    limit,
+                )
+                .await
             }
             .await;
             let _ = reply.send(result);
@@ -884,6 +929,7 @@ fn rpc_status_error(error: tonic::Status) -> FluxError {
 
 async fn repair_with_health(
     clients: &mut [WorkerRpcClient],
+    membership: Option<&WorkerMembership>,
     required: usize,
     healthy: &BTreeMap<u64, usize>,
     repair_cursor: &mut Option<ChunkId>,
@@ -892,9 +938,15 @@ async fn repair_with_health(
     let mut checked_chunks = 0usize;
     let mut repaired_replicas = 0usize;
     loop {
-        let page =
-            repair_pass_with_health(clients, required, healthy, repair_cursor, REPAIR_PAGE_SIZE)
-                .await?;
+        let page = repair_pass_with_health(
+            clients,
+            membership,
+            required,
+            healthy,
+            repair_cursor,
+            REPAIR_PAGE_SIZE,
+        )
+        .await?;
         checked_chunks += page.checked_chunks;
         repaired_replicas += page.repaired_replicas;
         if !page.more {
@@ -910,6 +962,7 @@ async fn repair_with_health(
 
 async fn repair_pass_with_health(
     clients: &mut [WorkerRpcClient],
+    membership: Option<&WorkerMembership>,
     required: usize,
     healthy: &BTreeMap<u64, usize>,
     repair_cursor: &mut Option<ChunkId>,
@@ -932,7 +985,23 @@ async fn repair_pass_with_health(
     let mut repaired_replicas = 0usize;
 
     for (chunk, mut holders) in page.chunks {
-        if holders.len() >= required {
+        let desired = membership
+            .map(|membership| {
+                crate::select_worker_targets(membership, &chunk, required, unix_time_millis()).map(
+                    |workers| {
+                        workers
+                            .into_iter()
+                            .map(|worker| worker.id.0)
+                            .collect::<BTreeSet<_>>()
+                    },
+                )
+            })
+            .transpose()?;
+        let desired_holders = desired.as_ref().map_or_else(
+            || holders.len(),
+            |desired| holders.intersection(desired).count(),
+        );
+        if desired_holders >= required {
             continue;
         }
         let source = holders
@@ -956,21 +1025,35 @@ async fn repair_pass_with_health(
             )));
         }
         for (worker_id, index) in healthy {
-            if holders.len() >= required {
+            let placed = desired.as_ref().map_or_else(
+                || holders.len(),
+                |desired| holders.intersection(desired).count(),
+            );
+            if placed >= required {
                 break;
             }
             if holders.contains(worker_id) {
+                continue;
+            }
+            if desired
+                .as_ref()
+                .is_some_and(|desired| !desired.contains(worker_id))
+            {
                 continue;
             }
             put_one(&mut clients[*index], *worker_id, &response.data, chunk).await?;
             holders.insert(*worker_id);
             repaired_replicas += 1;
         }
-        if holders.len() < required {
+        let placed = desired.as_ref().map_or_else(
+            || holders.len(),
+            |desired| holders.intersection(desired).count(),
+        );
+        if placed < required {
             return Err(FluxError::Io(format!(
                 "repair left {} at {}/{} replicas",
                 chunk.to_hex(),
-                holders.len(),
+                placed,
                 required
             )));
         }

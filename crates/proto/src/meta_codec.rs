@@ -406,6 +406,26 @@ mod tests {
     }
 
     #[test]
+    fn worker_membership_codec_keeps_rolling_bare_write_policy() {
+        let membership = WorkerMembership {
+            epoch: 4,
+            workers: vec![WorkerRegistration {
+                id: WorkerTargetId(9),
+                endpoint: "http://127.0.0.1:50059".into(),
+                failure_domain: "rack-a".into(),
+                capacity_bytes: 100,
+                available_bytes: 80,
+                lease_deadline_ms: 500,
+            }],
+        };
+        let bytes = encode_worker_membership(&membership).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["epoch"], serde_json::json!(4));
+        assert!(json.get("payload").is_none());
+        assert_eq!(decode_worker_membership(&bytes).unwrap(), membership);
+    }
+
+    #[test]
     fn decode_accepts_envelope_form_for_forwards_compat() {
         // A peer that wrote envelope form (commit 3225ffa window, or future
         // capability-negotiated peers) must still decode cleanly via the

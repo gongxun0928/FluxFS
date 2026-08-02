@@ -32,6 +32,10 @@ pub enum SnapshotRecord {
         next_manifest: u64,
         sm: SmAppliedMeta,
         gc_lease: Option<GcLeaseId>,
+        /// Added compatibly: old readers ignore this unknown header field;
+        /// new readers default it when installing pre-B4 snapshots.
+        #[serde(default)]
+        worker_membership: WorkerMembership,
     },
     Inode(Box<Inode>),
     Dentry(Dentry),
@@ -45,7 +49,6 @@ pub enum SnapshotRecord {
     },
     Reservation(ChunkReservation),
     DeleteTombstone(GcTombstone),
-    WorkerMembership(WorkerMembership),
     End,
 }
 
@@ -132,6 +135,7 @@ mod tests {
                 next_manifest: 2,
                 sm: SmAppliedMeta::default(),
                 gc_lease: None,
+                worker_membership: WorkerMembership::default(),
             },
         )
         .unwrap();
