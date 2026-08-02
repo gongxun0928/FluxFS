@@ -10,6 +10,7 @@ prost = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = "0.14"
 fluxfs-types = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 
 [build-dependencies]

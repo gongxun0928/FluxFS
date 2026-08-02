@@ -11,41 +11,39 @@
 //!    wire form for a single nested structure. B2's `ExtentTree` accepts
 //!    both the legacy bare `Vec<Extent>` and the versioned
 //!    `{version, entries}` form.
-//! 3. **Per-record codec envelope** (THIS module): wraps every top-level
-//!    value flowing through `meta_codec::{encode,decode}_*` with
-//!    `{schema_version, payload}`. Started at v1.
+//! 3. **Per-record codec envelope** (THIS module): wraps a top-level value
+//!    with `{schema_version, payload}`. Started at v1.
 //!
-//! ## Compatibility policy
+//! ## Status: infrastructure in place, NOT YET ENABLED on the wire
+//!
+//! `Versioned` impls + `encode_versioned` / `decode_versioned` + the test
+//! matrix below are landed, but `meta_codec::{encode,decode}_*` currently
+//! still write **legacy bare-JSON** so old binaries can keep reading RPC
+//! payloads and persisted state during a rolling upgrade (see gpt56 review
+//! `6b114fa5` for the rolling-compat constraint). Decode is bimodal —
+//! bare-T first, envelope fallback — so a future capability-negotiated
+//! rollout is forward-compatible.
+//!
+//! Enabling the envelope on the wire requires a follow-up task that adds:
+//! (a) RPC capability/version negotiation so peers explicitly opt in, and
+//! (b) an upgrade-fence test matrix covering old-codec → new-envelope.
+//!
+//! ## Compatibility policy (once enabled)
 //!
 //! * **New binary reading old data** (legacy bare-JSON, no envelope): the
 //!   envelope deserialize fails on the missing `payload` key and we fall
 //!   back to direct `T` deserialization, stamping `LEGACY` (= 0). B2's
 //!   tolerant deserializers (e.g. `ExtentTree`) make this work transparently
 //!   for layout-compatible extensions.
-//! * **Old binary reading new data**: serde's default-tolerant structs
-//!   absorb unknown fields; the envelope wrapper is invisible to an old
-//!   binary only if that binary also uses the same codec. RPC details path
-//!   (`tonic::Status`) is unaffected — only the JSON payload contracts
-//!   inside `meta_codec` change.
+//! * **Old binary reading new data**: only safe after capability
+//!   negotiation opts the peer into envelope form. Without negotiation,
+//!   envelope payloads are invisible to old `serde_json::from_slice::<T>`
+//!   readers and would break rolling upgrades.
 //! * **New binary reading data from an even newer binary**: detected via
 //!   `schema_version > CURRENT` and rejected with a clear error rather
 //!   than silently corrupting state.
 //! * **Breaking layout changes**: override [`Versioned::migrate_from`] to
 //!   hand-translate older payload bytes into the current shape.
-//!
-//! ## Scope
-//!
-//! Ships the envelope, trait, encode/decode helpers, per-type impls, and
-//! test matrix. All `meta_codec::{encode,decode}_*` functions route through
-//! `encode_versioned` / `decode_versioned`, covering: inode, manifest,
-//! flush_intent, dentries, ufs_object, flush_intents, gc_plan, chunk_ids,
-//! gc_batch, gc_tombstones, worker_targets, gc_delete_acks.
-//!
-//! Raw `serde_json::*` callsites in `heed_store` / `raft_log_store` /
-//! `raft_sm` (Raft log payloads, vote state, snapshot envelopes) are **not**
-//! migrated here — they convert incrementally as those subsystems are
-//! touched, since each requires careful audit of crash-recovery semantics
-//! that is out of scope for the codec-level envelope.
 //!
 //! ## Field-name invariant
 //!

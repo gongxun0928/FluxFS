@@ -1,112 +1,139 @@
 use crate::meta::v1;
-use fluxfs_types::schema::{decode_versioned, encode_versioned};
+use fluxfs_types::schema::{decode_versioned, Versioned};
 use fluxfs_types::{
     ChunkId, Dentry, FileType, FlushIntent, FluxError, GcBatch, GcPlan, GcTombstone, Inode,
     InodeId, Manifest, ManifestId, Result as FluxResult, UfsObject, WorkerTargetId,
 };
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+
+// ===== Rolling-compatibility codec policy (C4 fix-forward) =====
+//
+// `encode_*` writes **legacy bare-JSON** so old binaries (pre-envelope) can
+// still decode RPC payloads and persisted state during a rolling upgrade.
+//
+// `decode_*` is bimodal: try bare-T first (covers today's peers and legacy
+// persistence), fall back to `decode_versioned` envelope (forwards-compat
+// with the brief window where commit 3225ffa wrote envelope on the wire,
+// and with future capability-negotiated envelope peers).
+//
+// The `Versioned` infrastructure in `fluxfs_types::schema` remains in place
+// as infrastructure-for-future-use, gated behind a follow-up task that adds
+// RPC capability/version negotiation. See task #32 thread + gpt56 review
+// (`6b114fa5`) for the rolling-compat constraint.
+
+fn encode_legacy<T: Serialize + ?Sized>(t: &T) -> FluxResult<Vec<u8>> {
+    serde_json::to_vec(t).map_err(|e| FluxError::Meta(e.to_string()))
+}
+
+fn decode_legacy_or_envelope<T>(bytes: &[u8]) -> FluxResult<T>
+where
+    T: DeserializeOwned + Versioned,
+{
+    // Fast path: bare-T (what most peers write today, plus all legacy data).
+    if let Ok(value) = serde_json::from_slice::<T>(bytes) {
+        return Ok(value);
+    }
+    // Fallback: envelope form. Either a peer that has already opted in via
+    // capability negotiation, or data written during the 3225ffa envelope
+    // window before this rolling-compat fix landed.
+    decode_versioned(bytes)
+}
 
 pub fn encode_inode(inode: &Inode) -> FluxResult<Vec<u8>> {
-    encode_versioned(inode)
+    encode_legacy(inode)
 }
 
 pub fn decode_inode(bytes: &[u8]) -> FluxResult<Inode> {
-    decode_versioned(bytes)
+    decode_legacy_or_envelope(bytes)
 }
 
 pub fn encode_manifest(m: &Manifest) -> FluxResult<Vec<u8>> {
-    encode_versioned(m)
+    encode_legacy(m)
 }
 
 pub fn decode_manifest(bytes: &[u8]) -> FluxResult<Manifest> {
-    decode_versioned(bytes)
+    decode_legacy_or_envelope(bytes)
 }
 
 pub fn encode_flush_intent(intent: &FlushIntent) -> FluxResult<Vec<u8>> {
-    encode_versioned(intent)
+    encode_legacy(intent)
 }
 
 pub fn decode_flush_intent(bytes: &[u8]) -> FluxResult<FlushIntent> {
-    decode_versioned(bytes)
+    decode_legacy_or_envelope(bytes)
 }
 
 pub fn encode_ufs_object(object: &UfsObject) -> FluxResult<Vec<u8>> {
-    encode_versioned(object)
+    encode_legacy(object)
 }
 
 pub fn decode_ufs_object(bytes: &[u8]) -> FluxResult<UfsObject> {
-    decode_versioned(bytes)
+    decode_legacy_or_envelope(bytes)
 }
 
 pub fn encode_flush_intents(intents: &[(InodeId, FlushIntent)]) -> FluxResult<Vec<u8>> {
-    let owned: Vec<(InodeId, FlushIntent)> = intents.to_vec();
-    encode_versioned(&owned)
+    encode_legacy(intents)
 }
 
 pub fn decode_flush_intents(bytes: &[u8]) -> FluxResult<Vec<(InodeId, FlushIntent)>> {
-    decode_versioned(bytes)
+    decode_legacy_or_envelope(bytes)
 }
 
 pub fn encode_gc_plan(plan: &GcPlan) -> FluxResult<Vec<u8>> {
-    encode_versioned(plan)
+    encode_legacy(plan)
 }
 
 pub fn decode_gc_plan(bytes: &[u8]) -> FluxResult<GcPlan> {
-    decode_versioned(bytes)
+    decode_legacy_or_envelope(bytes)
 }
 
 pub fn encode_chunk_ids(chunks: &[ChunkId]) -> FluxResult<Vec<u8>> {
-    let owned: Vec<ChunkId> = chunks.to_vec();
-    encode_versioned(&owned)
+    encode_legacy(chunks)
 }
 
 pub fn decode_chunk_ids(bytes: &[u8]) -> FluxResult<Vec<ChunkId>> {
-    decode_versioned(bytes)
+    decode_legacy_or_envelope(bytes)
 }
 
 pub fn encode_gc_batch(batch: &GcBatch) -> FluxResult<Vec<u8>> {
-    encode_versioned(batch)
+    encode_legacy(batch)
 }
 
 pub fn decode_gc_batch(bytes: &[u8]) -> FluxResult<GcBatch> {
-    decode_versioned(bytes)
+    decode_legacy_or_envelope(bytes)
 }
 
 pub fn encode_gc_tombstones(value: &[GcTombstone]) -> FluxResult<Vec<u8>> {
-    let owned: Vec<GcTombstone> = value.to_vec();
-    encode_versioned(&owned)
+    encode_legacy(value)
 }
 
 pub fn decode_gc_tombstones(bytes: &[u8]) -> FluxResult<Vec<GcTombstone>> {
-    decode_versioned(bytes)
+    decode_legacy_or_envelope(bytes)
 }
 
 pub fn encode_worker_targets(value: &[WorkerTargetId]) -> FluxResult<Vec<u8>> {
-    let owned: Vec<WorkerTargetId> = value.to_vec();
-    encode_versioned(&owned)
+    encode_legacy(value)
 }
 
 pub fn decode_worker_targets(bytes: &[u8]) -> FluxResult<Vec<WorkerTargetId>> {
-    decode_versioned(bytes)
+    decode_legacy_or_envelope(bytes)
 }
 
 pub fn encode_gc_delete_acks(value: &[(ChunkId, WorkerTargetId)]) -> FluxResult<Vec<u8>> {
-    let owned: Vec<(ChunkId, WorkerTargetId)> = value.to_vec();
-    encode_versioned(&owned)
+    encode_legacy(value)
 }
 
 pub fn decode_gc_delete_acks(bytes: &[u8]) -> FluxResult<Vec<(ChunkId, WorkerTargetId)>> {
-    decode_versioned(bytes)
+    decode_legacy_or_envelope(bytes)
 }
 
 pub fn encode_dentries(d: &[Dentry]) -> FluxResult<Vec<u8>> {
-    // Slice → Vec to satisfy Versioned (owned) bound. Readdir payloads are
-    // small, so the clone is negligible.
-    let owned: Vec<Dentry> = d.to_vec();
-    encode_versioned(&owned)
+    encode_legacy(d)
 }
 
 pub fn decode_dentries(bytes: &[u8]) -> FluxResult<Vec<Dentry>> {
-    decode_versioned(bytes)
+    decode_legacy_or_envelope(bytes)
 }
 
 pub fn file_type_to_wire(ft: FileType) -> u32 {
@@ -139,37 +166,36 @@ pub fn status_from_flux(err: FluxError) -> tonic::Status {
         }
         _ => Code::Internal,
     };
-    tonic::Status::new(code, err.to_string())
+    // Attach the structured FluxError as tonic::Status details so clients can
+    // decode the exact variant + payload (e.g. CasFailed { expected, actual })
+    // instead of reverse-parsing the Display string. Generic gRPC clients
+    // still see the Code + a human-readable message.
+    let details = serde_json::to_vec(&err).unwrap_or_default();
+    tonic::Status::with_details(code, err.to_string(), details.into())
 }
 
 pub fn flux_from_status(status: tonic::Status) -> FluxError {
+    // Preferred path: structured FluxError in Status.details (serde_json).
+    if !status.details().is_empty() {
+        if let Ok(err) = serde_json::from_slice::<FluxError>(status.details()) {
+            return err;
+        }
+        // Fall through to Code-based reconstruction if details are malformed
+        // or carry some other detail schema (forward compatibility).
+    }
+    // Backward-compatible path for servers that do not yet attach details:
+    // reconstruct a best-effort FluxError from the gRPC Code alone. Note this
+    // is lossy (no payload) — clients needing structured data must talk to a
+    // server that emits details.
     match status.code() {
         tonic::Code::NotFound => FluxError::NotFound,
         tonic::Code::AlreadyExists => FluxError::AlreadyExists,
         tonic::Code::InvalidArgument => FluxError::InvalidArg(status.message().to_string()),
         tonic::Code::ResourceExhausted => FluxError::Capability(status.message().to_string()),
         tonic::Code::Unavailable => FluxError::Busy,
-        tonic::Code::FailedPrecondition => parse_failed_precondition(status.message()),
+        tonic::Code::FailedPrecondition => FluxError::Meta(status.message().to_string()),
         _ => FluxError::Meta(status.to_string()),
     }
-}
-
-fn parse_failed_precondition(msg: &str) -> FluxError {
-    // Matches `FluxError::CasFailed` Display: "CAS failed: expected=X actual=Y"
-    if let Some(rest) = msg.strip_prefix("CAS failed: expected=") {
-        if let Some((e, a)) = rest.split_once(" actual=") {
-            if let (Ok(expected), Ok(actual)) = (e.parse::<u64>(), a.parse::<u64>()) {
-                return FluxError::CasFailed { expected, actual };
-            }
-        }
-    }
-    if msg.contains("dirty conflict") {
-        return FluxError::DirtyConflict;
-    }
-    if msg.contains("read-only") {
-        return FluxError::ReadOnly;
-    }
-    FluxError::Meta(msg.to_string())
 }
 
 pub fn inode_response(inode: &Inode) -> FluxResult<v1::GetInodeResponse> {
@@ -180,4 +206,175 @@ pub fn inode_response(inode: &Inode) -> FluxResult<v1::GetInodeResponse> {
 
 pub fn manifest_id_response(id: ManifestId) -> v1::PutManifestResponse {
     v1::PutManifestResponse { manifest_id: id.0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluxfs_types::FluxError;
+
+    fn roundtrip(err: FluxError) -> FluxError {
+        flux_from_status(status_from_flux(err))
+    }
+
+    #[test]
+    fn all_flux_error_variants_roundtrip_through_tonic_status() {
+        let cases = vec![
+            FluxError::NotFound,
+            FluxError::AlreadyExists,
+            FluxError::NotDirectory,
+            FluxError::IsDirectory,
+            FluxError::InvalidArg("bad offset 123".into()),
+            FluxError::Capability("over 4MiB".into()),
+            FluxError::CasFailed {
+                expected: 7,
+                actual: 9,
+            },
+            FluxError::DirtyConflict,
+            FluxError::Busy,
+            FluxError::ReadOnly,
+            FluxError::Io("short read".into()),
+            FluxError::Meta("raft apply".into()),
+            FluxError::Ufs("s3 403".into()),
+        ];
+        for err in cases {
+            let decoded = roundtrip(err.clone());
+            assert_eq!(decoded, err, "round-trip lost data for {err:?}");
+        }
+    }
+
+    #[test]
+    fn cas_failed_payload_survives_wire() {
+        // The A7 bug: CasFailed { expected, actual } used to be lost to a
+        // Display-string reverse-parse. Verify the structured payload now
+        // survives the tonic::Status details round-trip exactly.
+        let err = FluxError::CasFailed {
+            expected: 42,
+            actual: 99,
+        };
+        let decoded = roundtrip(err.clone());
+        match decoded {
+            FluxError::CasFailed { expected, actual } => {
+                assert_eq!((expected, actual), (42, 99));
+            }
+            other => panic!("expected CasFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn backward_compat_path_when_no_details() {
+        // Old servers do not attach details. Client must still decode a
+        // reasonable FluxError from Code alone (lossy but functional).
+        let status = tonic::Status::new(tonic::Code::NotFound, "old server".to_string());
+        let decoded = flux_from_status(status);
+        assert_eq!(decoded, FluxError::NotFound);
+    }
+
+    #[test]
+    fn backward_compat_internal_falls_through_to_meta() {
+        let status = tonic::Status::new(tonic::Code::Internal, "boom".to_string());
+        let decoded = flux_from_status(status);
+        assert!(matches!(decoded, FluxError::Meta(_)));
+    }
+
+    // ===== Rolling-compat codec tests (C4 fix-forward) =====
+
+    #[test]
+    fn encode_writes_legacy_bare_json_not_envelope() {
+        // Encode must produce bare-T JSON (no envelope wrapper) so old
+        // binaries can decode RPC payloads during rolling upgrade.
+        let inode = Inode {
+            id: 7,
+            file_type: FileType::Regular,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            mtime_ms: 0,
+            ctime_ms: 0,
+            atime_ms: 0,
+            link_count: 1,
+            generation: 1,
+            head_gen: fluxfs_types::DataGen(1),
+            ufs_gen: fluxfs_types::DataGen(0),
+            ufs_base_version: None,
+            locality: fluxfs_types::LocalityLabel::Dirty,
+            locality_fields: None,
+            ufs: None,
+            extent_root: None,
+            manifest_id: None,
+            flush_intent: None,
+            last_error: None,
+        };
+        let bytes = encode_inode(&inode).expect("encode");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        // Bare-T form has `id` at root and NO `schema_version`/`payload` wrapper.
+        assert_eq!(v["id"], serde_json::json!(7u64));
+        assert!(v.get("schema_version").is_none());
+        assert!(v.get("payload").is_none());
+    }
+
+    #[test]
+    fn decode_accepts_legacy_bare_json() {
+        let inode = Inode {
+            id: 99,
+            file_type: FileType::Regular,
+            mode: 0o600,
+            uid: 1,
+            gid: 2,
+            size: 4096,
+            mtime_ms: 1,
+            ctime_ms: 2,
+            atime_ms: 3,
+            link_count: 1,
+            generation: 5,
+            head_gen: fluxfs_types::DataGen(5),
+            ufs_gen: fluxfs_types::DataGen(3),
+            ufs_base_version: None,
+            locality: fluxfs_types::LocalityLabel::Dirty,
+            locality_fields: None,
+            ufs: None,
+            extent_root: None,
+            manifest_id: None,
+            flush_intent: None,
+            last_error: None,
+        };
+        let legacy = serde_json::to_vec(&inode).expect("bare encode");
+        let decoded = decode_inode(&legacy).expect("legacy decode");
+        assert_eq!(decoded.id, 99);
+    }
+
+    #[test]
+    fn decode_accepts_envelope_form_for_forwards_compat() {
+        // A peer that wrote envelope form (commit 3225ffa window, or future
+        // capability-negotiated peers) must still decode cleanly via the
+        // envelope fallback path.
+        use fluxfs_types::schema::encode_versioned;
+        let inode = Inode {
+            id: 42,
+            file_type: FileType::Regular,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            mtime_ms: 0,
+            ctime_ms: 0,
+            atime_ms: 0,
+            link_count: 1,
+            generation: 1,
+            head_gen: fluxfs_types::DataGen(0),
+            ufs_gen: fluxfs_types::DataGen(0),
+            ufs_base_version: None,
+            locality: fluxfs_types::LocalityLabel::Clean,
+            locality_fields: None,
+            ufs: None,
+            extent_root: None,
+            manifest_id: None,
+            flush_intent: None,
+            last_error: None,
+        };
+        let envelope = encode_versioned(&inode).expect("envelope encode");
+        let decoded = decode_inode(&envelope).expect("envelope decode via fallback");
+        assert_eq!(decoded.id, 42);
+    }
 }
