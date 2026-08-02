@@ -3,7 +3,7 @@
 //! Alpha: `external-consistency = best-effort`. Prefetch / parallel Range GET
 //! are layered on this adapter (patterns inspired by ZeroFS, no full fork).
 
-use fluxfs_types::{FluxError, Result, UfsObject};
+use fluxfs_types::{ChunkId, FluxError, Result, UfsObject};
 use futures::future::try_join_all;
 use opendal::{services, EntryMode, Operator};
 use std::path::Path;
@@ -84,6 +84,16 @@ pub enum UfsProbe {
     Dir,
 }
 
+const FLUXFS_DIGEST_METADATA: &str = "fluxfs-blake3";
+
+/// Backend guarantees required for crash-recoverable conditional publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublishCapabilities {
+    pub conditional_overwrite: bool,
+    pub conditional_create: bool,
+    pub verifiable_digest_metadata: bool,
+}
+
 impl Ufs {
     /// Local filesystem UFS for W1 smoke / benches.
     pub fn local(root: impl AsRef<Path>) -> Result<Self> {
@@ -120,6 +130,15 @@ impl Ufs {
     pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.prefix = prefix.into();
         self
+    }
+
+    pub fn publish_capabilities(&self) -> PublishCapabilities {
+        let caps = self.op.info().capability();
+        PublishCapabilities {
+            conditional_overwrite: caps.write_with_if_match,
+            conditional_create: caps.write_with_if_not_exists,
+            verifiable_digest_metadata: caps.write_with_user_metadata,
+        }
     }
 
     fn key(&self, rel: &str) -> String {
@@ -219,6 +238,86 @@ impl Ufs {
         self.head(rel).await
     }
 
+    /// Publish one complete object under an optimistic concurrency condition,
+    /// then verify its durable size and FluxFS content digest through HEAD.
+    ///
+    /// `expected_etag=Some` is a compare-and-swap overwrite. `None` is a
+    /// create-if-absent operation. Backends that cannot enforce the requested
+    /// condition or preserve user metadata are rejected instead of silently
+    /// degrading to an unsafe unconditional write.
+    pub async fn publish_full_verified(
+        &self,
+        rel: &str,
+        data: &[u8],
+        expected_etag: Option<&str>,
+        target_digest: &ChunkId,
+    ) -> Result<UfsObject> {
+        let actual_digest = ChunkId::from_bytes(data);
+        if &actual_digest != target_digest {
+            return Err(FluxError::InvalidArg(
+                "publish target_digest does not match payload".into(),
+            ));
+        }
+
+        let caps = self.publish_capabilities();
+        if !caps.verifiable_digest_metadata {
+            return Err(FluxError::Capability(
+                "UFS backend cannot persist verification metadata".into(),
+            ));
+        }
+        match expected_etag {
+            Some(_) if !caps.conditional_overwrite => {
+                return Err(FluxError::Capability(
+                    "UFS backend does not support conditional overwrite".into(),
+                ));
+            }
+            None if !caps.conditional_create => {
+                return Err(FluxError::Capability(
+                    "UFS backend does not support create-if-absent".into(),
+                ));
+            }
+            _ => {}
+        }
+
+        let key = self.key(rel);
+        let digest_hex = target_digest.to_hex();
+        let write = self
+            .op
+            .write_with(&key, data.to_vec())
+            .user_metadata([(FLUXFS_DIGEST_METADATA.to_string(), digest_hex.clone())]);
+        let result = match expected_etag {
+            Some(etag) => write.if_match(etag).await,
+            None => write.if_not_exists(true).await,
+        };
+        result.map_err(map_publish_error)?;
+
+        let meta = self.op.stat(&key).await.map_err(map_opendal)?;
+        if meta.content_length() != data.len() as u64 {
+            return Err(FluxError::Io(format!(
+                "published UFS size mismatch: want={} got={}",
+                data.len(),
+                meta.content_length()
+            )));
+        }
+        let stored_digest = meta
+            .user_metadata()
+            .and_then(|metadata| metadata.get(FLUXFS_DIGEST_METADATA));
+        if stored_digest != Some(&digest_hex) {
+            return Err(FluxError::Io(
+                "published UFS digest metadata missing or mismatched".into(),
+            ));
+        }
+
+        Ok(UfsObject {
+            key,
+            size: meta.content_length(),
+            etag: meta.etag().map(str::to_owned),
+            mtime_ms: meta
+                .last_modified()
+                .map(|time| time.into_inner().as_millisecond()),
+        })
+    }
+
     /// List one directory level under `rel` (non-recursive). Empty `rel` = prefix root.
     pub async fn list(&self, rel: &str) -> Result<Vec<UfsEntry>> {
         let key = self.key(rel);
@@ -265,6 +364,15 @@ fn map_opendal(e: opendal::Error) -> FluxError {
     }
 }
 
+fn map_publish_error(e: opendal::Error) -> FluxError {
+    match e.kind() {
+        opendal::ErrorKind::ConditionNotMatch | opendal::ErrorKind::AlreadyExists => {
+            FluxError::DirtyConflict
+        }
+        _ => map_opendal(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +404,41 @@ mod tests {
             [&parts[0][..], &parts[1][..], &parts[2][..]].concat(),
             payload
         );
+    }
+
+    #[tokio::test]
+    async fn verified_publish_requires_digest_and_create_condition() {
+        let dir = tempfile::tempdir().unwrap();
+        let ufs = Ufs::local(dir.path()).unwrap();
+        let payload = b"recoverable-publish";
+        let digest = ChunkId::from_bytes(payload);
+
+        let published = ufs
+            .publish_full_verified("new.bin", payload, None, &digest)
+            .await
+            .unwrap();
+        assert_eq!(published.size, payload.len() as u64);
+        assert_eq!(
+            ufs.read_range("new.bin", 0, published.size).await.unwrap(),
+            payload
+        );
+
+        let conflict = ufs
+            .publish_full_verified(
+                "new.bin",
+                b"replacement",
+                None,
+                &ChunkId::from_bytes(b"replacement"),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(conflict, FluxError::DirtyConflict);
+
+        let bad_digest = ufs
+            .publish_full_verified("bad.bin", payload, None, &ChunkId::from_bytes(b"wrong"))
+            .await
+            .unwrap_err();
+        assert!(matches!(bad_digest, FluxError::InvalidArg(_)));
     }
 
     #[test]
