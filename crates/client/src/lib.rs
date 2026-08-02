@@ -61,6 +61,8 @@ pub struct FluxClient<M: MetaStore, C: ChunkStore> {
     ufs: Option<UfsRuntime>,
     /// Relative UFS path for imported/local namespace nodes (`""` = UFS root).
     ufs_paths: Mutex<HashMap<InodeId, String>>,
+    /// Last content address considered by bounded background GC.
+    gc_cursor: Mutex<Option<ChunkId>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -84,6 +86,7 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
             io_lock: Mutex::new(()),
             ufs: None,
             ufs_paths: Mutex::new(HashMap::from([(ROOT_INODE, String::new())])),
+            gc_cursor: Mutex::new(None),
         }
     }
 
@@ -303,23 +306,44 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         }
         let mut report = OrphanGcReport::default();
         let pending = self.meta.list_gc_tombstones()?;
-        for batch in pending.chunks(batch_size) {
+        if !pending.is_empty() {
+            let batch = &pending[..pending.len().min(batch_size)];
             for chunk in batch {
                 self.chunks.delete(chunk)?;
                 report.removed_chunks += 1;
             }
             self.meta.finalize_gc_tombstones(batch)?;
+            return Ok(report);
         }
-        let inventory = self.chunks.list_chunks()?;
-        for candidates in inventory.chunks(batch_size) {
-            let batch = self.meta.tombstone_gc_batch(candidates)?;
-            report.removed_manifests += batch.removed_manifests;
-            for chunk in &batch.tombstoned_chunks {
-                self.chunks.delete(chunk)?;
-                report.removed_chunks += 1;
-            }
-            self.meta.finalize_gc_tombstones(&batch.tombstoned_chunks)?;
+        let mut inventory = self.chunks.list_chunks()?;
+        inventory.sort_by_key(ChunkId::to_hex);
+        let mut cursor = self
+            .gc_cursor
+            .lock()
+            .map_err(|_| FluxError::Io("GC cursor lock poisoned".into()))?;
+        let start = match *cursor {
+            Some(last) => inventory
+                .iter()
+                .position(|chunk| *chunk > last)
+                .unwrap_or(0),
+            None => 0,
+        };
+        let end = start.saturating_add(batch_size).min(inventory.len());
+        let candidates = &inventory[start..end];
+        *cursor = if end == inventory.len() {
+            None
+        } else {
+            candidates.last().copied()
+        };
+        drop(cursor);
+
+        let batch = self.meta.tombstone_gc_batch(candidates)?;
+        report.removed_manifests += batch.removed_manifests;
+        for chunk in &batch.tombstoned_chunks {
+            self.chunks.delete(chunk)?;
+            report.removed_chunks += 1;
         }
+        self.meta.finalize_gc_tombstones(&batch.tombstoned_chunks)?;
         Ok(report)
     }
 
@@ -1122,6 +1146,23 @@ mod tests {
         recovered.run_concurrent_gc_pass(1).unwrap();
         assert!(recovered.meta.list_gc_tombstones().unwrap().is_empty());
         assert!(!recovered.chunks.contains(&chunk).unwrap());
+    }
+
+    #[test]
+    fn concurrent_gc_pass_never_deletes_more_than_its_batch_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = FluxClient::new(
+            HeedMetaStore::open(dir.path().join("meta")).unwrap(),
+            DiskChunkStore::open(dir.path().join("chunks")).unwrap(),
+        );
+        for data in [b"orphan-one".as_slice(), b"orphan-two", b"orphan-three"] {
+            client.chunks.put(data).unwrap();
+        }
+        assert_eq!(client.chunks.list_chunks().unwrap().len(), 3);
+        assert_eq!(client.run_concurrent_gc_pass(1).unwrap().removed_chunks, 1);
+        assert_eq!(client.chunks.list_chunks().unwrap().len(), 2);
+        assert_eq!(client.run_concurrent_gc_pass(1).unwrap().removed_chunks, 1);
+        assert_eq!(client.chunks.list_chunks().unwrap().len(), 1);
     }
 
     #[test]
