@@ -12,6 +12,7 @@ use fluxfs_types::{ChunkId, FluxError, CHUNK_SIZE};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response, Status};
 
@@ -35,6 +36,11 @@ struct Cli {
     /// Optional Prometheus text endpoint, e.g. 127.0.0.1:9102 (`GET /metrics`).
     #[arg(long)]
     metrics_listen: Option<SocketAddr>,
+    /// Background pack compaction interval. `0` disables. Compacts when more
+    /// than one segment file exists (reclaims delete holes without blocking
+    /// foreground put/get — compaction holds the pack write lock briefly).
+    #[arg(long, default_value_t = 300)]
+    compact_interval_secs: u64,
 }
 
 struct ChunkSvc {
@@ -226,6 +232,28 @@ async fn main() -> Result<()> {
         spawn_prometheus(addr, Arc::clone(&metrics));
         println!("fluxfs-chunkworker metrics on http://{addr}/metrics");
     }
+    if cli.compact_interval_secs > 0 {
+        let compact_store = Arc::clone(&store);
+        let interval = Duration::from_secs(cli.compact_interval_secs);
+        std::thread::Builder::new()
+            .name("fluxfs-chunk-compact".into())
+            .spawn(move || loop {
+                std::thread::sleep(interval);
+                match compact_store.segment_file_count() {
+                    Ok(n) if n > 1 => match compact_store.compact() {
+                        Ok(report) => tracing::info!(
+                            live = report.live_chunks,
+                            removed = report.removed_segments,
+                            "background pack compaction"
+                        ),
+                        Err(error) => tracing::warn!(%error, "background pack compaction failed"),
+                    },
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(%error, "segment_file_count failed"),
+                }
+            })
+            .context("spawn pack compaction thread")?;
+    }
     let service = ChunkSvc {
         worker_id: cli.worker_id,
         store,
@@ -234,11 +262,12 @@ async fn main() -> Result<()> {
         metrics,
     };
     println!(
-        "fluxfs-chunkworker id={} listening on {} data_dir={} max_in_flight={}",
+        "fluxfs-chunkworker id={} listening on {} data_dir={} max_in_flight={} compact_interval_secs={}",
         cli.worker_id,
         cli.listen,
         cli.data_dir.display(),
-        cli.max_in_flight
+        cli.max_in_flight,
+        cli.compact_interval_secs
     );
     tonic::transport::Server::builder()
         .add_service(

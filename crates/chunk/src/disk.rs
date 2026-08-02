@@ -24,6 +24,11 @@ impl DiskChunkStore {
     pub fn compact(&self) -> Result<CompactReport> {
         self.inner.compact()
     }
+
+    /// Number of on-disk segment files (used by background compaction policy).
+    pub fn segment_file_count(&self) -> Result<usize> {
+        self.inner.segment_file_count()
+    }
 }
 
 impl ChunkStore for DiskChunkStore {

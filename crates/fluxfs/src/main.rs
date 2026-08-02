@@ -77,6 +77,12 @@ enum Cmd {
         #[arg(long, default_value_t = fluxfs_chunk::DEFAULT_MAX_PENDING_CHUNK_OPS)]
         chunk_max_pending: usize,
     },
+    /// Compact a local Worker pack store (rewrite live chunks, drop hole segments).
+    CompactChunks {
+        /// Worker data directory (contains `segments/` + `index/`).
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
     /// Print stack / topology freeze summary.
     Info,
 }
@@ -89,6 +95,16 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::CompactChunks { data_dir } => {
+            let store = DiskChunkStore::open(&data_dir).context("open chunk store")?;
+            let report = store.compact().context("compact chunks")?;
+            println!(
+                "compact-chunks ok: live={} removed_segments={} data_dir={}",
+                report.live_chunks,
+                report.removed_segments,
+                data_dir.display()
+            );
+        }
         Cmd::Info => {
             println!("FluxFS MVP");
             println!("  repo: https://github.com/gongxun0928/FluxFS");

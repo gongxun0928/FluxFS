@@ -1,8 +1,16 @@
 //! Append-only chunk segments + durable location index (B7 / #28).
 //!
-//! Replaces one-file-per-chunk object trees. Each put appends a framed record to
-//! the active segment, fsyncs, then records `{seg,offset,len}` in a heed index.
-//! Deletes remove the index entry; [`PackStore::compact`] rewrites live data.
+//! Layout:
+//! - `segments/seg-NNNNNN.dat`: framed records
+//!   `[magic:u32 LE][len:u32 LE][chunk_id:32][payload]`
+//!   Integrity is content-addressed: `ChunkId::from_bytes(payload)` must equal
+//!   the stored id (blake3). There is no separate CRC32 field.
+//! - `index/`: heed map `ChunkId → {seg, offset, len}`
+//!
+//! Durability: after appending a record, the segment file **and** the
+//! `segments/` directory are fsync'd before the index commit. Readers share an
+//! [`RwLock`] with writers/compaction so old segment files are never unlinked
+//! while a get/list still holds a read guard.
 
 use fluxfs_types::{ChunkId, ChunkPage, FluxError, Result};
 use heed::types::{Bytes, SerdeJson};
@@ -11,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::RwLock;
 
 const RECORD_MAGIC: u32 = 0x4658_4b31; // "FXK1"
 const INDEX_DB: &str = "chunk_index";
@@ -36,7 +44,9 @@ pub struct PackStore {
     env: Env,
     index: IndexDb,
     meta: MetaDb,
-    write_lock: Mutex<()>,
+    /// Shared by get/list (read) and put/delete/compact (write). Holding a write
+    /// guard covers the entire compact rewrite + old-segment unlink window.
+    lock: RwLock<()>,
     segment_roll_bytes: u64,
 }
 
@@ -45,6 +55,9 @@ impl PackStore {
         let root = path.as_ref().to_path_buf();
         fs::create_dir_all(root.join("segments")).map_err(|e| FluxError::Io(e.to_string()))?;
         fs::create_dir_all(root.join("index")).map_err(|e| FluxError::Io(e.to_string()))?;
+        // Persist directory entries created above before we rely on them.
+        sync_dir(&root)?;
+        sync_dir(&root.join("segments"))?;
 
         let env = unsafe {
             EnvOpenOptions::new()
@@ -77,7 +90,7 @@ impl PackStore {
             env,
             index,
             meta,
-            write_lock: Mutex::new(()),
+            lock: RwLock::new(()),
             segment_roll_bytes: DEFAULT_SEGMENT_ROLL_BYTES,
         };
         store.migrate_legacy_objects()?;
@@ -88,6 +101,10 @@ impl PackStore {
         self.root
             .join("segments")
             .join(format!("seg-{segment:06}.dat"))
+    }
+
+    fn segments_dir(&self) -> PathBuf {
+        self.root.join("segments")
     }
 
     fn read_u64_meta(&self, txn: &heed::RoTxn, key: &str) -> Result<u64> {
@@ -146,7 +163,6 @@ impl PackStore {
                     }
                     let data = fs::read(object.path()).map_err(|e| FluxError::Io(e.to_string()))?;
                     let id = ChunkId::from_bytes(&data);
-                    // Skip corrupt leftovers (path hex must match content hash).
                     let hex = id.to_hex();
                     let expected = objects.join(&hex[..2]).join(&hex[2..4]).join(&hex);
                     if object.path() != expected {
@@ -165,7 +181,6 @@ impl PackStore {
         if imported > 0 {
             tracing::info!(imported, "migrated legacy chunk objects into pack segments");
         }
-        // Best-effort cleanup of empty dirs; ignore errors.
         let _ = fs::remove_dir_all(&objects);
         Ok(())
     }
@@ -173,11 +188,14 @@ impl PackStore {
     pub fn put(&self, data: &[u8]) -> Result<ChunkId> {
         let id = ChunkId::from_bytes(data);
         let _guard = self
-            .write_lock
-            .lock()
+            .lock
+            .write()
             .map_err(|_| FluxError::Io("pack write lock poisoned".into()))?;
+        self.put_locked(data, id)
+    }
 
-        if let Some(existing) = self.get_if_valid(&id)? {
+    fn put_locked(&self, data: &[u8], id: ChunkId) -> Result<ChunkId> {
+        if let Some(existing) = self.get_if_valid_unlocked(&id)? {
             if existing == data {
                 return Ok(id);
             }
@@ -192,8 +210,10 @@ impl PackStore {
         drop(rtxn);
 
         let mut seg_path = self.segment_path(active);
-        if !seg_path.exists() {
+        let created_new = !seg_path.exists();
+        if created_new {
             File::create(&seg_path).map_err(|e| FluxError::Io(e.to_string()))?;
+            sync_dir(&self.segments_dir())?;
         }
         let mut file = OpenOptions::new()
             .read(true)
@@ -207,8 +227,9 @@ impl PackStore {
             active = next_seg;
             next_seg = next_seg.saturating_add(1);
             seg_path = self.segment_path(active);
+            File::create(&seg_path).map_err(|e| FluxError::Io(e.to_string()))?;
+            sync_dir(&self.segments_dir())?;
             file = OpenOptions::new()
-                .create(true)
                 .read(true)
                 .append(true)
                 .open(&seg_path)
@@ -229,6 +250,9 @@ impl PackStore {
         file.write_all(data)
             .map_err(|e| FluxError::Io(e.to_string()))?;
         file.sync_all().map_err(|e| FluxError::Io(e.to_string()))?;
+        // Persist the directory entry for a newly created (or rolled) segment
+        // before the index may point at it.
+        sync_dir(&self.segments_dir())?;
 
         let entry = IndexEntry {
             segment: active,
@@ -249,11 +273,14 @@ impl PackStore {
     }
 
     pub fn get(&self, id: &ChunkId) -> Result<Vec<u8>> {
-        self.get_if_valid(id)?
-            .ok_or_else(|| FluxError::Io(format!("chunk missing {}", id.to_hex())))
+        let _guard = self
+            .lock
+            .read()
+            .map_err(|_| FluxError::Io("pack read lock poisoned".into()))?;
+        self.get_if_valid_unlocked(id)?.ok_or(FluxError::NotFound)
     }
 
-    fn get_if_valid(&self, id: &ChunkId) -> Result<Option<Vec<u8>>> {
+    fn get_if_valid_unlocked(&self, id: &ChunkId) -> Result<Option<Vec<u8>>> {
         let rtxn = self
             .env
             .read_txn()
@@ -291,19 +318,23 @@ impl PackStore {
         file.read_exact(&mut data)
             .map_err(|e| FluxError::Io(e.to_string()))?;
         if ChunkId::from_raw(stored_id) != ChunkId::from_bytes(&data) {
-            return Err(FluxError::Io("pack record checksum mismatch".into()));
+            return Err(FluxError::Io("pack record content-hash mismatch".into()));
         }
         Ok(data)
     }
 
     pub fn contains(&self, id: &ChunkId) -> Result<bool> {
-        Ok(self.get_if_valid(id)?.is_some())
+        let _guard = self
+            .lock
+            .read()
+            .map_err(|_| FluxError::Io("pack read lock poisoned".into()))?;
+        Ok(self.get_if_valid_unlocked(id)?.is_some())
     }
 
     pub fn delete(&self, id: &ChunkId) -> Result<()> {
         let _guard = self
-            .write_lock
-            .lock()
+            .lock
+            .write()
             .map_err(|_| FluxError::Io("pack write lock poisoned".into()))?;
         let mut wtxn = self
             .env
@@ -318,6 +349,14 @@ impl PackStore {
     }
 
     pub fn list_chunks(&self) -> Result<Vec<ChunkId>> {
+        let _guard = self
+            .lock
+            .read()
+            .map_err(|_| FluxError::Io("pack read lock poisoned".into()))?;
+        self.list_chunks_unlocked()
+    }
+
+    fn list_chunks_unlocked(&self) -> Result<Vec<ChunkId>> {
         let rtxn = self
             .env
             .read_txn()
@@ -330,7 +369,6 @@ impl PackStore {
         for item in iter {
             let (key, entry) = item.map_err(|e| FluxError::Io(e.to_string()))?;
             let id = ChunkId::try_from(key)?;
-            // Skip corrupt / truncated records so scrub/inventory stays honest.
             if self.read_record(&entry).is_ok() {
                 ids.push(id);
             }
@@ -346,9 +384,7 @@ impl PackStore {
                 "chunk inventory page limit must be non-zero".into(),
             ));
         }
-        let mut chunks = self.list_chunks()?;
-        chunks.sort_by_key(ChunkId::to_hex);
-        chunks.dedup();
+        let chunks = self.list_chunks()?;
         let mut page = chunks
             .into_iter()
             .filter(|chunk| cursor.is_none_or(|cursor| *chunk > cursor))
@@ -363,21 +399,41 @@ impl PackStore {
         })
     }
 
+    pub fn segment_file_count(&self) -> Result<usize> {
+        let dir = self.segments_dir();
+        if !dir.exists() {
+            return Ok(0);
+        }
+        let mut n = 0usize;
+        for entry in fs::read_dir(&dir).map_err(|e| FluxError::Io(e.to_string()))? {
+            let entry = entry.map_err(|e| FluxError::Io(e.to_string()))?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("seg-") && name.ends_with(".dat") {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
     /// Rewrite live chunks into a fresh segment and drop unreferenced segment files.
+    ///
+    /// Holds the write lock for the whole rewrite + unlink window so concurrent
+    /// readers never observe a deleted segment path.
     pub fn compact(&self) -> Result<CompactReport> {
         let _guard = self
-            .write_lock
-            .lock()
+            .lock
+            .write()
             .map_err(|_| FluxError::Io("pack write lock poisoned".into()))?;
 
-        let live = self.list_chunks()?;
+        let live = self.list_chunks_unlocked()?;
         let rtxn = self
             .env
             .read_txn()
             .map_err(|e| FluxError::Io(e.to_string()))?;
         let mut next_seg = self.read_u64_meta(&rtxn, KEY_NEXT_SEG)?;
         drop(rtxn);
-        // Pick a segment id that does not already exist on disk.
+
         let mut target = next_seg;
         let path = loop {
             let candidate = self.segment_path(target);
@@ -392,10 +448,11 @@ impl PackStore {
             .write(true)
             .open(&path)
             .map_err(|e| FluxError::Io(e.to_string()))?;
+        sync_dir(&self.segments_dir())?;
 
         let mut new_entries = Vec::with_capacity(live.len());
         for id in &live {
-            let data = self.get(id)?;
+            let data = self.get_if_valid_unlocked(id)?.ok_or(FluxError::NotFound)?;
             let offset = file
                 .stream_position()
                 .map_err(|e| FluxError::Io(e.to_string()))?;
@@ -419,12 +476,12 @@ impl PackStore {
             ));
         }
         file.sync_all().map_err(|e| FluxError::Io(e.to_string()))?;
+        sync_dir(&self.segments_dir())?;
 
         let mut wtxn = self
             .env
             .write_txn()
             .map_err(|e| FluxError::Io(e.to_string()))?;
-        // Clear index then rewrite.
         {
             let keys: Vec<Vec<u8>> = self
                 .index
@@ -448,13 +505,15 @@ impl PackStore {
         self.put_u64_meta(&mut wtxn, KEY_NEXT_SEG, next_seg)?;
         wtxn.commit().map_err(|e| FluxError::Io(e.to_string()))?;
 
+        // Unlink obsolete segments only while the write lock is still held, so
+        // no reader can still be opening those paths.
         let mut removed_segments = 0usize;
-        let segments_dir = self.root.join("segments");
-        if let Ok(entries) = fs::read_dir(&segments_dir) {
+        let keep = format!("seg-{target:06}.dat");
+        if let Ok(entries) = fs::read_dir(self.segments_dir()) {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if name == format!("seg-{target:06}.dat") {
+                if name == keep {
                     continue;
                 }
                 if name.starts_with("seg-") && name.ends_with(".dat") {
@@ -463,12 +522,18 @@ impl PackStore {
                 }
             }
         }
+        sync_dir(&self.segments_dir())?;
 
         Ok(CompactReport {
             live_chunks: new_entries.len(),
             removed_segments,
         })
     }
+}
+
+fn sync_dir(path: &Path) -> Result<()> {
+    let file = File::open(path).map_err(|e| FluxError::Io(e.to_string()))?;
+    file.sync_all().map_err(|e| FluxError::Io(e.to_string()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -480,6 +545,8 @@ pub struct CompactReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::thread;
 
     #[test]
     fn pack_put_get_delete_and_compact() {
@@ -491,18 +558,66 @@ mod tests {
         assert_eq!(store.get(&b).unwrap(), b"beta-chunk");
         store.delete(&a).unwrap();
         assert!(!store.contains(&a).unwrap());
+        assert!(matches!(store.get(&a), Err(FluxError::NotFound)));
         let report = store.compact().unwrap();
         assert_eq!(report.live_chunks, 1);
         assert!(report.removed_segments >= 1);
         assert_eq!(store.get(&b).unwrap(), b"beta-chunk");
-        assert!(!store.contains(&a).unwrap());
+    }
+
+    #[test]
+    fn put_survives_reopen_after_dir_fsync() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = {
+            let store = PackStore::open(dir.path()).unwrap();
+            store.put(b"durable-after-reopen").unwrap()
+        };
+        let store = PackStore::open(dir.path()).unwrap();
+        assert_eq!(store.get(&id).unwrap(), b"durable-after-reopen");
+        assert!(dir.path().join("segments").join("seg-000001.dat").exists());
+    }
+
+    #[test]
+    fn concurrent_get_list_with_compact_and_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PackStore::open(dir.path()).unwrap());
+        let mut ids = Vec::new();
+        for i in 0..32u8 {
+            ids.push(store.put(&[i; 64]).unwrap());
+        }
+        let drop_id = ids[0];
+        store.delete(&drop_id).unwrap();
+
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let ids = ids.clone();
+                thread::spawn(move || {
+                    for _ in 0..40 {
+                        let _ = store.list_chunks();
+                        for id in ids.iter().skip(1).take(8) {
+                            let _ = store.get(id);
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for _ in 0..8 {
+            let _ = store.compact();
+            let _ = store.put(b"extra-during-compact");
+        }
+        for t in readers {
+            t.join().unwrap();
+        }
+        assert!(store.get(&ids[1]).is_ok());
+        assert!(matches!(store.get(&drop_id), Err(FluxError::NotFound)));
     }
 
     #[test]
     fn migrates_legacy_object_tree() {
         use std::fs;
         let dir = tempfile::tempdir().unwrap();
-        // Seed legacy one-file-per-chunk layout under objects/.
         for payload in [b"legacy-one".as_slice(), b"legacy-two".as_slice()] {
             let id = ChunkId::from_bytes(payload);
             let hex = id.to_hex();
