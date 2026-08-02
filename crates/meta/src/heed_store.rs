@@ -1038,18 +1038,42 @@ impl HeedMetaStore {
         name: &str,
     ) -> Result<()> {
         let key = dentry_key(parent, name);
-        if self
+        let child_raw = self
             .dentries
             .get(wtxn, &key)
             .map_err(|e| FluxError::Meta(e.to_string()))?
-            .is_none()
-        {
-            return Err(FluxError::NotFound);
-        }
+            .ok_or(FluxError::NotFound)?
+            .to_vec();
+        let child_id = u64_from_bytes(&child_raw)?;
         self.load_and_bump_parent_dir(wtxn, parent, expected_parent_generation)?;
         self.dentries
             .delete(wtxn, &key)
             .map_err(|e| FluxError::Meta(e.to_string()))?;
+
+        let mut child = get_inode_raw(&self.inodes, wtxn, child_id)?;
+        if child.link_count == 0 {
+            return Err(FluxError::Meta(format!(
+                "inode {child_id} already has link_count=0"
+            )));
+        }
+        child.link_count -= 1;
+        child.ctime_ms = now_ms();
+        if child.link_count == 0 {
+            // Drop live manifest refs so concurrent GC can reclaim chunks.
+            // Abort in-flight write reservations for this inode (deterministic
+            // expire of abandoned tickets is T2; unlink must not leave forever-live
+            // reservations pinning deleted-file chunks).
+            for reservation in self.list_reservations_in_txn(wtxn)? {
+                if reservation.inode == child_id {
+                    self.abort_reservation_in_txn(wtxn, reservation.ticket)?;
+                }
+            }
+            self.inodes
+                .delete(wtxn, &inode_key(child_id))
+                .map_err(|e| FluxError::Meta(e.to_string()))?;
+        } else {
+            put_inode_raw(&self.inodes, wtxn, &child)?;
+        }
         Ok(())
     }
 
@@ -2506,5 +2530,60 @@ mod tests {
             store.get_inode(ROOT_INODE).unwrap().generation,
             after_unlink + 1
         );
+    }
+
+    #[test]
+    fn unlink_drops_inode_so_gc_can_reclaim_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HeedMetaStore::open(dir.path()).unwrap();
+        let file = store
+            .create(ROOT_INODE, "victim.bin", FileType::Regular, 0o644, 0, 0)
+            .unwrap();
+        let chunk = ChunkId::from_bytes(b"victim-chunk");
+        let mut next = file.clone();
+        next.size = 4;
+        next.generation += 1;
+        next.head_gen = DataGen(1);
+        let manifest = Manifest {
+            inode: file.id,
+            gen: DataGen(1),
+            size: 4,
+            extents: vec![Extent::Local {
+                offset: 0,
+                len: 4,
+                chunk,
+            }],
+        };
+        let ticket = WriteTicketId(11);
+        store
+            .reserve_chunks(ticket, file.id, file.generation, &[chunk])
+            .unwrap();
+        let committed = store
+            .commit_inode_manifest_reserved_with_id(
+                RequestOpId::random(),
+                ticket,
+                file.generation,
+                &next,
+                &manifest,
+            )
+            .unwrap();
+        let mid = committed.manifest_id.expect("manifest");
+
+        store.unlink(ROOT_INODE, "victim.bin").unwrap();
+        assert!(matches!(
+            store.get_inode(file.id),
+            Err(FluxError::NotFound)
+        ));
+        assert!(matches!(
+            store.lookup(ROOT_INODE, "victim.bin"),
+            Err(FluxError::NotFound)
+        ));
+
+        // Manifest is no longer referenced by any inode head → GC removes it and
+        // tombstones the chunk.
+        let batch = store.tombstone_gc_batch(&[chunk]).unwrap();
+        assert!(batch.removed_manifests >= 1);
+        assert_eq!(batch.tombstoned_chunks, vec![chunk]);
+        assert_eq!(store.get_manifest(mid), Err(FluxError::NotFound));
     }
 }
