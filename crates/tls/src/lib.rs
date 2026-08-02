@@ -19,6 +19,9 @@
 //! lives in Phase 3 (`tonic::service::Interceptor` reading peer certs via
 //! `Request::extensions`). See task #30 thread msg `5c77d96b`.
 
+pub mod authz;
+pub use authz::AuthzInterceptor;
+
 use fluxfs_types::FluxError;
 use fluxfs_types::Result as FluxResult;
 use std::path::{Path, PathBuf};

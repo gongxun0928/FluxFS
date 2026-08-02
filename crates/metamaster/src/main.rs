@@ -740,8 +740,8 @@ async fn main() -> Result<()> {
         cli.data_dir.display(),
         raft_dir.display()
     );
-    // ===== C1 mTLS wiring (task #30 Phase 2) =====
-    use fluxfs_tls::ServerTlsOptions;
+    // ===== C1 mTLS wiring (task #30 Phase 2 + Phase 3 authz) =====
+    use fluxfs_tls::{AuthzInterceptor, ServerTlsOptions};
     let tls_opts = ServerTlsOptions::from_cli(
         cli.tls_ca_cert.clone(),
         cli.tls_server_cert.clone(),
@@ -753,20 +753,34 @@ async fn main() -> Result<()> {
         .build_config()
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    let mut server_builder = tonic::transport::Server::builder();
     if let Some(tls) = tls_config {
         tracing::info!(
-            "metamaster TLS enabled (mTLS require-client-cert={})",
+            "metamaster TLS enabled (mTLS require-client-cert={}) + Phase 3 authz interceptor",
             !tls_opts.allow_no_client_cert
         );
-        server_builder = server_builder.tls_config(tls).context("tls_config")?;
+        // Phase 3: role-level authz on every RPC. Fail-closed if no peer cert,
+        // unparsable SPIFFE SAN, or role not in the admit set.
+        let authz = std::sync::Arc::new(AuthzInterceptor::for_meta());
+        tonic::transport::Server::builder()
+            .tls_config(tls)
+            .context("tls_config")?
+            .layer(tonic::service::InterceptorLayer::new(move |req| {
+                authz.check(&req)?;
+                Ok(req)
+            }))
+            .add_service(MetaServiceServer::new(svc))
+            .serve(cli.listen)
+            .await
+            .context("serve")?;
     } else {
-        tracing::warn!("metamaster in INSECURE-DEV plaintext mode (--allow-insecure-dev)");
+        tracing::warn!(
+            "metamaster in INSECURE-DEV plaintext mode (--allow-insecure-dev); authz interceptor OFF"
+        );
+        tonic::transport::Server::builder()
+            .add_service(MetaServiceServer::new(svc))
+            .serve(cli.listen)
+            .await
+            .context("serve")?;
     }
-    server_builder
-        .add_service(MetaServiceServer::new(svc))
-        .serve(cli.listen)
-        .await
-        .context("serve")?;
     Ok(())
 }

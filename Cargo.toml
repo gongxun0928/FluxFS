@@ -43,6 +43,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "sync", "time"] }
 tonic = { version = "0.14", features = ["transport", "tls-ring", "tls-connect-info"] }
 tracing = "0.1"
+# X.509 parser used to extract SPIFFE URI SAN from peer client certs in the
+# Phase 3 authz interceptor (task #30 C1). Pin so a forced bump can't slip
+# through silently.
+x509-parser = "0.17"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 fluxfs-types = { path = "crates/types" }
 fluxfs-metrics = { path = "crates/metrics" }
