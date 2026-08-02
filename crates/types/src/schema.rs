@@ -57,7 +57,7 @@ use std::fmt;
 
 use crate::{
     ChunkId, DedupEntry, Dentry, FlushIntent, FluxError, GcBatch, GcPlan, GcTombstone, Inode,
-    InodeId, Manifest, Result, UfsObject, WorkerTargetId,
+    InodeId, Manifest, Result, UfsObject, WorkerMembership, WorkerRegistration, WorkerTargetId,
 };
 
 /// Monotonic codec schema stamp. `LEGACY` (= 0) denotes pre-versioning data
@@ -191,6 +191,8 @@ impl Versioned for FlushIntent {}
 impl Versioned for DedupEntry {}
 impl Versioned for Dentry {}
 impl Versioned for UfsObject {}
+impl Versioned for WorkerRegistration {}
+impl Versioned for WorkerMembership {}
 
 // GC + Worker topology persisted state. Default impls cover these (only
 // layout-compatible field extensions have happened so far).

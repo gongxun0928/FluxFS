@@ -10,20 +10,33 @@ use fluxfs_proto::chunk::v1::{
     ContainsChunkRequest, DeleteChunkRequest, GetChunkRequest, HealthRequest, ListChunksRequest,
     PutChunkRequest,
 };
-use fluxfs_proto::ChunkWorkerClient;
-use fluxfs_types::{ChunkId, ChunkPage, FluxError, Result, WorkerTargetId, CHUNK_SIZE};
+use fluxfs_proto::meta::v1::GetWorkerMembershipRequest;
+use fluxfs_proto::meta_codec::decode_worker_membership;
+use fluxfs_proto::{ChunkWorkerClient, MetaServiceClient};
+use fluxfs_types::{
+    ChunkId, ChunkPage, FluxError, Result, WorkerMembership, WorkerTargetId, CHUNK_SIZE,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::Duration;
-use tonic::transport::{Channel, Endpoint};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 const MAX_CHUNK_RPC_MESSAGE: usize = CHUNK_SIZE as usize + 64 * 1024;
 pub const DEFAULT_MAX_PENDING_CHUNK_OPS: usize = 64;
 /// Bounded inventory page for repair/scrub (replaces `limit=u32::MAX` sweeps).
 pub const REPAIR_PAGE_SIZE: usize = 256;
 const BACKGROUND_REPAIR_IDLE: Duration = Duration::from_secs(2);
+
+fn unix_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
 
 type RpcReply<T> = mpsc::Sender<Result<T>>;
 
@@ -56,8 +69,8 @@ enum Command {
         limit: usize,
         reply: RpcReply<ChunkPage>,
     },
-    TargetCount {
-        reply: RpcReply<u64>,
+    Targets {
+        reply: RpcReply<Vec<WorkerTargetId>>,
     },
     DeleteTarget {
         id: ChunkId,
@@ -112,10 +125,102 @@ impl RemoteReplicatedChunkStore {
         tls: Option<fluxfs_tls::ClientTlsOptions>,
         insecure_dev: bool,
     ) -> Result<Self> {
-        if required == 0 || worker_endpoints.len() < required {
+        let targets = worker_endpoints
+            .into_iter()
+            .enumerate()
+            .map(|(index, endpoint)| {
+                (
+                    WorkerTargetId(index.try_into().unwrap_or(u64::MAX)),
+                    endpoint,
+                )
+            })
+            .collect();
+        Self::new_with_targets(
+            targets,
+            required,
+            max_pending,
+            None,
+            None,
+            tls,
+            insecure_dev,
+        )
+    }
+
+    pub fn new_with_membership(
+        membership: WorkerMembership,
+        required: usize,
+        max_pending: usize,
+        now_ms: u64,
+    ) -> Result<Self> {
+        let targets = membership
+            .active_at(now_ms)
+            .map(|worker| (worker.id, worker.endpoint.clone()))
+            .collect();
+        Self::new_with_targets(targets, required, max_pending, Some(membership), None, None, true)
+    }
+
+    pub fn new_with_membership_discovery(
+        membership: WorkerMembership,
+        meta_endpoint: String,
+        required: usize,
+        max_pending: usize,
+        now_ms: u64,
+    ) -> Result<Self> {
+        Self::new_with_membership_discovery_tls(
+            membership,
+            meta_endpoint,
+            required,
+            max_pending,
+            now_ms,
+            None,
+            true,
+        )
+    }
+
+    pub fn new_with_membership_discovery_tls(
+        membership: WorkerMembership,
+        meta_endpoint: String,
+        required: usize,
+        max_pending: usize,
+        now_ms: u64,
+        tls: Option<fluxfs_tls::ClientTlsOptions>,
+        insecure_dev: bool,
+    ) -> Result<Self> {
+        let targets = membership
+            .active_at(now_ms)
+            .map(|worker| (worker.id, worker.endpoint.clone()))
+            .collect();
+        let endpoint = if meta_endpoint.starts_with("http://") || meta_endpoint.starts_with("https://") {
+            meta_endpoint
+        } else if tls.is_some() {
+            format!("https://{meta_endpoint}")
+        } else {
+            format!("http://{meta_endpoint}")
+        };
+        Self::new_with_targets(
+            targets,
+            required,
+            max_pending,
+            Some(membership),
+            Some(endpoint),
+            tls,
+            insecure_dev,
+        )
+    }
+
+    fn new_with_targets(
+        targets: Vec<(WorkerTargetId, String)>,
+        required: usize,
+        max_pending: usize,
+        membership: Option<WorkerMembership>,
+        meta_endpoint: Option<String>,
+        tls: Option<fluxfs_tls::ClientTlsOptions>,
+        insecure_dev: bool,
+    ) -> Result<Self> {
+        if required == 0 || targets.len() < required {
             return Err(FluxError::InvalidArg(format!(
-                "remote replication requires {required} workers, got {} endpoints",
-                worker_endpoints.len()
+                "remote replication requires {required} workers, got {} targets",
+                targets.len()
             )));
         }
         if max_pending == 0 {
@@ -129,29 +234,10 @@ impl RemoteReplicatedChunkStore {
         } else {
             None
         };
-        let insecure = fluxfs_tls::InsecureDev::allow(insecure_dev);
-        let mut channels = Vec::with_capacity(worker_endpoints.len());
-        for endpoint in worker_endpoints {
-            let url = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-                endpoint.clone()
-            } else if tls_cfg.is_some() {
-                format!("https://{endpoint}")
-            } else {
-                format!("http://{endpoint}")
-            };
-            insecure
-                .check_endpoint(&url)
-                .map_err(|e| FluxError::InvalidArg(e.to_string()))?;
-            let mut ep = Endpoint::from_shared(url.clone())
-                .map_err(|error| FluxError::InvalidArg(format!("{endpoint}: {error}")))?
-                .connect_timeout(Duration::from_secs(1))
-                .timeout(Duration::from_secs(2));
-            if let Some(cfg) = tls_cfg.as_ref() {
-                ep = ep
-                    .tls_config(cfg.clone())
-                    .map_err(|error| FluxError::InvalidArg(format!("{endpoint}: tls: {error}")))?;
-            }
-            channels.push(ep.connect_lazy());
+        let mut channels = Vec::with_capacity(targets.len());
+        for (id, endpoint) in targets {
+            let ep = configured_endpoint(&endpoint, tls_cfg.as_ref(), insecure_dev)?;
+            channels.push((id, ep.connect_lazy()));
         }
 
         let (sender, receiver) = mpsc::sync_channel(max_pending);
@@ -159,11 +245,16 @@ impl RemoteReplicatedChunkStore {
         let gc_channels = channels.clone();
         let rpc_thread = thread::Builder::new()
             .name("fluxfs-chunk-rpc".into())
-            .spawn(move || rpc_loop(channels, required, receiver))
+            .spawn({
+                let membership = membership.clone();
+                let meta_endpoint = meta_endpoint.clone();
+                let tls_cfg = tls_cfg.clone();
+                move || rpc_loop(channels, membership, meta_endpoint, tls_cfg, insecure_dev, required, receiver)
+            })
             .map_err(|error| FluxError::Io(format!("spawn chunk RPC thread: {error}")))?;
         let gc_thread = thread::Builder::new()
             .name("fluxfs-chunk-gc-rpc".into())
-            .spawn(move || rpc_loop(gc_channels, required, gc_receiver))
+            .spawn(move || rpc_loop(gc_channels, membership, meta_endpoint, tls_cfg, insecure_dev, required, gc_receiver))
             .map_err(|error| FluxError::Io(format!("spawn chunk GC RPC thread: {error}")))?;
 
         let scrub_stop = Arc::new(AtomicBool::new(false));
@@ -293,8 +384,7 @@ impl ChunkStore for RemoteReplicatedChunkStore {
     }
 
     fn gc_delete_targets(&self) -> Result<Vec<WorkerTargetId>> {
-        let count = self.call_gc(|reply| Command::TargetCount { reply })?;
-        Ok((0..count).map(WorkerTargetId).collect())
+        self.call_gc(|reply| Command::Targets { reply })
     }
 
     fn delete_from_target(&self, id: &ChunkId, target: WorkerTargetId) -> Result<()> {
@@ -325,7 +415,20 @@ impl Drop for RemoteReplicatedChunkStore {
     }
 }
 
-fn rpc_loop(channels: Vec<Channel>, required: usize, receiver: mpsc::Receiver<Command>) {
+struct WorkerRpcClient {
+    id: WorkerTargetId,
+    client: ChunkWorkerClient<Channel>,
+}
+
+fn rpc_loop(
+    channels: Vec<(WorkerTargetId, Channel)>,
+    mut membership: Option<WorkerMembership>,
+    meta_endpoint: Option<String>,
+    tls_cfg: Option<ClientTlsConfig>,
+    insecure_dev: bool,
+    required: usize,
+    receiver: mpsc::Receiver<Command>,
+) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -335,17 +438,52 @@ fn rpc_loop(channels: Vec<Channel>, required: usize, receiver: mpsc::Receiver<Co
     };
     let mut clients = channels
         .into_iter()
-        .map(|channel| {
-            ChunkWorkerClient::new(channel)
+        .map(|(id, channel)| WorkerRpcClient {
+            id,
+            client: ChunkWorkerClient::new(channel)
                 .max_decoding_message_size(MAX_CHUNK_RPC_MESSAGE)
-                .max_encoding_message_size(MAX_CHUNK_RPC_MESSAGE)
+                .max_encoding_message_size(MAX_CHUNK_RPC_MESSAGE),
         })
         .collect::<Vec<_>>();
     let mut last_healthy = BTreeSet::new();
     let mut repair_cursor: Option<ChunkId> = None;
+    let mut meta_client = meta_endpoint.and_then(|endpoint| {
+        configured_endpoint(&endpoint, tls_cfg.as_ref(), insecure_dev)
+            .ok()
+            .map(|endpoint| MetaServiceClient::new(endpoint.connect_lazy()))
+    });
+    let mut last_membership_refresh = Instant::now() - Duration::from_secs(2);
     while let Ok(command) = receiver.recv() {
+        if last_membership_refresh.elapsed() >= Duration::from_secs(1) {
+            last_membership_refresh = Instant::now();
+            if let Some(meta) = meta_client.as_mut() {
+                let refreshed = runtime.block_on(async {
+                    meta.get_worker_membership(GetWorkerMembershipRequest {})
+                        .await
+                        .map_err(rpc_status_error)
+                        .and_then(|response| {
+                            decode_worker_membership(&response.into_inner().membership_json)
+                        })
+                });
+                if let Ok(refreshed) = refreshed {
+                    if membership.as_ref() != Some(&refreshed) {
+                        if let Ok(next_clients) = worker_clients_from_membership(
+                            &refreshed,
+                            tls_cfg.as_ref(),
+                            insecure_dev,
+                        ) {
+                            clients = next_clients;
+                            membership = Some(refreshed);
+                            last_healthy.clear();
+                            repair_cursor = None;
+                        }
+                    }
+                }
+            }
+        }
         runtime.block_on(handle_command(
             &mut clients,
+            membership.as_ref(),
             required,
             &mut last_healthy,
             &mut repair_cursor,
@@ -354,8 +492,55 @@ fn rpc_loop(channels: Vec<Channel>, required: usize, receiver: mpsc::Receiver<Co
     }
 }
 
+fn worker_clients_from_membership(
+    membership: &WorkerMembership,
+    tls_cfg: Option<&ClientTlsConfig>,
+    insecure_dev: bool,
+) -> Result<Vec<WorkerRpcClient>> {
+    membership
+        .active_at(unix_time_millis())
+        .map(|worker| {
+            let endpoint = configured_endpoint(&worker.endpoint, tls_cfg, insecure_dev)?;
+            Ok(WorkerRpcClient {
+                id: worker.id,
+                client: ChunkWorkerClient::new(endpoint.connect_lazy())
+                    .max_decoding_message_size(MAX_CHUNK_RPC_MESSAGE)
+                    .max_encoding_message_size(MAX_CHUNK_RPC_MESSAGE),
+            })
+        })
+        .collect()
+}
+
+fn configured_endpoint(
+    endpoint: &str,
+    tls_cfg: Option<&ClientTlsConfig>,
+    insecure_dev: bool,
+) -> Result<Endpoint> {
+    let url = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint.to_string()
+    } else if tls_cfg.is_some() {
+        format!("https://{endpoint}")
+    } else {
+        format!("http://{endpoint}")
+    };
+    fluxfs_tls::InsecureDev::allow(insecure_dev)
+        .check_endpoint(&url)
+        .map_err(|error| FluxError::InvalidArg(error.to_string()))?;
+    let mut configured = Endpoint::from_shared(url)
+        .map_err(|error| FluxError::InvalidArg(format!("{endpoint}: {error}")))?
+        .connect_timeout(Duration::from_secs(1))
+        .timeout(Duration::from_secs(2));
+    if let Some(tls) = tls_cfg {
+        configured = configured
+            .tls_config(tls.clone())
+            .map_err(|error| FluxError::InvalidArg(format!("{endpoint}: tls: {error}")))?;
+    }
+    Ok(configured)
+}
+
 async fn handle_command(
-    clients: &mut [ChunkWorkerClient<Channel>],
+    clients: &mut [WorkerRpcClient],
+    membership: Option<&WorkerMembership>,
     required: usize,
     last_healthy: &mut BTreeSet<u64>,
     repair_cursor: &mut Option<ChunkId>,
@@ -385,7 +570,28 @@ async fn handle_command(
             let mut durable_workers = BTreeSet::new();
             let mut errors = Vec::new();
             let mut overloaded = false;
+            let selected = match membership {
+                Some(membership) => match crate::select_worker_targets(
+                    membership,
+                    &expected,
+                    required,
+                    unix_time_millis(),
+                ) {
+                    Ok(workers) => workers
+                        .into_iter()
+                        .map(|worker| worker.id.0)
+                        .collect::<BTreeSet<_>>(),
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                        return;
+                    }
+                },
+                None => healthy.keys().copied().collect(),
+            };
             for (worker_id, index) in &healthy {
+                if !selected.contains(worker_id) {
+                    continue;
+                }
                 match put_one(&mut clients[*index], *worker_id, &data, expected).await {
                     Ok(()) => {
                         durable_workers.insert(*worker_id);
@@ -421,6 +627,7 @@ async fn handle_command(
             let mut overloaded = false;
             for client in clients.iter_mut() {
                 match client
+                    .client
                     .get_chunk(GetChunkRequest {
                         chunk_id: id.as_bytes().to_vec(),
                     })
@@ -476,6 +683,7 @@ async fn handle_command(
             let mut present_workers = BTreeSet::new();
             for client in clients.iter_mut() {
                 if let Ok(response) = client
+                    .client
                     .contains_chunk(ContainsChunkRequest {
                         chunk_id: id.as_bytes().to_vec(),
                     })
@@ -529,15 +737,13 @@ async fn handle_command(
             let result = all_chunks_page(clients, cursor, limit).await;
             let _ = reply.send(result);
         }
-        Command::TargetCount { reply } => {
-            let _ = reply.send(Ok(clients.len().try_into().unwrap_or(u64::MAX)));
+        Command::Targets { reply } => {
+            let _ = reply.send(Ok(clients.iter().map(|client| client.id).collect()));
         }
         Command::DeleteTarget { id, target, reply } => {
-            let result = match usize::try_from(target.0)
-                .ok()
-                .and_then(|index| clients.get_mut(index))
-            {
+            let result = match clients.iter_mut().find(|client| client.id == target) {
                 Some(client) => client
+                    .client
                     .delete_chunk(DeleteChunkRequest {
                         chunk_id: id.as_bytes().to_vec(),
                     })
@@ -555,7 +761,7 @@ async fn handle_command(
 }
 
 async fn all_chunks_page(
-    clients: &mut [ChunkWorkerClient<Channel>],
+    clients: &mut [WorkerRpcClient],
     cursor: Option<ChunkId>,
     limit: usize,
 ) -> Result<ChunkPage> {
@@ -569,6 +775,7 @@ async fn all_chunks_page(
     let mut worker_has_more = false;
     for client in clients.iter_mut() {
         if let Ok(response) = client
+            .client
             .list_chunks(ListChunksRequest {
                 after_chunk_id: cursor
                     .map(|chunk| chunk.as_bytes().to_vec())
@@ -600,12 +807,18 @@ async fn all_chunks_page(
 }
 
 async fn healthy_workers(
-    clients: &mut [ChunkWorkerClient<Channel>],
+    clients: &mut [WorkerRpcClient],
 ) -> Result<BTreeMap<u64, usize>> {
     let mut healthy = BTreeMap::new();
     for (index, client) in clients.iter_mut().enumerate() {
-        if let Ok(response) = client.health(HealthRequest {}).await {
+        if let Ok(response) = client.client.health(HealthRequest {}).await {
             let response = response.into_inner();
+            if response.ready && response.worker_id != client.id.0 {
+                return Err(FluxError::InvalidArg(format!(
+                    "configured worker id {} answered as {}",
+                    client.id.0, response.worker_id
+                )));
+            }
             if response.ready && healthy.insert(response.worker_id, index).is_some() {
                 return Err(FluxError::InvalidArg(format!(
                     "duplicate remote worker id {}",
@@ -618,12 +831,13 @@ async fn healthy_workers(
 }
 
 async fn put_one(
-    client: &mut ChunkWorkerClient<Channel>,
+    client: &mut WorkerRpcClient,
     expected_worker: u64,
     data: &[u8],
     expected_chunk: ChunkId,
 ) -> Result<()> {
     let response = client
+        .client
         .put_chunk(PutChunkRequest {
             data: data.to_vec(),
         })
@@ -648,7 +862,7 @@ fn rpc_status_error(error: tonic::Status) -> FluxError {
 }
 
 async fn repair_with_health(
-    clients: &mut [ChunkWorkerClient<Channel>],
+    clients: &mut [WorkerRpcClient],
     required: usize,
     healthy: &BTreeMap<u64, usize>,
     repair_cursor: &mut Option<ChunkId>,
@@ -674,7 +888,7 @@ async fn repair_with_health(
 }
 
 async fn repair_pass_with_health(
-    clients: &mut [ChunkWorkerClient<Channel>],
+    clients: &mut [WorkerRpcClient],
     required: usize,
     healthy: &BTreeMap<u64, usize>,
     repair_cursor: &mut Option<ChunkId>,
@@ -707,6 +921,7 @@ async fn repair_pass_with_health(
             .copied()
             .ok_or_else(|| FluxError::Io(format!("no source replica for {}", chunk.to_hex())))?;
         let response = clients[source]
+            .client
             .get_chunk(GetChunkRequest {
                 chunk_id: chunk.as_bytes().to_vec(),
             })
@@ -755,7 +970,7 @@ struct InventoryPage {
 }
 
 async fn inventory_page_with_holders(
-    clients: &mut [ChunkWorkerClient<Channel>],
+    clients: &mut [WorkerRpcClient],
     healthy: &BTreeMap<u64, usize>,
     cursor: Option<ChunkId>,
     limit: usize,
@@ -767,6 +982,7 @@ async fn inventory_page_with_holders(
         .unwrap_or_default();
     for (worker_id, index) in healthy {
         let response = clients[*index]
+            .client
             .list_chunks(ListChunksRequest {
                 after_chunk_id: after.clone(),
                 limit: limit.try_into().unwrap_or(u32::MAX),
@@ -862,8 +1078,12 @@ mod tests {
             .unwrap();
         let (gc_sender, gc_receiver) = mpsc::sync_channel(1);
         let gc_thread = thread::spawn(move || {
-            if let Ok(Command::TargetCount { reply }) = gc_receiver.recv() {
-                let _ = reply.send(Ok(3));
+            if let Ok(Command::Targets { reply }) = gc_receiver.recv() {
+                let _ = reply.send(Ok(vec![
+                    WorkerTargetId(0),
+                    WorkerTargetId(1),
+                    WorkerTargetId(2),
+                ]));
             }
         });
         let store = RemoteReplicatedChunkStore {

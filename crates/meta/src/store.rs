@@ -1,7 +1,7 @@
 use fluxfs_types::{
     ChunkId, Dentry, FileType, FlushId, FlushIntent, GcBatch, GcLeaseId, GcPlan, GcTombstone,
-    Inode, InodeId, Manifest, ManifestId, RequestOpId, Result, UfsObject, WorkerTargetId,
-    WriteTicketId, ROOT_INODE,
+    Inode, InodeId, Manifest, ManifestId, RequestOpId, Result, UfsObject, WorkerMembership,
+    WorkerRegistration, WorkerTargetId, WriteTicketId, ROOT_INODE,
 };
 
 /// Engine-agnostic metadata API frozen for W1.
@@ -14,6 +14,14 @@ pub trait MetaStore: Send + Sync {
     }
 
     fn get_inode(&self, id: InodeId) -> Result<Inode>;
+
+    /// Register or renew a stable Worker identity. Callers sample the lease
+    /// deadline before submitting the replicated mutation.
+    fn register_worker(&self, registration: &WorkerRegistration) -> Result<WorkerMembership>;
+
+    /// Return the durable membership, including expired entries. Placement
+    /// filters them against a caller-sampled time.
+    fn worker_membership(&self) -> Result<WorkerMembership>;
 
     fn lookup(&self, parent: InodeId, name: &str) -> Result<Inode>;
 

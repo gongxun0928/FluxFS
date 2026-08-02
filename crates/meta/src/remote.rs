@@ -6,21 +6,22 @@ use fluxfs_proto::meta::v1::{
     CommitFlushRequest, CommitInodeManifestRequest, CommitInodeManifestReservedRequest,
     CreateRequest, CurrentGcPlanRequest, ExpireChunkReservationsRequest, FailFlushConflictRequest,
     FinalizeGcTombstonesRequest, FinishGcRequest, GetInodeRequest, GetManifestRequest,
-    ImportExternalRequest, InitializeGcDeleteTargetsRequest, ListFlushIntentsRequest,
+    GetWorkerMembershipRequest, ImportExternalRequest, InitializeGcDeleteTargetsRequest,
+    ListFlushIntentsRequest,
     ListGcTombstonesRequest, LookupRequest, PutInodeRequest, PutManifestRequest, ReaddirRequest,
-    ReserveChunksRequest, TombstoneGcBatchRequest, UnlinkRequest,
+    RegisterWorkerRequest, ReserveChunksRequest, TombstoneGcBatchRequest, UnlinkRequest,
 };
 use fluxfs_proto::meta_codec::{
     decode_dentries, decode_flush_intents, decode_gc_batch, decode_gc_plan, decode_gc_tombstones,
-    decode_inode, decode_manifest, encode_chunk_ids, encode_flush_intent, encode_gc_delete_acks,
-    encode_inode, encode_manifest, encode_ufs_object, encode_worker_targets, file_type_to_wire,
-    flux_from_status,
+    decode_inode, decode_manifest, decode_worker_membership, encode_chunk_ids, encode_flush_intent,
+    encode_gc_delete_acks, encode_inode, encode_manifest, encode_ufs_object,
+    encode_worker_registration, encode_worker_targets, file_type_to_wire, flux_from_status,
 };
 use fluxfs_proto::MetaServiceClient;
 use fluxfs_types::{
     ChunkId, Dentry, FileType, FlushId, FlushIntent, FluxError, GcBatch, GcLeaseId, GcPlan,
     GcTombstone, Inode, InodeId, Manifest, ManifestId, RequestOpId, Result, UfsObject,
-    WorkerTargetId, WriteTicketId, ROOT_INODE,
+    WorkerMembership, WorkerRegistration, WorkerTargetId, WriteTicketId, ROOT_INODE,
 };
 use std::future::Future;
 use std::sync::Mutex;
@@ -133,6 +134,33 @@ impl MetaStore for RemoteMetaStore {
             .map_err(flux_from_status)?
             .into_inner();
         decode_inode(&resp.inode_json)
+    }
+
+    fn register_worker(&self, registration: &WorkerRegistration) -> Result<WorkerMembership> {
+        let mut c = self.client()?;
+        let response = self
+            .block_on(async {
+                c.register_worker(RegisterWorkerRequest {
+                    registration_json: encode_worker_registration(registration)?,
+                    request_id: RequestOpId::random().to_hex(),
+                })
+                .await
+                .map_err(flux_from_status)
+            })?
+            .into_inner();
+        decode_worker_membership(&response.membership_json)
+    }
+
+    fn worker_membership(&self) -> Result<WorkerMembership> {
+        let mut c = self.client()?;
+        let response = self
+            .block_on(async {
+                c.get_worker_membership(GetWorkerMembershipRequest {})
+                    .await
+                    .map_err(flux_from_status)
+            })?
+            .into_inner();
+        decode_worker_membership(&response.membership_json)
     }
 
     fn lookup(&self, parent: InodeId, name: &str) -> Result<Inode> {

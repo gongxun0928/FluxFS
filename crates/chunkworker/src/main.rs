@@ -2,17 +2,18 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use fluxfs_chunk::{ChunkStore, DiskChunkStore};
 use fluxfs_metrics::{spawn_prometheus, FluxMetrics};
+use fluxfs_meta::{MetaStore, RemoteMetaStore};
 use fluxfs_proto::chunk::v1::{
     ContainsChunkRequest, ContainsChunkResponse, DeleteChunkRequest, DeleteChunkResponse,
     GetChunkRequest, GetChunkResponse, HealthRequest, HealthResponse, ListChunksRequest,
     ListChunksResponse, PutChunkRequest, PutChunkResponse,
 };
 use fluxfs_proto::{ChunkWorker, ChunkWorkerServer};
-use fluxfs_types::{ChunkId, FluxError, CHUNK_SIZE};
+use fluxfs_types::{ChunkId, FluxError, WorkerRegistration, WorkerTargetId, CHUNK_SIZE};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response, Status};
 
@@ -55,6 +56,71 @@ struct Cli {
     /// Explicit plaintext opt-in (tests only). Production MUST pass TLS flags.
     #[arg(long, default_value_t = false)]
     allow_insecure_dev: bool,
+    /// MetaMaster address used for durable membership registration/heartbeats.
+    #[arg(long)]
+    meta_addr: Option<String>,
+    /// Client-reachable tonic endpoint. Defaults to `http://<listen>`.
+    #[arg(long)]
+    advertise_endpoint: Option<String>,
+    #[arg(long, default_value = "local")]
+    failure_domain: String,
+    /// Administrative capacity advertised to placement.
+    #[arg(long, default_value_t = 1 << 40)]
+    capacity_bytes: u64,
+    /// Initial available capacity. Defaults to capacity.
+    #[arg(long)]
+    available_bytes: Option<u64>,
+    #[arg(long, default_value_t = 5)]
+    heartbeat_interval_secs: u64,
+    #[arg(long, default_value_t = 15)]
+    lease_secs: u64,
+}
+
+fn unix_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn registration(cli: &Cli) -> Result<WorkerRegistration> {
+    let lease_ms = cli
+        .lease_secs
+        .checked_mul(1000)
+        .context("--lease-secs overflow")?;
+    let registration = WorkerRegistration {
+        id: WorkerTargetId(cli.worker_id),
+        endpoint: cli
+            .advertise_endpoint
+            .clone()
+            .unwrap_or_else(|| {
+                let scheme = if cli.tls_server_cert.is_some() {
+                    "https"
+                } else {
+                    "http"
+                };
+                format!("{scheme}://{}", cli.listen)
+            }),
+        failure_domain: cli.failure_domain.clone(),
+        capacity_bytes: cli.capacity_bytes,
+        available_bytes: cli.available_bytes.unwrap_or(cli.capacity_bytes),
+        lease_deadline_ms: unix_time_millis().saturating_add(lease_ms),
+    };
+    registration.validate().map_err(anyhow::Error::msg)?;
+    Ok(registration)
+}
+
+fn client_tls(cli: &Cli) -> Result<Option<fluxfs_tls::ClientTlsOptions>> {
+    let opts = fluxfs_tls::ClientTlsOptions::from_cli(
+        cli.tls_ca_cert.clone(),
+        cli.tls_server_cert.clone(),
+        cli.tls_server_key.clone(),
+        None,
+    )
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    Ok(opts.enabled.then_some(opts))
 }
 
 struct ChunkSvc {
@@ -240,6 +306,9 @@ async fn main() -> Result<()> {
     if cli.max_in_flight == 0 || cli.gc_max_in_flight == 0 {
         anyhow::bail!("--max-in-flight and --gc-max-in-flight must be greater than zero");
     }
+    if cli.heartbeat_interval_secs == 0 || cli.lease_secs <= cli.heartbeat_interval_secs {
+        anyhow::bail!("--lease-secs must exceed a non-zero --heartbeat-interval-secs");
+    }
     let store = Arc::new(DiskChunkStore::open(&cli.data_dir).context("open chunk store")?);
     let metrics = FluxMetrics::new();
     if let Some(addr) = cli.metrics_listen {
@@ -275,6 +344,30 @@ async fn main() -> Result<()> {
         gc_in_flight: Arc::new(Semaphore::new(cli.gc_max_in_flight)),
         metrics,
     };
+    let heartbeat = if let Some(meta_addr) = &cli.meta_addr {
+        let meta = Arc::new(
+            RemoteMetaStore::connect_tls(meta_addr, client_tls(&cli)?, cli.allow_insecure_dev)
+                .context("connect MetaMaster")?,
+        );
+        let initial = registration(&cli)?;
+        meta.register_worker(&initial)
+            .context("initial Worker membership registration")?;
+        let template = initial;
+        let lease_ms = cli.lease_secs * 1000;
+        let interval = Duration::from_secs(cli.heartbeat_interval_secs);
+        Some(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let mut next = template.clone();
+                next.lease_deadline_ms = unix_time_millis().saturating_add(lease_ms);
+                if let Err(error) = meta.register_worker(&next) {
+                    tracing::warn!(%error, "Worker membership heartbeat failed");
+                }
+            }
+        }))
+    } else {
+        None
+    };
     println!(
         "fluxfs-chunkworker id={} listening on {} data_dir={} max_in_flight={} compact_interval_secs={}",
         cli.worker_id,
@@ -306,7 +399,7 @@ async fn main() -> Result<()> {
     } else {
         tracing::warn!("chunkworker in INSECURE-DEV plaintext mode (--allow-insecure-dev)");
     }
-    server_builder
+    let result = server_builder
         .add_service(
             ChunkWorkerServer::new(service)
                 .max_decoding_message_size(MAX_CHUNK_RPC_MESSAGE)
@@ -314,8 +407,11 @@ async fn main() -> Result<()> {
         )
         .serve(cli.listen)
         .await
-        .context("serve chunk worker")?;
-    Ok(())
+        .context("serve chunk worker");
+    if let Some(task) = heartbeat {
+        task.abort();
+    }
+    result
 }
 
 #[cfg(test)]

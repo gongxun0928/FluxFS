@@ -7,6 +7,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 use fluxfs_types::{
     ChunkReservation, Dentry, FluxError, GcLeaseId, GcTombstone, Inode, Manifest, Result,
+    WorkerMembership,
 };
 use serde::{Deserialize, Serialize};
 
@@ -44,6 +45,7 @@ pub enum SnapshotRecord {
     },
     Reservation(ChunkReservation),
     DeleteTombstone(GcTombstone),
+    WorkerMembership(WorkerMembership),
     End,
 }
 

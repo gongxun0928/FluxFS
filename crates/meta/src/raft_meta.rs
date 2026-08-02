@@ -6,7 +6,7 @@ use crate::store::MetaStore;
 use fluxfs_types::{
     ChunkId, Dentry, FileType, FlushId, FlushIntent, FluxError, GcBatch, GcLeaseId, GcPlan,
     GcTombstone, Inode, InodeId, Manifest, ManifestId, RequestOpId, Result, UfsObject,
-    WorkerTargetId, WriteTicketId, ROOT_INODE,
+    WorkerMembership, WorkerRegistration, WorkerTargetId, WriteTicketId, ROOT_INODE,
 };
 use std::future::Future;
 use std::sync::Arc;
@@ -116,6 +116,16 @@ impl RaftMetaStore {
             ))),
         }
     }
+
+    fn map_worker_membership(resp: MetaRaftResponse) -> Result<WorkerMembership> {
+        match resp {
+            MetaRaftResponse::WorkerMembership(membership) => Ok(*membership),
+            MetaRaftResponse::Err(err) => Err(err),
+            other => Err(FluxError::Meta(format!(
+                "unexpected raft response: {other:?}"
+            ))),
+        }
+    }
 }
 
 impl MetaStore for RaftMetaStore {
@@ -125,6 +135,17 @@ impl MetaStore for RaftMetaStore {
 
     fn get_inode(&self, id: InodeId) -> Result<Inode> {
         self.store.get_inode(id)
+    }
+
+    fn register_worker(&self, registration: &WorkerRegistration) -> Result<WorkerMembership> {
+        Self::map_worker_membership(self.write(MetaRaftRequest::RegisterWorker {
+            request_id: Some(RequestOpId::random()),
+            registration: registration.clone(),
+        })?)
+    }
+
+    fn worker_membership(&self) -> Result<WorkerMembership> {
+        self.store.worker_membership()
     }
 
     fn lookup(&self, parent: InodeId, name: &str) -> Result<Inode> {

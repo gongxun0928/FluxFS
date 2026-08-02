@@ -2,7 +2,8 @@ use crate::meta::v1;
 use fluxfs_types::schema::{decode_versioned, Versioned};
 use fluxfs_types::{
     ChunkId, Dentry, FileType, FlushIntent, FluxError, GcBatch, GcPlan, GcTombstone, Inode,
-    InodeId, Manifest, ManifestId, Result as FluxResult, UfsObject, WorkerTargetId,
+    InodeId, Manifest, ManifestId, Result as FluxResult, UfsObject, WorkerMembership,
+    WorkerRegistration, WorkerTargetId,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -38,6 +39,22 @@ where
     // capability negotiation, or data written during the 3225ffa envelope
     // window before this rolling-compat fix landed.
     decode_versioned(bytes)
+}
+
+pub fn encode_worker_registration(value: &WorkerRegistration) -> FluxResult<Vec<u8>> {
+    encode_legacy(value)
+}
+
+pub fn decode_worker_registration(bytes: &[u8]) -> FluxResult<WorkerRegistration> {
+    decode_legacy_or_envelope(bytes)
+}
+
+pub fn encode_worker_membership(value: &WorkerMembership) -> FluxResult<Vec<u8>> {
+    encode_legacy(value)
+}
+
+pub fn decode_worker_membership(bytes: &[u8]) -> FluxResult<WorkerMembership> {
+    decode_legacy_or_envelope(bytes)
 }
 
 pub fn encode_inode(inode: &Inode) -> FluxResult<Vec<u8>> {

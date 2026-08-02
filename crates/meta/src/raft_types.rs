@@ -5,7 +5,8 @@
 
 use fluxfs_types::{
     ChunkId, FileType, FlushId, FlushIntent, FluxError, GcBatch, GcLeaseId, GcPlan, Inode,
-    Manifest, RequestOpId, UfsObject, WorkerTargetId, WriteTicketId,
+    Manifest, RequestOpId, UfsObject, WorkerMembership, WorkerRegistration, WorkerTargetId,
+    WriteTicketId,
 };
 use openraft::declare_raft_types;
 use openraft::BasicNode;
@@ -28,6 +29,11 @@ pub struct SmAppliedMeta {
 /// new writers MUST set it so apply can retain/dedup results.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MetaRaftRequest {
+    RegisterWorker {
+        #[serde(default)]
+        request_id: Option<RequestOpId>,
+        registration: WorkerRegistration,
+    },
     Create {
         #[serde(default)]
         request_id: Option<RequestOpId>,
@@ -170,7 +176,8 @@ pub enum MetaRaftRequest {
 impl MetaRaftRequest {
     pub fn request_id(&self) -> Option<&RequestOpId> {
         match self {
-            Self::Create { request_id, .. }
+            Self::RegisterWorker { request_id, .. }
+            | Self::Create { request_id, .. }
             | Self::PutInode { request_id, .. }
             | Self::PutManifest { request_id, .. }
             | Self::CommitInodeManifest { request_id, .. }
@@ -194,7 +201,8 @@ impl MetaRaftRequest {
 
     pub fn with_request_id(mut self, id: RequestOpId) -> Self {
         match &mut self {
-            Self::Create { request_id, .. }
+            Self::RegisterWorker { request_id, .. }
+            | Self::Create { request_id, .. }
             | Self::PutInode { request_id, .. }
             | Self::PutManifest { request_id, .. }
             | Self::CommitInodeManifest { request_id, .. }
@@ -228,6 +236,7 @@ pub enum MetaRaftResponse {
     ManifestId(u64),
     GcPlan(Box<GcPlan>),
     GcBatch(Box<GcBatch>),
+    WorkerMembership(Box<WorkerMembership>),
     Err(FluxError),
 }
 

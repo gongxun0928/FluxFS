@@ -6,6 +6,8 @@ package fluxfs.meta.v1;
 // Convert at the crate boundary via fluxfs_proto::meta_codec.
 
 service MetaService {
+  rpc RegisterWorker(RegisterWorkerRequest) returns (WorkerMembershipResponse);
+  rpc GetWorkerMembership(GetWorkerMembershipRequest) returns (WorkerMembershipResponse);
   rpc GetInode(GetInodeRequest) returns (GetInodeResponse);
   rpc Lookup(LookupRequest) returns (LookupResponse);
   rpc Create(CreateRequest) returns (CreateResponse);
@@ -35,6 +37,10 @@ service MetaService {
   rpc Unlink(UnlinkRequest) returns (UnlinkResponse);
   rpc Ping(PingRequest) returns (PingResponse);
 }
+
+message RegisterWorkerRequest { bytes registration_json = 1; string request_id = 2; }
+message GetWorkerMembershipRequest {}
+message WorkerMembershipResponse { bytes membership_json = 1; }
 
 message PingRequest {}
 message PingResponse { string version = 1; }

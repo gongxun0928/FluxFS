@@ -4,7 +4,8 @@ use fluxfs_types::{
     BackingMode, ChunkId, ChunkReservation, DataGen, DataState, Dentry, Extent, ExtentTree,
     FileType, FlushId, FlushIntent, FluxError, GcBatch, GcLeaseId, GcPlan, GcTombstone, Inode,
     InodeId, LocalityFields, LocalityLabel, Manifest, ManifestId, OpState, Origin, Result,
-    UfsObject, UfsVersion, WorkerTargetId, WriteTicketId, ROOT_INODE,
+    UfsObject, UfsVersion, WorkerMembership, WorkerRegistration, WorkerTargetId, WriteTicketId,
+    ROOT_INODE,
 };
 use heed::types::{Bytes, Str};
 use heed::{Database, Env, EnvOpenOptions};
@@ -29,6 +30,7 @@ const KEY_SM_LAST_APPLIED: &str = "raft_sm_last_applied";
 const KEY_SM_LAST_MEMBERSHIP: &str = "raft_sm_last_membership";
 const KEY_GC_LEASE: &str = "gc_lease";
 const KEY_META_SCHEMA_VERSION: &str = "meta_schema_version";
+const KEY_WORKER_MEMBERSHIP: &str = "worker_membership";
 const RESERVATION_PREFIX: &str = "write_reservation:";
 const TOMBSTONE_PREFIX: &str = "gc_tombstone:";
 
@@ -53,6 +55,8 @@ pub struct MetaSnapshotData {
     pub gc_tombstones: Vec<ChunkId>,
     #[serde(default)]
     pub gc_delete_tombstones: Vec<GcTombstone>,
+    #[serde(default)]
+    pub worker_membership: WorkerMembership,
 }
 
 pub struct HeedMetaStore {
@@ -245,6 +249,78 @@ impl HeedMetaStore {
         })
     }
 
+    fn worker_membership_in_txn(&self, txn: &heed::RoTxn<'_>) -> Result<WorkerMembership> {
+        match self
+            .meta
+            .get(txn, KEY_WORKER_MEMBERSHIP)
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+        {
+            Some(bytes) => {
+                serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))
+            }
+            None => Ok(WorkerMembership::default()),
+        }
+    }
+
+    fn put_worker_membership_in_txn(
+        &self,
+        txn: &mut heed::RwTxn<'_>,
+        membership: &WorkerMembership,
+    ) -> Result<()> {
+        let bytes =
+            serde_json::to_vec(membership).map_err(|e| FluxError::Meta(e.to_string()))?;
+        self.meta
+            .put(txn, KEY_WORKER_MEMBERSHIP, &bytes)
+            .map_err(|e| FluxError::Meta(e.to_string()))
+    }
+
+    fn register_worker_in_txn(
+        &self,
+        txn: &mut heed::RwTxn<'_>,
+        registration: &WorkerRegistration,
+    ) -> Result<WorkerMembership> {
+        registration.validate()?;
+        let mut membership = self.worker_membership_in_txn(txn)?;
+        if membership.workers.iter().any(|worker| {
+            worker.id != registration.id && worker.endpoint == registration.endpoint
+        }) {
+            return Err(FluxError::InvalidArg(format!(
+                "worker endpoint {} is already registered to another id",
+                registration.endpoint
+            )));
+        }
+
+        match membership
+            .workers
+            .iter_mut()
+            .find(|worker| worker.id == registration.id)
+        {
+            Some(current) => {
+                if registration.lease_deadline_ms < current.lease_deadline_ms {
+                    return Err(FluxError::CasFailed {
+                        expected: current.lease_deadline_ms,
+                        actual: registration.lease_deadline_ms,
+                    });
+                }
+                let placement_changed = current.endpoint != registration.endpoint
+                    || current.failure_domain != registration.failure_domain
+                    || current.capacity_bytes != registration.capacity_bytes
+                    || current.available_bytes != registration.available_bytes;
+                *current = registration.clone();
+                if placement_changed {
+                    membership.epoch = membership.epoch.saturating_add(1);
+                }
+            }
+            None => {
+                membership.workers.push(registration.clone());
+                membership.epoch = membership.epoch.saturating_add(1);
+            }
+        }
+        membership.workers.sort_by_key(|worker| worker.id);
+        self.put_worker_membership_in_txn(txn, &membership)?;
+        Ok(membership)
+    }
+
     fn put_sm_meta_raw(&self, wtxn: &mut heed::RwTxn, sm: &SmAppliedMeta) -> Result<()> {
         let applied =
             serde_json::to_vec(&sm.last_applied_log).map_err(|e| FluxError::Meta(e.to_string()))?;
@@ -286,12 +362,22 @@ impl HeedMetaStore {
         let gc_blocked = self.gc_lease_in_txn(&wtxn)?.is_some()
             && !matches!(
                 req,
-                MetaRaftRequest::BeginGc { .. } | MetaRaftRequest::FinishGc { .. }
+                MetaRaftRequest::RegisterWorker { .. }
+                    | MetaRaftRequest::BeginGc { .. }
+                    | MetaRaftRequest::FinishGc { .. }
             );
         let resp = if gc_blocked {
             MetaRaftResponse::Err(FluxError::Busy)
         } else {
             match req {
+                MetaRaftRequest::RegisterWorker { registration, .. } => {
+                    match self.register_worker_in_txn(&mut wtxn, registration) {
+                        Ok(membership) => {
+                            MetaRaftResponse::WorkerMembership(Box::new(membership))
+                        }
+                        Err(e) => MetaRaftResponse::Err(e),
+                    }
+                }
                 MetaRaftRequest::Create {
                     parent,
                     name,
@@ -649,6 +735,7 @@ impl HeedMetaStore {
         let gc_lease = self.gc_lease_in_txn(&rtxn)?;
         let chunk_reservations = self.list_reservations_in_txn(&rtxn)?;
         let gc_delete_tombstones = self.list_tombstones_in_txn(&rtxn)?;
+        let worker_membership = self.worker_membership_in_txn(&rtxn)?;
         drop(rtxn);
         Ok(MetaSnapshotData {
             inodes,
@@ -662,6 +749,7 @@ impl HeedMetaStore {
             chunk_reservations,
             gc_tombstones: Vec::new(),
             gc_delete_tombstones,
+            worker_membership,
         })
     }
 
@@ -788,6 +876,7 @@ impl HeedMetaStore {
         for tombstone in &snap.gc_delete_tombstones {
             self.put_tombstone_in_txn(&mut wtxn, tombstone)?;
         }
+        self.put_worker_membership_in_txn(&mut wtxn, &snap.worker_membership)?;
         self.put_sm_meta_raw(&mut wtxn, &snap.sm)?;
         wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
         Ok(())
@@ -825,6 +914,10 @@ impl HeedMetaStore {
                 sm: sm.clone(),
                 gc_lease,
             },
+        )?;
+        write_record(
+            &mut file,
+            &SnapshotRecord::WorkerMembership(self.worker_membership_in_txn(&rtxn)?),
         )?;
 
         let iter = self
@@ -1003,6 +1096,9 @@ impl HeedMetaStore {
         }
         self.clear_meta_prefix_in_txn(&mut wtxn, RESERVATION_PREFIX)?;
         self.clear_meta_prefix_in_txn(&mut wtxn, TOMBSTONE_PREFIX)?;
+        self.meta
+            .delete(&mut wtxn, KEY_WORKER_MEMBERSHIP)
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
 
         let mut header_sm = None;
         let mut saw_end = false;
@@ -1059,6 +1155,9 @@ impl HeedMetaStore {
                 }
                 SnapshotRecord::DeleteTombstone(tombstone) => {
                     self.put_tombstone_in_txn(&mut wtxn, &tombstone)?;
+                }
+                SnapshotRecord::WorkerMembership(membership) => {
+                    self.put_worker_membership_in_txn(&mut wtxn, &membership)?;
                 }
                 SnapshotRecord::End => {
                     saw_end = true;
@@ -1969,6 +2068,18 @@ impl MetaStore for HeedMetaStore {
             .to_vec();
         drop(rtxn);
         serde_json::from_slice(&bytes).map_err(|e| FluxError::Meta(e.to_string()))
+    }
+
+    fn register_worker(&self, registration: &WorkerRegistration) -> Result<WorkerMembership> {
+        self.with_write_txn(|store, txn| store.register_worker_in_txn(txn, registration))
+    }
+
+    fn worker_membership(&self) -> Result<WorkerMembership> {
+        let txn = self
+            .env
+            .read_txn()
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        self.worker_membership_in_txn(&txn)
     }
 
     fn lookup(&self, parent: InodeId, name: &str) -> Result<Inode> {
@@ -3379,6 +3490,53 @@ mod tests {
                 .lookup(ROOT_INODE, &format!("stream-{i}.bin"))
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn worker_membership_uses_stable_ids_epochs_and_survives_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HeedMetaStore::open(dir.path()).unwrap();
+        let mut worker = WorkerRegistration {
+            id: WorkerTargetId(41),
+            endpoint: "http://127.0.0.1:5041".into(),
+            failure_domain: "rack-a".into(),
+            capacity_bytes: 1_000,
+            available_bytes: 900,
+            lease_deadline_ms: 100,
+        };
+        let first = store.register_worker(&worker).unwrap();
+        assert_eq!(first.epoch, 1);
+
+        worker.lease_deadline_ms = 200;
+        let heartbeat = store.register_worker(&worker).unwrap();
+        assert_eq!(heartbeat.epoch, 1, "lease-only heartbeat must not churn placement");
+        worker.failure_domain = "rack-b".into();
+        worker.lease_deadline_ms = 300;
+        let moved = store.register_worker(&worker).unwrap();
+        assert_eq!(moved.epoch, 2);
+        assert!(matches!(
+            store.register_worker(&WorkerRegistration {
+                lease_deadline_ms: 250,
+                ..worker.clone()
+            }),
+            Err(FluxError::CasFailed { .. })
+        ));
+
+        let snapshot = store.export_snapshot(&SmAppliedMeta::default()).unwrap();
+        let restored_dir = tempfile::tempdir().unwrap();
+        let restored = HeedMetaStore::open(restored_dir.path()).unwrap();
+        restored.install_snapshot_data(&snapshot).unwrap();
+        assert_eq!(restored.worker_membership().unwrap(), moved);
+
+        let path = dir.path().join("membership.snap");
+        store
+            .export_snapshot_to_path(&SmAppliedMeta::default(), &path)
+            .unwrap();
+        let streamed_dir = tempfile::tempdir().unwrap();
+        let streamed = HeedMetaStore::open(streamed_dir.path()).unwrap();
+        let mut file = std::fs::File::open(path).unwrap();
+        streamed.install_snapshot_from_reader(&mut file).unwrap();
+        assert_eq!(streamed.worker_membership().unwrap(), moved);
     }
 
     #[test]

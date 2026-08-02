@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Parser, Debug)]
 #[command(name = "fluxfs", about = "FluxFS MVP co-located control binary")]
@@ -349,6 +349,27 @@ fn run_mount(
     }
     std::fs::create_dir_all(&data_dir)?;
     std::fs::create_dir_all(&mountpoint)?;
+    if chunk_workers.is_empty() && meta_addr.is_some() {
+        let client_tls = tls.build(None)?;
+        let meta = RemoteMetaStore::connect_tls(
+            meta_addr.as_deref().expect("checked"),
+            client_tls.clone(),
+            tls.allow_insecure_dev,
+        )
+        .context("connect MetaMaster for Worker discovery")?;
+        let membership = meta.worker_membership().context("get Worker membership")?;
+        let chunks = RemoteReplicatedChunkStore::new_with_membership_discovery_tls(
+            membership,
+            meta_addr.as_deref().expect("checked").to_string(),
+            2,
+            chunk_max_pending,
+            unix_time_millis(),
+            client_tls,
+            tls.allow_insecure_dev,
+        )
+        .context("configure membership-discovered RF=2 chunks")?;
+        return mount_remote_chunks(data_dir, mountpoint, meta_addr, chunks, ufs, tls);
+    }
     if chunk_workers.is_empty() {
         let chunks = ReplicatedChunkStore::open_rf2(
             data_dir.join("chunks/worker-0"),
@@ -380,6 +401,17 @@ fn run_mount(
         tls.allow_insecure_dev,
     )
     .context("configure remote RF=2 chunks")?;
+    mount_remote_chunks(data_dir, mountpoint, meta_addr, chunks, ufs, tls)
+}
+
+fn mount_remote_chunks(
+    data_dir: PathBuf,
+    mountpoint: PathBuf,
+    meta_addr: Option<String>,
+    chunks: RemoteReplicatedChunkStore,
+    ufs: Option<Ufs>,
+    tls: TlsClientArgs,
+) -> Result<()> {
     let available = chunks
         .available_workers()
         .context("probe remote ChunkWorkers")?;
@@ -401,6 +433,15 @@ fn run_mount(
         ufs,
         tls,
     )
+}
+
+fn unix_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn mount_with_chunks<C: ChunkStore + 'static>(
@@ -528,7 +569,27 @@ fn run_orphan_gc_cmd(
     tls: TlsClientArgs,
 ) -> Result<()> {
     std::fs::create_dir_all(&data_dir)?;
-    if chunk_workers.is_empty() {
+    if chunk_workers.is_empty() && meta_addr.is_some() {
+        let client_tls = tls.build(None)?;
+        let meta = RemoteMetaStore::connect_tls(
+            meta_addr.as_deref().expect("checked"),
+            client_tls.clone(),
+            tls.allow_insecure_dev,
+        )
+        .context("connect MetaMaster for Worker discovery")?;
+        let membership = meta.worker_membership().context("get Worker membership")?;
+        let chunks = RemoteReplicatedChunkStore::new_with_membership_discovery_tls(
+            membership,
+            meta_addr.as_deref().expect("checked").to_string(),
+            2,
+            chunk_max_pending,
+            unix_time_millis(),
+            client_tls,
+            tls.allow_insecure_dev,
+        )
+        .context("configure membership-discovered RF=2 chunks")?;
+        run_orphan_gc_with_chunks(data_dir, meta_addr, chunks, &tls)
+    } else if chunk_workers.is_empty() {
         let chunks = ReplicatedChunkStore::open_rf2(
             data_dir.join("chunks/worker-0"),
             data_dir.join("chunks/worker-1"),

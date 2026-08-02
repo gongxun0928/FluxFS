@@ -858,6 +858,7 @@ dependencies = [
  "anyhow",
  "clap",
  "fluxfs-chunk",
+ "fluxfs-meta",
  "fluxfs-metrics",
  "fluxfs-proto",
  "fluxfs-tls",

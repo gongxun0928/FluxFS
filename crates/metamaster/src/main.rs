@@ -14,18 +14,22 @@ use fluxfs_proto::meta::v1::{
     ExpireChunkReservationsResponse, FailFlushConflictRequest, FailFlushConflictResponse,
     FinalizeGcTombstonesRequest, FinalizeGcTombstonesResponse, FinishGcRequest, FinishGcResponse,
     GetInodeRequest, GetInodeResponse, GetManifestRequest, GetManifestResponse,
+    GetWorkerMembershipRequest,
     ImportExternalRequest, ImportExternalResponse, InitializeGcDeleteTargetsRequest,
     InitializeGcDeleteTargetsResponse, ListFlushIntentsRequest, ListFlushIntentsResponse,
     ListGcTombstonesRequest, ListGcTombstonesResponse, LookupRequest, LookupResponse, PingRequest,
     PingResponse, PutInodeRequest, PutInodeResponse, PutManifestRequest, PutManifestResponse,
-    ReaddirRequest, ReaddirResponse, ReserveChunksRequest, ReserveChunksResponse,
+    ReaddirRequest, ReaddirResponse, RegisterWorkerRequest, ReserveChunksRequest,
+    ReserveChunksResponse,
     TombstoneGcBatchRequest, TombstoneGcBatchResponse, UnlinkRequest, UnlinkResponse,
+    WorkerMembershipResponse,
 };
 use fluxfs_proto::meta_codec::{
     decode_chunk_ids, decode_flush_intent, decode_gc_delete_acks, decode_inode, decode_manifest,
     decode_ufs_object, decode_worker_targets, encode_dentries, encode_flush_intents,
-    encode_gc_batch, encode_gc_plan, encode_gc_tombstones, encode_inode, encode_manifest,
-    file_type_from_wire, status_from_flux,
+    decode_worker_registration, encode_gc_batch, encode_gc_plan, encode_gc_tombstones,
+    encode_inode, encode_manifest, encode_worker_membership, file_type_from_wire,
+    status_from_flux,
 };
 use fluxfs_proto::{MetaService, MetaServiceServer};
 use fluxfs_types::{FlushId, FluxError, GcLeaseId, ManifestId, RequestOpId, WriteTicketId};
@@ -166,10 +170,55 @@ impl MetaSvc {
             ))),
         }
     }
+
+    fn map_resp_worker_membership(
+        &self,
+        resp: MetaRaftResponse,
+    ) -> std::result::Result<fluxfs_types::WorkerMembership, Status> {
+        match resp {
+            MetaRaftResponse::WorkerMembership(membership) => Ok(*membership),
+            MetaRaftResponse::Err(err) => {
+                self.note_app_err(&err);
+                Err(status_from_flux(err))
+            }
+            other => Err(Status::internal(format!(
+                "unexpected raft response: {other:?}"
+            ))),
+        }
+    }
 }
 
 #[tonic::async_trait]
 impl MetaService for MetaSvc {
+    async fn register_worker(
+        &self,
+        req: Request<RegisterWorkerRequest>,
+    ) -> Result<Response<WorkerMembershipResponse>, Status> {
+        let request = req.into_inner();
+        let registration =
+            decode_worker_registration(&request.registration_json).map_err(status_from_flux)?;
+        let response = self
+            .write(MetaRaftRequest::RegisterWorker {
+                request_id: parse_request_op_id(&request.request_id),
+                registration,
+            })
+            .await?;
+        let membership = self.map_resp_worker_membership(response)?;
+        Ok(Response::new(WorkerMembershipResponse {
+            membership_json: encode_worker_membership(&membership).map_err(status_from_flux)?,
+        }))
+    }
+
+    async fn get_worker_membership(
+        &self,
+        _req: Request<GetWorkerMembershipRequest>,
+    ) -> Result<Response<WorkerMembershipResponse>, Status> {
+        let membership = self.store.worker_membership().map_err(status_from_flux)?;
+        Ok(Response::new(WorkerMembershipResponse {
+            membership_json: encode_worker_membership(&membership).map_err(status_from_flux)?,
+        }))
+    }
+
     async fn ping(&self, _req: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
         Ok(Response::new(PingResponse {
             version: env!("CARGO_PKG_VERSION").into(),
