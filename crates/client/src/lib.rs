@@ -266,6 +266,10 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
     }
 
     /// Resume a GC interrupted by process failure, without starting a new pass.
+    ///
+    /// Prefer [`Self::release_interrupted_gc_lease`] on the mount critical path:
+    /// completing a full physical sweep here is stop-the-world and can stall
+    /// startup. Kept for explicit/admin GC tooling and tests.
     pub fn resume_orphan_gc(&self) -> Result<Option<OrphanGcReport>> {
         let Some(plan) = self.meta.current_gc_plan()? else {
             return Ok(None);
@@ -273,12 +277,24 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         self.execute_gc_plan(plan).map(Some)
     }
 
+    /// Drop a leftover stop-the-world GC lease without deleting chunks.
+    ///
+    /// Used so mount can serve traffic instead of blocking on an incomplete
+    /// quiesced sweep. Orphan chunks remain until reservation/tombstone GC.
+    pub fn release_interrupted_gc_lease(&self) -> Result<bool> {
+        let Some(plan) = self.meta.current_gc_plan()? else {
+            return Ok(false);
+        };
+        self.meta.finish_gc(plan.lease_id)?;
+        Ok(true)
+    }
+
     /// Atomically freeze metadata mutations, remove unreachable manifests, and
     /// sweep physical chunks not referenced by any active inode manifest.
     ///
-    /// This is a startup/quiesced operation: callers must not allow a writer to
-    /// stage chunks before the lease and delay its metadata commit until after
-    /// the lease is released. The mount path invokes it before serving FUSE.
+    /// Historical quiesced API: safe only when no writer can stage chunks that
+    /// commit after the lease snapshot. Mount no longer invokes this on the
+    /// critical path; use explicit tooling/tests until online GC lands.
     pub fn run_orphan_gc(&self) -> Result<OrphanGcReport> {
         let plan = match self.meta.current_gc_plan()? {
             Some(plan) => plan,

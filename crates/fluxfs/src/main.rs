@@ -59,6 +59,21 @@ enum Cmd {
         #[arg(long, default_value = "fluxfs-ufs-check.bin")]
         key: String,
     },
+    /// Quiesced orphan GC (stop-the-world). Not run automatically on mount.
+    ///
+    /// Safe only when no writer can stage chunks that commit after the GC
+    /// snapshot. Prefer online reservation/tombstone GC once it lands; this
+    /// command remains for admin/tests until then.
+    OrphanGc {
+        #[arg(long, default_value = "/tmp/fluxfs-data")]
+        data_dir: PathBuf,
+        #[arg(long)]
+        meta_addr: Option<String>,
+        #[arg(long = "chunk-worker")]
+        chunk_workers: Vec<String>,
+        #[arg(long, default_value_t = fluxfs_chunk::DEFAULT_MAX_PENDING_CHUNK_OPS)]
+        chunk_max_pending: usize,
+    },
     /// Print stack / topology freeze summary.
     Info,
 }
@@ -128,6 +143,14 @@ async fn main() -> Result<()> {
         }
         Cmd::UfsCheck { key } => {
             run_ufs_check(&key).await?;
+        }
+        Cmd::OrphanGc {
+            data_dir,
+            meta_addr,
+            chunk_workers,
+            chunk_max_pending,
+        } => {
+            run_orphan_gc_cmd(data_dir, meta_addr, chunk_workers, chunk_max_pending)?;
         }
     }
     Ok(())
@@ -348,15 +371,76 @@ fn mount_with_chunks<C: ChunkStore + 'static>(
     Ok(())
 }
 
-fn reconcile_before_mount<M: MetaStore, C: ChunkStore>(client: &FluxClient<M, C>) -> Result<()> {
-    if let Some(report) = client
-        .resume_orphan_gc()
-        .context("resume interrupted orphan GC")?
-    {
+fn run_orphan_gc_cmd(
+    data_dir: PathBuf,
+    meta_addr: Option<String>,
+    chunk_workers: Vec<String>,
+    chunk_max_pending: usize,
+) -> Result<()> {
+    std::fs::create_dir_all(&data_dir)?;
+    if chunk_workers.is_empty() {
+        let chunks = ReplicatedChunkStore::open_rf2(
+            data_dir.join("chunks/worker-0"),
+            data_dir.join("chunks/worker-1"),
+        )
+        .context("open local RF=2 chunks")?;
+        run_orphan_gc_with_chunks(data_dir, meta_addr, chunks)
+    } else {
+        if chunk_workers.len() != 3 {
+            bail!(
+                "multi-process v0 requires exactly three --chunk-worker URLs; got {}",
+                chunk_workers.len()
+            );
+        }
+        let chunks =
+            RemoteReplicatedChunkStore::new_with_max_pending(chunk_workers, 2, chunk_max_pending)
+                .context("configure remote RF=2 chunks")?;
+        run_orphan_gc_with_chunks(data_dir, meta_addr, chunks)
+    }
+}
+
+fn run_orphan_gc_with_chunks<C: ChunkStore>(
+    data_dir: PathBuf,
+    meta_addr: Option<String>,
+    chunks: C,
+) -> Result<()> {
+    if let Some(addr) = meta_addr {
+        let meta = RemoteMetaStore::connect(&addr).context("connect meta")?;
+        let client = FluxClient::new(meta, chunks);
+        let report = client.run_orphan_gc().context("orphan gc")?;
         println!(
-            "orphan GC recovery: manifests={} chunks={}",
+            "orphan-gc ok: manifests={} chunks={}",
             report.removed_manifests, report.removed_chunks
         );
+    } else {
+        let meta_path = data_dir.join("meta");
+        let raft_dir = data_dir.join("raft");
+        let store = Arc::new(HeedMetaStore::open(&meta_path).context("open meta")?);
+        let rt = tokio::runtime::Runtime::new().context("tokio runtime")?;
+        let raft = rt
+            .block_on(start_single_voter(store.clone(), &raft_dir, "127.0.0.1:0"))
+            .context("start embedded openraft")?;
+        let meta = RaftMetaStore::new_owned(store, raft, rt);
+        let client = FluxClient::new(meta, chunks);
+        let report = client.run_orphan_gc().context("orphan gc")?;
+        println!(
+            "orphan-gc ok: manifests={} chunks={}",
+            report.removed_manifests, report.removed_chunks
+        );
+    }
+    Ok(())
+}
+
+fn reconcile_before_mount<M: MetaStore, C: ChunkStore>(client: &FluxClient<M, C>) -> Result<()> {
+    // Do not run stop-the-world orphan GC on the mount critical path: it stalls
+    // FUSE bring-up and holds a Meta Busy lease across the whole sweep.
+    // Release any interrupted lease so writers are not stuck Busy after mount;
+    // physical reclaim waits for reservation/tombstone background GC.
+    if client
+        .release_interrupted_gc_lease()
+        .context("release interrupted orphan GC lease")?
+    {
+        println!("orphan GC: released interrupted lease (deferred background reclaim)");
     }
     if client.has_ufs() {
         let report = client
@@ -368,13 +452,6 @@ fn reconcile_before_mount<M: MetaStore, C: ChunkStore>(client: &FluxClient<M, C>
                 report.completed, report.conflicts, report.pending
             );
         }
-    }
-    let report = client.run_orphan_gc().context("run startup orphan GC")?;
-    if report.removed_manifests + report.removed_chunks > 0 {
-        println!(
-            "orphan GC: manifests={} chunks={}",
-            report.removed_manifests, report.removed_chunks
-        );
     }
     Ok(())
 }
