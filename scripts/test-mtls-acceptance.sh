@@ -327,8 +327,10 @@ if "$repo_dir/target/debug/fluxfs" chunk-probe --mode put \
     exit 1
 fi
 # Role gate passes; rejection must come from the handler-layer cap check.
-# authz.rs require() emits "lacks <Capability>" in the Status message.
-if ! grep -qiE "lacks putchunk|does not have permission|permission denied" \
+# authz.rs require() emits "lacks <Capability>" in the Status message; the
+# Capability Display impl (auth.rs) lowercases to snake_case, so the marker
+# is "lacks put_chunk" (not "PutChunk"/"putchunk").
+if ! grep -qiE "lacks put_chunk|does not have permission|permission denied" \
         "$test_root/cap-reject.log"; then
     echo "    FAIL: Meta PutChunk rejected without per-handler cap marker:" >&2
     cat "$test_root/cap-reject.log" >&2
@@ -345,9 +347,37 @@ echo "==> [bonus 1] tombstone/delete/finalize: ClientAdmin drives GC under mTLS"
 # orphan-gc against the live cluster under mTLS and assert chunks>=1 were
 # reclaimed via Worker.delete_chunk.
 start_mount_with "$cert_dir/client.crt" "$cert_dir/client.key"
-dd if=/dev/zero of="$mount_dir/gc-target.bin" bs=1M count=2 status=none
-test "$(stat -c %s "$mount_dir/gc-target.bin")" = "2097152"
-rm -f "$mount_dir/gc-target.bin"
+# Stage the bytes on tmpfs first, then copy into the mount. Direct dd/cp
+# into FUSE intermittently hits B6 EAGAIN/backpressure (gpt56 7d871536,
+# cursor 00233d1d) — both reviewers reproduced this deterministically.
+# Use a small read+write loop with bounded EAGAIN retry so the write
+# completes once the worker queue drains.
+dd if=/dev/zero of="$test_root/gc.expected" bs=1M count=2 status=none
+gc_target="$mount_dir/gc-target.bin"
+cp_ok=0
+for attempt in $(seq 1 8); do
+    if cp "$test_root/gc.expected" "$gc_target" 2>"$test_root/cp.err"; then
+        cp_ok=1
+        break
+    fi
+    # EAGAIN / Resource temporarily unavailable — worker queue full, retry.
+    if ! grep -qiE "resource temporarily unavailable|would block|eagain" \
+            "$test_root/cp.err"; then
+        echo "    cp failed for non-EAGAIN reason:" >&2
+        cat "$test_root/cp.err" >&2
+        break
+    fi
+    sleep 0.25
+done
+if (( cp_ok != 1 )); then
+    echo "    FAIL: cp into mount did not complete after 8 EAGAIN retries" >&2
+    cat "$test_root/cp.err" >&2
+    exit 1
+fi
+gc_size=$(stat -c %s "$gc_target" 2>/dev/null || echo 0)
+test "$gc_size" = "2097152"
+cmp "$test_root/gc.expected" "$gc_target"
+rm -f "$gc_target"
 fusermount3 -u "$mount_dir"
 wait "$mount_pid" 2>/dev/null || true
 mount_pid=""
