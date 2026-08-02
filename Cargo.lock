@@ -825,6 +825,7 @@ dependencies = [
  "fluxfs-meta",
  "fluxfs-types",
  "fluxfs-ufs",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -868,9 +869,11 @@ dependencies = [
  "fluxfs-chunk",
  "fluxfs-meta",
  "fluxfs-types",
+ "fluxfs-ufs",
  "serde",
  "tempfile",
  "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]

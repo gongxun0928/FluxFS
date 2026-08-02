@@ -79,6 +79,9 @@ async fn main() -> Result<()> {
             println!(
                 "  mount ephemeral: fluxfs mount --no-ufs --data-dir DIR --mountpoint MNT"
             );
+            println!(
+                "  mount ufs: fluxfs mount --ufs s3://bucket[/prefix]|file:///path --data-dir DIR --mountpoint MNT"
+            );
             println!("  ufs test bed: bash scripts/dev-minio.sh && cargo run -p fluxfs -- ufs-check");
         }
         Cmd::Smoke { data_dir } => {
@@ -93,11 +96,10 @@ async fn main() -> Result<()> {
             chunk_workers,
         } => {
             match (no_ufs, ufs.as_deref()) {
-                (true, None) => run_mount(data_dir, mountpoint, meta_addr, chunk_workers)?,
+                (true, None) => run_mount(data_dir, mountpoint, meta_addr, chunk_workers, None)?,
                 (false, Some(uri)) => {
-                    bail!(
-                        "UFS-backed mount (`--ufs {uri}`) not wired yet; OpenDAL path is live via `fluxfs ufs-check`. External FUSE vertical is next."
-                    );
+                    let ufs = open_ufs_uri(uri).context("open --ufs")?;
+                    run_mount(data_dir, mountpoint, meta_addr, chunk_workers, Some(ufs))?;
                 }
                 (true, Some(_)) => bail!("pass either --no-ufs or --ufs, not both"),
                 (false, None) => {
@@ -141,11 +143,32 @@ async fn run_ufs_check(key: &str) -> Result<()> {
     let joined: Vec<u8> = ranges.into_iter().flatten().collect();
     assert_eq!(joined, payload);
     let listed = ufs.list("").await.context("ufs list")?;
+
+    // External lazy namespace path (same stack as `--ufs` mount, without FUSE).
+    let tmp = tempfile::tempdir().context("tempdir")?;
+    let meta = HeedMetaStore::open(tmp.path().join("meta")).context("meta")?;
+    let chunks = DiskChunkStore::open(tmp.path().join("chunks")).context("chunks")?;
+    let client = FluxClient::new(meta, chunks)
+        .with_ufs(Ufs::s3(&opts).context("ufs for client")?)
+        .context("attach ufs")?;
+    let imported = client.lookup(ROOT_INODE, key).context("lazy lookup")?;
+    assert_eq!(
+        imported.locality,
+        fluxfs_types::LocalityLabel::External,
+        "expected External locality"
+    );
+    let got = client.read_all(imported.id).context("external read")?;
+    assert_eq!(got, payload);
+
     println!("ufs-check ok");
     println!("  endpoint={}", opts.endpoint);
     println!("  bucket={}", opts.bucket);
     println!("  key={} size={} etag={:?}", written.key, written.size, written.etag);
     println!("  list_entries={}", listed.len());
+    println!(
+        "  external_inode={} locality={:?}",
+        imported.id, imported.locality
+    );
     Ok(())
 }
 
@@ -185,11 +208,35 @@ async fn run_smoke(data_dir: PathBuf) -> Result<()> {
     Ok(())
 }
 
+fn open_ufs_uri(uri: &str) -> Result<Ufs> {
+    if let Some(path) = uri.strip_prefix("file://") {
+        return Ufs::local(path).map_err(Into::into);
+    }
+    if let Some(rest) = uri.strip_prefix("s3://") {
+        let rest = rest.trim_start_matches('/');
+        let (bucket, prefix) = match rest.split_once('/') {
+            Some((b, p)) => (b.to_string(), p.trim_matches('/').to_string()),
+            None => (rest.to_string(), String::new()),
+        };
+        if bucket.is_empty() {
+            bail!("s3 URI missing bucket: {uri}");
+        }
+        let mut opts = S3Options::from_env().context("load FLUXFS_UFS_* for s3:// mount")?;
+        opts.bucket = bucket;
+        if !prefix.is_empty() {
+            opts.root = Some(prefix);
+        }
+        return Ufs::s3(&opts).map_err(Into::into);
+    }
+    bail!("unsupported --ufs URI (want file:///path or s3://bucket[/prefix]): {uri}")
+}
+
 fn run_mount(
     data_dir: PathBuf,
     mountpoint: PathBuf,
     meta_addr: Option<String>,
     chunk_workers: Vec<String>,
+    ufs: Option<Ufs>,
 ) -> Result<()> {
     if !fluxfs_fuse::mount_supported() {
         bail!("FUSE mount only supported on Linux in this build");
@@ -202,7 +249,7 @@ fn run_mount(
             data_dir.join("chunks/worker-1"),
         )
         .context("open local RF=2 chunks")?;
-        return mount_with_chunks(data_dir, mountpoint, meta_addr, chunks, "local RF=2");
+        return mount_with_chunks(data_dir, mountpoint, meta_addr, chunks, "local RF=2", ufs);
     }
     if chunk_workers.len() != 3 {
         bail!(
@@ -221,7 +268,7 @@ fn run_mount(
     chunks
         .repair()
         .context("repair remote RF=2 chunks before mount")?;
-    mount_with_chunks(data_dir, mountpoint, meta_addr, chunks, "remote RF=2")
+    mount_with_chunks(data_dir, mountpoint, meta_addr, chunks, "remote RF=2", ufs)
 }
 
 fn mount_with_chunks<C: ChunkStore + 'static>(
@@ -230,33 +277,60 @@ fn mount_with_chunks<C: ChunkStore + 'static>(
     meta_addr: Option<String>,
     chunks: C,
     chunk_mode: &str,
+    ufs: Option<Ufs>,
 ) -> Result<()> {
+    let mode = if ufs.is_some() {
+        "UFS External (read-only)"
+    } else {
+        "Ephemeral"
+    };
     if let Some(addr) = meta_addr {
         let meta = RemoteMetaStore::connect(&addr).context("connect meta")?;
         // Touch root to fail fast if MetaMaster is down.
         meta.get_inode(ROOT_INODE).context("meta get root")?;
-        let client = Arc::new(FluxClient::new(meta, chunks));
+        let client = build_client(meta, chunks, ufs)?;
         println!(
-            "mounting Ephemeral FluxFS ({chunk_mode}, remote meta={addr}) data_dir={} mountpoint={}",
+            "mounting {mode} FluxFS ({chunk_mode}, remote meta={addr}) data_dir={} mountpoint={}",
             data_dir.display(),
             mountpoint.display()
         );
         fluxfs_fuse::mount_ephemeral(client, &mountpoint).context("fuse mount")?;
     } else {
         let meta = HeedMetaStore::open(data_dir.join("meta")).context("open meta")?;
-        let client = Arc::new(FluxClient::new(meta, chunks));
+        let client = build_client(meta, chunks, ufs)?;
         println!(
-            "mounting Ephemeral FluxFS ({chunk_mode}) data_dir={} mountpoint={}",
+            "mounting {mode} FluxFS ({chunk_mode}) data_dir={} mountpoint={}",
             data_dir.display(),
             mountpoint.display()
         );
-        println!(
-            "basic check: echo hi > {0}/hi.txt && cat {0}/hi.txt",
-            mountpoint.display()
-        );
+        if client.has_ufs() {
+            println!(
+                "basic check: ls {0} && cat {0}/<ufs-object>",
+                mountpoint.display()
+            );
+        } else {
+            println!(
+                "basic check: echo hi > {0}/hi.txt && cat {0}/hi.txt",
+                mountpoint.display()
+            );
+        }
         fluxfs_fuse::mount_ephemeral(client, &mountpoint).context("fuse mount")?;
     }
     Ok(())
+}
+
+fn build_client<M: MetaStore + 'static, C: ChunkStore + 'static>(
+    meta: M,
+    chunks: C,
+    ufs: Option<Ufs>,
+) -> Result<Arc<FluxClient<M, C>>> {
+    let client = FluxClient::new(meta, chunks);
+    let client = if let Some(ufs) = ufs {
+        client.with_ufs(ufs).context("attach UFS")?
+    } else {
+        client
+    };
+    Ok(Arc::new(client))
 }
 
 fn run_meta_ping(addr: &str) -> Result<()> {

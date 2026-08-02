@@ -8,6 +8,10 @@ use futures::future::try_join_all;
 use opendal::{services, EntryMode, Operator};
 use std::path::Path;
 
+mod read_path;
+
+pub use read_path::{ReadPathConfig, ReadPathStats, UfsReadPath};
+
 /// Connection parameters for S3-compatible UFS (AWS S3, MinIO, …).
 #[derive(Debug, Clone)]
 pub struct S3Options {
@@ -29,7 +33,9 @@ impl S3Options {
             region: std::env::var("FLUXFS_UFS_REGION").unwrap_or_else(|_| "us-east-1".into()),
             access_key: env_req("FLUXFS_UFS_ACCESS_KEY")?,
             secret_key: env_req("FLUXFS_UFS_SECRET_KEY")?,
-            root: std::env::var("FLUXFS_UFS_ROOT").ok().filter(|s| !s.is_empty()),
+            root: std::env::var("FLUXFS_UFS_ROOT")
+                .ok()
+                .filter(|s| !s.is_empty()),
         })
     }
 }
@@ -42,6 +48,7 @@ fn env_req(key: &str) -> Result<String> {
     })
 }
 
+#[derive(Clone)]
 pub struct Ufs {
     op: Operator,
     /// Logical prefix inside the operator root.
@@ -68,6 +75,13 @@ pub enum UfsEntryMode {
 pub struct RangeReq {
     pub offset: u64,
     pub len: u64,
+}
+
+/// Result of [`Ufs::probe`] — distinguishes files from directory prefixes.
+#[derive(Debug, Clone)]
+pub enum UfsProbe {
+    File(UfsObject),
+    Dir,
 }
 
 impl Ufs {
@@ -121,27 +135,52 @@ impl Ufs {
     }
 
     pub async fn head(&self, rel: &str) -> Result<UfsObject> {
+        match self.probe(rel).await? {
+            UfsProbe::File(obj) => Ok(obj),
+            UfsProbe::Dir => Err(FluxError::Ufs(format!("path is a directory: {rel}"))),
+        }
+    }
+
+    /// Stat a path and classify it as file or directory.
+    pub async fn probe(&self, rel: &str) -> Result<UfsProbe> {
         let key = self.key(rel);
         let meta = self.op.stat(&key).await.map_err(map_opendal)?;
-        Ok(UfsObject {
-            key,
-            size: meta.content_length(),
-            etag: meta.etag().map(|s| s.to_string()),
-            mtime_ms: meta
-                .last_modified()
-                .map(|t| t.into_inner().as_millisecond()),
-        })
+        match meta.mode() {
+            EntryMode::DIR => Ok(UfsProbe::Dir),
+            EntryMode::FILE => Ok(UfsProbe::File(UfsObject {
+                key,
+                size: meta.content_length(),
+                etag: meta.etag().map(|s| s.to_string()),
+                mtime_ms: meta
+                    .last_modified()
+                    .map(|t| t.into_inner().as_millisecond()),
+            })),
+            _ => Err(FluxError::Ufs(format!(
+                "unsupported UFS entry mode at {rel}"
+            ))),
+        }
     }
 
     pub async fn read_range(&self, rel: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
+        self.read_range_pinned(rel, offset, len, None).await
+    }
+
+    /// Range GET pinned to an object ETag when the backend supports If-Match.
+    pub async fn read_range_pinned(
+        &self,
+        rel: &str,
+        offset: u64,
+        len: u64,
+        etag: Option<&str>,
+    ) -> Result<Vec<u8>> {
         let key = self.key(rel);
         let end = offset.saturating_add(len);
-        let buf = self
-            .op
-            .read_with(&key)
-            .range(offset..end)
-            .await
-            .map_err(map_opendal)?;
+        let read = self.op.read_with(&key).range(offset..end);
+        let buf = match etag {
+            Some(etag) => read.if_match(etag).await,
+            None => read.await,
+        }
+        .map_err(map_opendal)?;
         Ok(buf.to_vec())
     }
 
