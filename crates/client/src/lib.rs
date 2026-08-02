@@ -4,8 +4,8 @@ use fluxfs_chunk::ChunkStore;
 use fluxfs_meta::MetaStore;
 use fluxfs_types::{
     BackingMode, ChunkId, DataGen, DataState, Extent, FileType, FluxError, Inode, InodeId,
-    LocalityFields, LocalityLabel, Manifest, OpState, Origin, Result, UfsObject, UfsVersion,
-    CHUNK_SIZE, DIRTY_WRITE_CAP_BYTES, ROOT_INODE,
+    LocalityFields, LocalityLabel, Manifest, OpState, Origin, RequestOpId, Result, UfsObject,
+    UfsVersion, CHUNK_SIZE, DIRTY_WRITE_CAP_BYTES, ROOT_INODE,
 };
 use fluxfs_ufs::{ReadPathConfig, ReadPathStats, Ufs, UfsEntryMode, UfsProbe, UfsReadPath};
 use std::collections::HashMap;
@@ -234,8 +234,13 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         inode.generation = inode.generation.saturating_add(1);
         inode.mtime_ms = now;
         inode.ctime_ms = now;
-        self.meta
-            .commit_inode_manifest(inode.generation.saturating_sub(1), &inode, &manifest)?;
+        let op_id = RequestOpId::new();
+        self.meta.commit_inode_manifest_with_id(
+            op_id,
+            inode.generation.saturating_sub(1),
+            &inode,
+            &manifest,
+        )?;
         Ok(data.len() as u32)
     }
 
@@ -319,8 +324,13 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         );
         inode.mtime_ms = now;
         inode.ctime_ms = now;
-        self.meta
-            .commit_inode_manifest(expected_generation, inode, &manifest)?;
+        let op_id = RequestOpId::new();
+        self.meta.commit_inode_manifest_with_id(
+            op_id,
+            expected_generation,
+            inode,
+            &manifest,
+        )?;
         Ok(data.len() as u32)
     }
 

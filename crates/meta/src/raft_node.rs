@@ -101,6 +101,7 @@ mod tests {
 
         let resp = raft
             .client_write(MetaRaftRequest::Create {
+                request_id: None,
                 parent: ROOT_INODE,
                 name: "via-raft.txt".into(),
                 file_type: FileType::Regular,
@@ -122,6 +123,7 @@ mod tests {
 
         let duplicate = raft
             .client_write(MetaRaftRequest::Create {
+                request_id: None,
                 parent: ROOT_INODE,
                 name: "via-raft.txt".into(),
                 file_type: FileType::Regular,
@@ -149,6 +151,7 @@ mod tests {
                 .await
                 .expect("start raft");
             raft.client_write(MetaRaftRequest::Create {
+                request_id: None,
                 parent: ROOT_INODE,
                 name: "persist.txt".into(),
                 file_type: FileType::Regular,
@@ -175,6 +178,7 @@ mod tests {
 
         let resp = raft
             .client_write(MetaRaftRequest::Create {
+                request_id: None,
                 parent: ROOT_INODE,
                 name: "after-restart.txt".into(),
                 file_type: FileType::Regular,
@@ -191,6 +195,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_request_id_does_not_double_create() {
+        use fluxfs_types::RequestOpId;
+
+        let dir = tempdir().unwrap();
+        let store = Arc::new(HeedMetaStore::open(dir.path().join("meta")).unwrap());
+        let raft = start_single_voter(store.clone(), dir.path().join("raft"), "127.0.0.1:0")
+            .await
+            .expect("start raft");
+
+        let op_id = RequestOpId::new();
+        let req = MetaRaftRequest::Create {
+            request_id: Some(op_id.clone()),
+            parent: ROOT_INODE,
+            name: "once.txt".into(),
+            file_type: FileType::Regular,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let first = raft
+            .client_write(req.clone())
+            .await
+            .expect("first write")
+            .data;
+        let second = raft
+            .client_write(req)
+            .await
+            .expect("retry write")
+            .data;
+        let MetaRaftResponse::Inode(a) = first else {
+            panic!("expected inode");
+        };
+        let MetaRaftResponse::Inode(b) = second else {
+            panic!("expected replay inode");
+        };
+        assert_eq!(a.id, b.id);
+        // Only one dentry — retry must not allocate a second inode name collision.
+        let entries = store.readdir(ROOT_INODE).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "once.txt");
+        assert_eq!(entries[0].child, a.id);
+    }
+
+    #[tokio::test]
     async fn commit_inode_manifest_via_raft_cas() {
         use fluxfs_types::{DataGen, Manifest};
 
@@ -202,6 +250,7 @@ mod tests {
 
         let created = match raft
             .client_write(MetaRaftRequest::Create {
+                request_id: None,
                 parent: ROOT_INODE,
                 name: "cas.bin".into(),
                 file_type: FileType::Regular,
@@ -230,6 +279,7 @@ mod tests {
         };
         let committed = match raft
             .client_write(MetaRaftRequest::CommitInodeManifest {
+                request_id: None,
                 expected_generation: base_gen,
                 inode: Box::new(next.clone()),
                 manifest: Box::new(manifest.clone()),
@@ -246,6 +296,7 @@ mod tests {
 
         let cas_fail = raft
             .client_write(MetaRaftRequest::CommitInodeManifest {
+                request_id: None,
                 expected_generation: base_gen,
                 inode: Box::new(next),
                 manifest: Box::new(manifest),
@@ -273,6 +324,7 @@ mod tests {
             .await
             .expect("start raft");
         raft.client_write(MetaRaftRequest::Create {
+                request_id: None,
             parent: ROOT_INODE,
             name: "snap.txt".into(),
             file_type: FileType::Regular,

@@ -11,7 +11,8 @@ use fluxfs_proto::meta_codec::{
 };
 use fluxfs_proto::MetaServiceClient;
 use fluxfs_types::{
-    Dentry, FileType, FluxError, Inode, InodeId, Manifest, ManifestId, Result, ROOT_INODE,
+    Dentry, FileType, FluxError, Inode, InodeId, Manifest, ManifestId, RequestOpId, Result,
+    ROOT_INODE,
 };
 use std::future::Future;
 use std::sync::Mutex;
@@ -121,6 +122,7 @@ impl MetaStore for RemoteMetaStore {
                     mode,
                     uid,
                     gid,
+                    request_id: RequestOpId::new().0,
                 })
                 .await
             })
@@ -156,8 +158,9 @@ impl MetaStore for RemoteMetaStore {
         Ok(ManifestId(resp.manifest_id))
     }
 
-    fn commit_inode_manifest(
+    fn commit_inode_manifest_with_id(
         &self,
+        op_id: RequestOpId,
         expected_generation: u64,
         inode: &Inode,
         manifest: &Manifest,
@@ -171,6 +174,7 @@ impl MetaStore for RemoteMetaStore {
                     expected_generation,
                     inode_json,
                     manifest_json,
+                    request_id: op_id.0,
                 })
                 .await
             })

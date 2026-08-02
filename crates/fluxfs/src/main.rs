@@ -2,7 +2,9 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use fluxfs_chunk::{ChunkStore, DiskChunkStore, RemoteReplicatedChunkStore, ReplicatedChunkStore};
 use fluxfs_client::FluxClient;
-use fluxfs_meta::{HeedMetaStore, MetaStore, RemoteMetaStore};
+use fluxfs_meta::{
+    start_single_voter, HeedMetaStore, MetaStore, RaftMetaStore, RemoteMetaStore,
+};
 use fluxfs_types::{FileType, ROOT_INODE};
 use fluxfs_ufs::{RangeReq, S3Options, Ufs};
 use std::path::PathBuf;
@@ -294,10 +296,23 @@ fn mount_with_chunks<C: ChunkStore + 'static>(
         );
         fluxfs_fuse::mount_ephemeral(client, &mountpoint).context("fuse mount")?;
     } else {
-        let meta = HeedMetaStore::open(data_dir.join("meta")).context("open meta")?;
+        // Co-located mount: embed single-voter Raft so mutations share the
+        // production write path (request-id ledger + SM apply), not direct Heed.
+        let meta_path = data_dir.join("meta");
+        let raft_dir = data_dir.join("raft");
+        let store = Arc::new(HeedMetaStore::open(&meta_path).context("open meta")?);
+        let rt = tokio::runtime::Runtime::new().context("tokio runtime")?;
+        let raft = rt
+            .block_on(start_single_voter(
+                store.clone(),
+                &raft_dir,
+                "127.0.0.1:0",
+            ))
+            .context("start embedded openraft")?;
+        let meta = RaftMetaStore::new_owned(store, raft, rt);
         let client = build_client(meta, chunks, ufs)?;
         println!(
-            "mounting {mode} FluxFS ({chunk_mode}) data_dir={} mountpoint={}",
+            "mounting {mode} FluxFS ({chunk_mode}, embedded raft) data_dir={} mountpoint={}",
             data_dir.display(),
             mountpoint.display()
         );

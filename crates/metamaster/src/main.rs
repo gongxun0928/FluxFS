@@ -15,7 +15,7 @@ use fluxfs_proto::meta_codec::{
     file_type_from_wire, status_from_flux,
 };
 use fluxfs_proto::{MetaService, MetaServiceServer};
-use fluxfs_types::ManifestId;
+use fluxfs_types::{ManifestId, RequestOpId};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -120,8 +120,14 @@ impl MetaService for MetaSvc {
     ) -> Result<Response<CreateResponse>, Status> {
         let r = req.into_inner();
         let ft = file_type_from_wire(r.file_type).map_err(status_from_flux)?;
+        let request_id = if r.request_id.is_empty() {
+            Some(RequestOpId::new())
+        } else {
+            Some(RequestOpId(r.request_id))
+        };
         let resp = self
             .write(MetaRaftRequest::Create {
+                request_id,
                 parent: r.parent,
                 name: r.name,
                 file_type: ft,
@@ -154,6 +160,7 @@ impl MetaService for MetaSvc {
         let inode = decode_inode(&req.into_inner().inode_json).map_err(status_from_flux)?;
         let resp = self
             .write(MetaRaftRequest::PutInode {
+                request_id: Some(RequestOpId::new()),
                 inode: Box::new(inode),
             })
             .await?;
@@ -169,6 +176,7 @@ impl MetaService for MetaSvc {
             decode_manifest(&req.into_inner().manifest_json).map_err(status_from_flux)?;
         let resp = self
             .write(MetaRaftRequest::PutManifest {
+                request_id: Some(RequestOpId::new()),
                 manifest: Box::new(manifest),
             })
             .await?;
@@ -183,8 +191,14 @@ impl MetaService for MetaSvc {
         let r = req.into_inner();
         let inode = decode_inode(&r.inode_json).map_err(status_from_flux)?;
         let manifest = decode_manifest(&r.manifest_json).map_err(status_from_flux)?;
+        let request_id = if r.request_id.is_empty() {
+            Some(RequestOpId::new())
+        } else {
+            Some(RequestOpId(r.request_id))
+        };
         let resp = self
             .write(MetaRaftRequest::CommitInodeManifest {
+                request_id,
                 expected_generation: r.expected_generation,
                 inode: Box::new(inode),
                 manifest: Box::new(manifest),
@@ -219,6 +233,7 @@ impl MetaService for MetaSvc {
         let r = req.into_inner();
         let resp = self
             .write(MetaRaftRequest::Unlink {
+                request_id: Some(RequestOpId::new()),
                 parent: r.parent,
                 name: r.name,
             })

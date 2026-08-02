@@ -17,6 +17,7 @@ type InodeDb = Database<Bytes, Bytes>;
 type DentryDb = Database<Str, Bytes>;
 type MetaDb = Database<Str, Bytes>;
 type ManifestDb = Database<Bytes, Bytes>;
+type RequestDb = Database<Str, Bytes>;
 
 const KEY_SM_LAST_APPLIED: &str = "raft_sm_last_applied";
 const KEY_SM_LAST_MEMBERSHIP: &str = "raft_sm_last_membership";
@@ -30,6 +31,9 @@ pub struct MetaSnapshotData {
     pub next_inode: u64,
     pub next_manifest: u64,
     pub sm: SmAppliedMeta,
+    /// Retained Meta mutation results keyed by [`fluxfs_types::RequestOpId`].
+    #[serde(default)]
+    pub client_requests: Vec<(String, MetaRaftResponse)>,
 }
 
 pub struct HeedMetaStore {
@@ -38,6 +42,8 @@ pub struct HeedMetaStore {
     dentries: DentryDb,
     meta: MetaDb,
     manifests: ManifestDb,
+    /// Durable request-id → apply result ledger for client retry dedup.
+    client_requests: RequestDb,
     /// Serialize writers; LMDB allows one write txn at a time anyway.
     write_lock: Mutex<()>,
 }
@@ -67,6 +73,9 @@ impl HeedMetaStore {
             .map_err(|e| FluxError::Meta(e.to_string()))?;
         let manifests: ManifestDb = env
             .create_database(&mut wtxn, Some("manifests"))
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        let client_requests: RequestDb = env
+            .create_database(&mut wtxn, Some("client_requests"))
             .map_err(|e| FluxError::Meta(e.to_string()))?;
 
         if inodes
@@ -125,6 +134,7 @@ impl HeedMetaStore {
             dentries,
             meta,
             manifests,
+            client_requests,
             write_lock: Mutex::new(()),
         })
     }
@@ -189,6 +199,15 @@ impl HeedMetaStore {
             .write_txn()
             .map_err(|e| FluxError::Meta(e.to_string()))?;
 
+        if let Some(op_id) = req.request_id() {
+            if let Some(cached) = self.get_client_request_in_txn(&wtxn, op_id.as_str())? {
+                // Still advance SM markers so the Raft log entry is durable.
+                self.put_sm_meta_raw(&mut wtxn, sm)?;
+                wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
+                return Ok(cached);
+            }
+        }
+
         let resp = match req {
             MetaRaftRequest::Create {
                 parent,
@@ -197,19 +216,20 @@ impl HeedMetaStore {
                 mode,
                 uid,
                 gid,
+                ..
             } => {
                 match self.create_in_txn(&mut wtxn, *parent, name, *file_type, *mode, *uid, *gid) {
                     Ok(inode) => MetaRaftResponse::Inode(Box::new(inode)),
                     Err(e) => MetaRaftResponse::Err(e),
                 }
             }
-            MetaRaftRequest::PutInode { inode } => {
+            MetaRaftRequest::PutInode { inode, .. } => {
                 match put_inode_raw(&self.inodes, &mut wtxn, inode.as_ref()) {
                     Ok(()) => MetaRaftResponse::Empty,
                     Err(e) => MetaRaftResponse::Err(e),
                 }
             }
-            MetaRaftRequest::PutManifest { manifest } => {
+            MetaRaftRequest::PutManifest { manifest, .. } => {
                 match self.put_manifest_in_txn(&mut wtxn, manifest.as_ref()) {
                     Ok(id) => MetaRaftResponse::ManifestId(id.0),
                     Err(e) => MetaRaftResponse::Err(e),
@@ -219,6 +239,7 @@ impl HeedMetaStore {
                 expected_generation,
                 inode,
                 manifest,
+                ..
             } => {
                 match self.commit_inode_manifest_in_txn(
                     &mut wtxn,
@@ -230,7 +251,7 @@ impl HeedMetaStore {
                     Err(e) => MetaRaftResponse::Err(e),
                 }
             }
-            MetaRaftRequest::Unlink { parent, name } => {
+            MetaRaftRequest::Unlink { parent, name, .. } => {
                 match self.unlink_in_txn(&mut wtxn, *parent, name) {
                     Ok(()) => MetaRaftResponse::Empty,
                     Err(e) => MetaRaftResponse::Err(e),
@@ -238,10 +259,44 @@ impl HeedMetaStore {
             }
         };
 
+        if let Some(op_id) = req.request_id() {
+            // Retain successes and typed application errors so retries are stable.
+            self.put_client_request_in_txn(&mut wtxn, op_id.as_str(), &resp)?;
+        }
+
         // Always advance applied markers with the mutation attempt (including typed Err).
         self.put_sm_meta_raw(&mut wtxn, sm)?;
         wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
         Ok(resp)
+    }
+
+    fn get_client_request_in_txn(
+        &self,
+        txn: &heed::RwTxn<'_>,
+        op_id: &str,
+    ) -> Result<Option<MetaRaftResponse>> {
+        let Some(bytes) = self
+            .client_requests
+            .get(txn, op_id)
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let resp = serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))?;
+        Ok(Some(resp))
+    }
+
+    fn put_client_request_in_txn(
+        &self,
+        txn: &mut heed::RwTxn<'_>,
+        op_id: &str,
+        resp: &MetaRaftResponse,
+    ) -> Result<()> {
+        let bytes = serde_json::to_vec(resp).map_err(|e| FluxError::Meta(e.to_string()))?;
+        self.client_requests
+            .put(txn, op_id, &bytes)
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        Ok(())
     }
 
     pub fn save_sm_meta_only(&self, sm: &SmAppliedMeta) -> Result<()> {
@@ -314,6 +369,17 @@ impl HeedMetaStore {
                 .map_err(|e| FluxError::Meta(e.to_string()))?
                 .ok_or_else(|| FluxError::Meta("missing next_manifest".into()))?,
         )?;
+        let mut client_requests = Vec::new();
+        let riter = self
+            .client_requests
+            .iter(&rtxn)
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        for item in riter {
+            let (k, v) = item.map_err(|e| FluxError::Meta(e.to_string()))?;
+            let resp: MetaRaftResponse =
+                serde_json::from_slice(v).map_err(|e| FluxError::Meta(e.to_string()))?;
+            client_requests.push((k.to_string(), resp));
+        }
         drop(rtxn);
         Ok(MetaSnapshotData {
             inodes,
@@ -322,6 +388,7 @@ impl HeedMetaStore {
             next_inode,
             next_manifest,
             sm: sm.clone(),
+            client_requests,
         })
     }
 
@@ -396,6 +463,23 @@ impl HeedMetaStore {
             self.manifests
                 .put(&mut wtxn, &inode_key(*id), &bytes)
                 .map_err(|e| FluxError::Meta(e.to_string()))?;
+        }
+        {
+            let keys: Vec<String> = self
+                .client_requests
+                .iter(&wtxn)
+                .map_err(|e| FluxError::Meta(e.to_string()))?
+                .map(|i| i.map(|(k, _)| k.to_string()))
+                .collect::<std::result::Result<_, _>>()
+                .map_err(|e| FluxError::Meta(e.to_string()))?;
+            for k in keys {
+                self.client_requests
+                    .delete(&mut wtxn, &k)
+                    .map_err(|e| FluxError::Meta(e.to_string()))?;
+            }
+        }
+        for (op_id, resp) in &snap.client_requests {
+            self.put_client_request_in_txn(&mut wtxn, op_id, resp)?;
         }
         self.meta
             .put(&mut wtxn, "next_inode", &u64_bytes(snap.next_inode))
@@ -796,8 +880,9 @@ impl MetaStore for HeedMetaStore {
         Ok(id)
     }
 
-    fn commit_inode_manifest(
+    fn commit_inode_manifest_with_id(
         &self,
+        op_id: fluxfs_types::RequestOpId,
         expected_generation: u64,
         inode: &Inode,
         manifest: &Manifest,
@@ -810,8 +895,36 @@ impl MetaStore for HeedMetaStore {
             .env
             .write_txn()
             .map_err(|e| FluxError::Meta(e.to_string()))?;
+        if let Some(cached) = self.get_client_request_in_txn(&wtxn, op_id.as_str())? {
+            return match cached {
+                MetaRaftResponse::Inode(inode) => Ok(*inode),
+                MetaRaftResponse::Err(err) => Err(err),
+                other => Err(FluxError::Meta(format!(
+                    "bad retained commit response: {other:?}"
+                ))),
+            };
+        }
         let next =
-            self.commit_inode_manifest_in_txn(&mut wtxn, expected_generation, inode, manifest)?;
+            match self.commit_inode_manifest_in_txn(&mut wtxn, expected_generation, inode, manifest)
+            {
+                Ok(inode) => {
+                    self.put_client_request_in_txn(
+                        &mut wtxn,
+                        op_id.as_str(),
+                        &MetaRaftResponse::Inode(Box::new(inode.clone())),
+                    )?;
+                    inode
+                }
+                Err(err) => {
+                    self.put_client_request_in_txn(
+                        &mut wtxn,
+                        op_id.as_str(),
+                        &MetaRaftResponse::Err(err.clone()),
+                    )?;
+                    wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
+                    return Err(err);
+                }
+            };
         wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
         Ok(next)
     }

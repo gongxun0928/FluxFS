@@ -38,6 +38,7 @@ message CreateRequest {
   uint32 mode = 4;
   uint32 uid = 5;
   uint32 gid = 6;
+  string request_id = 7;
 }
 message CreateResponse { bytes inode_json = 1; }
 
@@ -54,6 +55,8 @@ message CommitInodeManifestRequest {
   uint64 expected_generation = 1;
   bytes inode_json = 2;
   bytes manifest_json = 3;
+  // Client RequestOpId; empty means server allocates a fresh id (not retry-safe).
+  string request_id = 4;
 }
 message CommitInodeManifestResponse {
   bytes inode_json = 1;

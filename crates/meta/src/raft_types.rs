@@ -10,7 +10,7 @@ use openraft::StoredMembership;
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 
-use fluxfs_types::{FileType, FluxError, Inode, Manifest};
+use fluxfs_types::{FileType, FluxError, Inode, Manifest, RequestOpId};
 
 pub type NodeId = u64;
 
@@ -22,9 +22,14 @@ pub struct SmAppliedMeta {
 }
 
 /// Application request logged through Raft (write path only).
+///
+/// `request_id` is optional for forward-compatible replay of older log entries;
+/// new writers MUST set it so apply can retain/dedup results.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MetaRaftRequest {
     Create {
+        #[serde(default)]
+        request_id: Option<RequestOpId>,
         parent: u64,
         name: String,
         file_type: FileType,
@@ -33,22 +38,55 @@ pub enum MetaRaftRequest {
         gid: u32,
     },
     PutInode {
+        #[serde(default)]
+        request_id: Option<RequestOpId>,
         inode: Box<Inode>,
     },
     PutManifest {
+        #[serde(default)]
+        request_id: Option<RequestOpId>,
         manifest: Box<Manifest>,
     },
     /// Store `manifest`, CAS `inode.generation == expected_generation`, then
     /// publish the updated inode head in the same SM apply / heed write txn.
     CommitInodeManifest {
+        #[serde(default)]
+        request_id: Option<RequestOpId>,
         expected_generation: u64,
         inode: Box<Inode>,
         manifest: Box<Manifest>,
     },
     Unlink {
+        #[serde(default)]
+        request_id: Option<RequestOpId>,
         parent: u64,
         name: String,
     },
+}
+
+impl MetaRaftRequest {
+    pub fn request_id(&self) -> Option<&RequestOpId> {
+        match self {
+            Self::Create { request_id, .. }
+            | Self::PutInode { request_id, .. }
+            | Self::PutManifest { request_id, .. }
+            | Self::CommitInodeManifest { request_id, .. }
+            | Self::Unlink { request_id, .. } => request_id.as_ref(),
+        }
+    }
+
+    pub fn with_request_id(mut self, id: RequestOpId) -> Self {
+        match &mut self {
+            Self::Create { request_id, .. }
+            | Self::PutInode { request_id, .. }
+            | Self::PutManifest { request_id, .. }
+            | Self::CommitInodeManifest { request_id, .. }
+            | Self::Unlink { request_id, .. } => {
+                *request_id = Some(id);
+            }
+        }
+        self
+    }
 }
 
 /// Application response returned after apply.

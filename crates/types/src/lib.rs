@@ -11,6 +11,44 @@ use thiserror::Error;
 pub type InodeId = u64;
 pub type Generation = u64;
 
+/// Client-generated id for one logical Meta mutation.
+///
+/// Retries of the same logical op MUST reuse the same id so Raft apply can
+/// return the retained result instead of double-effecting `alloc_inode` /
+/// `unlink` / generation bumps.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RequestOpId(pub String);
+
+impl RequestOpId {
+    /// Fresh unique id (UUID v4). Call once per logical op; reuse on retry.
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4().to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for RequestOpId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for RequestOpId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Whether a mutation was freshly applied or replayed from the retention ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DedupOutcome {
+    Fresh,
+    Replay,
+}
+
 /// Per-inode data generation. `head_gen > ufs_gen` ⇒ Dirty.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,

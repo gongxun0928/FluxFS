@@ -1,4 +1,6 @@
-use fluxfs_types::{Dentry, FileType, Inode, InodeId, Manifest, ManifestId, Result, ROOT_INODE};
+use fluxfs_types::{
+    Dentry, FileType, Inode, InodeId, Manifest, ManifestId, RequestOpId, Result, ROOT_INODE,
+};
 
 /// Engine-agnostic metadata API frozen for W1.
 ///
@@ -39,6 +41,17 @@ pub trait MetaStore: Send + Sync {
     /// and leaves the previous head untouched.
     fn commit_inode_manifest(
         &self,
+        expected_generation: u64,
+        inode: &Inode,
+        manifest: &Manifest,
+    ) -> Result<Inode> {
+        self.commit_inode_manifest_with_id(RequestOpId::new(), expected_generation, inode, manifest)
+    }
+
+    /// Same as [`Self::commit_inode_manifest`] but with an explicit op id for retries.
+    fn commit_inode_manifest_with_id(
+        &self,
+        op_id: RequestOpId,
         expected_generation: u64,
         inode: &Inode,
         manifest: &Manifest,

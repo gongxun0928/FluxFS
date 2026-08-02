@@ -4,6 +4,7 @@
 
 mod heed_store;
 mod raft_log_store;
+mod raft_meta;
 mod raft_network;
 mod raft_node;
 mod raft_sm;
@@ -15,6 +16,7 @@ mod store;
 mod proptest_smoke;
 
 pub use heed_store::HeedMetaStore;
+pub use raft_meta::RaftMetaStore;
 pub use raft_node::{start_single_voter, SINGLE_VOTER_ID};
 pub use raft_types::{
     FluxRaft, FluxRaftTypeConfig, MetaRaftRequest, MetaRaftResponse, NodeId, SmAppliedMeta,
