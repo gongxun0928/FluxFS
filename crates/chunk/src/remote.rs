@@ -498,33 +498,23 @@ fn rpc_loop(
                         })
                 });
                 if let Ok(refreshed) = refreshed {
-                    let desired = refreshed
-                        .active_at(unix_time_millis())
-                        .map(|worker| worker.id)
-                        .collect::<BTreeSet<_>>();
-                    let current = clients.iter().map(|client| client.id).collect();
-                    let routing_changed = membership
-                        .as_ref()
-                        .is_none_or(|old| old.epoch != refreshed.epoch)
-                        || desired != current;
-                    if routing_changed {
-                        let next_clients = {
+                    let routing_rebuilt = apply_membership_refresh(
+                        &mut clients,
+                        &mut membership,
+                        refreshed,
+                        |refreshed| {
                             let _enter = runtime.enter();
                             worker_clients_from_membership(
-                                &refreshed,
+                                refreshed,
                                 tls_cfg.as_ref(),
                                 insecure_dev,
                             )
-                        };
-                        if let Ok(next_clients) = next_clients {
-                            clients = next_clients;
-                            last_healthy.clear();
-                            repair_cursor = None;
-                        }
+                        },
+                    );
+                    if routing_rebuilt {
+                        last_healthy.clear();
+                        repair_cursor = None;
                     }
-                    // Lease-only heartbeats extend liveness without forcing
-                    // channel rebuilds or topology-wide repair.
-                    membership = Some(refreshed);
                 }
             }
         }
@@ -537,6 +527,41 @@ fn rpc_loop(
             command,
         ));
     }
+}
+
+/// Commit a refreshed membership only when its matching channel set exists.
+/// Lease-only refreshes may update liveness in place; topology refreshes are
+/// atomic with client rebuild so placement never gets ahead of routing.
+fn apply_membership_refresh<F>(
+    clients: &mut Vec<WorkerRpcClient>,
+    membership: &mut Option<WorkerMembership>,
+    refreshed: WorkerMembership,
+    build_clients: F,
+) -> bool
+where
+    F: FnOnce(&WorkerMembership) -> Result<Vec<WorkerRpcClient>>,
+{
+    let desired = refreshed
+        .active_at(unix_time_millis())
+        .map(|worker| worker.id)
+        .collect::<BTreeSet<_>>();
+    let current = clients.iter().map(|client| client.id).collect();
+    let routing_changed = membership
+        .as_ref()
+        .is_none_or(|old| old.epoch != refreshed.epoch)
+        || desired != current;
+    if !routing_changed {
+        // Lease-only heartbeat: same topology and channels, fresher deadline.
+        *membership = Some(refreshed);
+        return false;
+    }
+    let Ok(next_clients) = build_clients(&refreshed) else {
+        // Keep the old membership paired with the old channel set.
+        return false;
+    };
+    *clients = next_clients;
+    *membership = Some(refreshed);
+    true
 }
 
 fn worker_clients_from_membership(
@@ -1188,6 +1213,23 @@ mod tests {
             assert!(REPAIR_PAGE_SIZE > 0);
             assert!(REPAIR_PAGE_SIZE < u32::MAX as usize);
         }
+    }
+
+    #[test]
+    fn failed_channel_rebuild_does_not_advance_membership() {
+        let old = WorkerMembership::default();
+        let refreshed = WorkerMembership {
+            epoch: 1,
+            workers: Vec::new(),
+        };
+        let mut membership = Some(old.clone());
+        let mut clients = Vec::new();
+        let rebuilt = apply_membership_refresh(&mut clients, &mut membership, refreshed, |_| {
+            Err(FluxError::InvalidArg("invalid refreshed endpoint".into()))
+        });
+        assert!(!rebuilt);
+        assert_eq!(membership, Some(old));
+        assert!(clients.is_empty());
     }
 
     #[test]
