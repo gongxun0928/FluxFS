@@ -823,6 +823,7 @@ dependencies = [
  "fluxfs-client",
  "fluxfs-fuse",
  "fluxfs-meta",
+ "fluxfs-tls",
  "fluxfs-types",
  "fluxfs-ufs",
  "tempfile",
@@ -837,6 +838,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "fluxfs-proto",
+ "fluxfs-tls",
  "fluxfs-types",
  "foyer",
  "heed",
@@ -858,6 +860,7 @@ dependencies = [
  "fluxfs-chunk",
  "fluxfs-metrics",
  "fluxfs-proto",
+ "fluxfs-tls",
  "fluxfs-types",
  "tokio",
  "tonic",
@@ -896,6 +899,7 @@ name = "fluxfs-meta"
 version = "0.1.0"
 dependencies = [
  "fluxfs-proto",
+ "fluxfs-tls",
  "fluxfs-types",
  "heed",
  "openraft",
@@ -918,6 +922,7 @@ dependencies = [
  "fluxfs-meta",
  "fluxfs-metrics",
  "fluxfs-proto",
+ "fluxfs-tls",
  "fluxfs-types",
  "serde_json",
  "tokio",

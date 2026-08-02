@@ -31,6 +31,14 @@ async fn load_pem(path: &Path) -> FluxResult<Vec<u8>> {
         .map_err(|e| FluxError::InvalidArg(format!("tls: read {}: {e}", path.display())))
 }
 
+/// Sync variant of [`load_pem`] for callers that build TLS config from a
+/// non-async context (e.g. the chunk-client constructor spawned from a
+/// sync CLI path).
+fn load_pem_blocking(path: &Path) -> FluxResult<Vec<u8>> {
+    std::fs::read(path)
+        .map_err(|e| FluxError::InvalidArg(format!("tls: read {}: {e}", path.display())))
+}
+
 /// Server-side TLS options. All paths required when [`Self::enabled`] is true.
 ///
 /// `ca_cert` is the trust anchor for verifying client certs (mTLS). Server
@@ -112,6 +120,33 @@ impl ServerTlsOptions {
         let ca_pem = load_pem(ca_path).await?;
         let cert_pem = load_pem(cert_path).await?;
         let key_pem = load_pem(key_path).await?;
+        let mut cfg = ServerTlsConfig::new()
+            .identity(Identity::from_pem(cert_pem, key_pem))
+            .client_ca_root(Certificate::from_pem(ca_pem));
+        if self.allow_no_client_cert {
+            cfg = cfg.client_auth_optional(true);
+        }
+        Ok(Some(cfg))
+    }
+
+    /// Sync variant of [`Self::build_config`] for callers that build TLS
+    /// config from a non-async context.
+    pub fn build_config_blocking(&self) -> FluxResult<Option<ServerTlsConfig>> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let ca_path = self.ca_cert.as_ref().expect("enabled implies ca_cert");
+        let cert_path = self
+            .server_cert
+            .as_ref()
+            .expect("enabled implies server_cert");
+        let key_path = self
+            .server_key
+            .as_ref()
+            .expect("enabled implies server_key");
+        let ca_pem = load_pem_blocking(ca_path)?;
+        let cert_pem = load_pem_blocking(cert_path)?;
+        let key_pem = load_pem_blocking(key_path)?;
         let mut cfg = ServerTlsConfig::new()
             .identity(Identity::from_pem(cert_pem, key_pem))
             .client_ca_root(Certificate::from_pem(ca_pem));
@@ -204,6 +239,29 @@ impl ClientTlsOptions {
                 .expect("client_cert implies client_key");
             let cert_pem = load_pem(cc).await?;
             let key_pem = load_pem(ck).await?;
+            cfg = cfg.identity(Identity::from_pem(cert_pem, key_pem));
+        }
+        if let Some(d) = &self.domain {
+            cfg = cfg.domain_name(d.clone());
+        }
+        Ok(Some(cfg))
+    }
+
+    /// Sync variant of [`Self::build_config`].
+    pub fn build_config_blocking(&self) -> FluxResult<Option<ClientTlsConfig>> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let ca_path = self.ca_cert.as_ref().expect("enabled implies ca_cert");
+        let ca_pem = load_pem_blocking(ca_path)?;
+        let mut cfg = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_pem));
+        if let Some(cc) = &self.client_cert {
+            let ck = self
+                .client_key
+                .as_ref()
+                .expect("client_cert implies client_key");
+            let cert_pem = load_pem_blocking(cc)?;
+            let key_pem = load_pem_blocking(ck)?;
             cfg = cfg.identity(Identity::from_pem(cert_pem, key_pem));
         }
         if let Some(d) = &self.domain {

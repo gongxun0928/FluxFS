@@ -8,6 +8,7 @@ description = "MetaMaster: MetaStore trait, heed backend, remote client, openraf
 [dependencies]
 fluxfs-types = { workspace = true }
 fluxfs-proto = { workspace = true }
+fluxfs-tls = { workspace = true }
 heed = { workspace = true }
 openraft = { workspace = true }
 serde = { workspace = true }

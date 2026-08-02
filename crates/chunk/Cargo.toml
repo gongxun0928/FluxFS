@@ -8,6 +8,7 @@ description = "ChunkWorker: ChunkStore trait + disk/foyer backends"
 [dependencies]
 fluxfs-types = { workspace = true }
 fluxfs-proto = { workspace = true }
+fluxfs-tls = { workspace = true }
 blake3 = { workspace = true }
 foyer = { workspace = true }
 heed = { workspace = true }

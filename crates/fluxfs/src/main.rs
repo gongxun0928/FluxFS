@@ -18,6 +18,42 @@ struct Cli {
     cmd: Cmd,
 }
 
+/// Client-side TLS args shared by subcommands that dial Meta/Worker (task #30 C1).
+#[derive(Parser, Debug, Clone, Default)]
+struct TlsClientArgs {
+    /// Cluster CA cert (PEM) for verifying server identity. Required when
+    /// --tls-client-cert is set (mTLS); production default.
+    #[arg(long)]
+    tls_ca_cert: Option<PathBuf>,
+    /// Client identity cert (PEM). Setting this enables TLS + mTLS.
+    #[arg(long)]
+    tls_client_cert: Option<PathBuf>,
+    /// Client identity key (PEM). Paired with --tls-client-cert.
+    #[arg(long)]
+    tls_client_key: Option<PathBuf>,
+    /// Explicit plaintext opt-in (tests only). Production MUST pass TLS flags.
+    #[arg(long, default_value_t = false)]
+    allow_insecure_dev: bool,
+}
+
+impl TlsClientArgs {
+    /// Build a `ClientTlsOptions` from the parsed flags (None when TLS is
+    /// disabled, in which case the caller must have opted into plaintext).
+    fn build(
+        &self,
+        domain: Option<String>,
+    ) -> anyhow::Result<Option<fluxfs_tls::ClientTlsOptions>> {
+        let opts = fluxfs_tls::ClientTlsOptions::from_cli(
+            self.tls_ca_cert.clone(),
+            self.tls_client_cert.clone(),
+            self.tls_client_key.clone(),
+            domain,
+        )
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        Ok(if opts.enabled { Some(opts) } else { None })
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Meta create/lookup + chunk put/get + local UFS HEAD smoke.
@@ -50,11 +86,15 @@ enum Cmd {
         /// Maximum chunk operations waiting in the remote client queue.
         #[arg(long, default_value_t = fluxfs_chunk::DEFAULT_MAX_PENDING_CHUNK_OPS)]
         chunk_max_pending: usize,
+        #[command(flatten)]
+        tls: TlsClientArgs,
     },
     /// Ping a remote MetaMaster (multi-process smoke).
     MetaPing {
         #[arg(long, default_value = "127.0.0.1:50051")]
         addr: String,
+        #[command(flatten)]
+        tls: TlsClientArgs,
     },
     /// OpenDAL/S3 smoke against MinIO (or any S3 endpoint via `FLUXFS_UFS_*`).
     UfsCheck {
@@ -76,6 +116,8 @@ enum Cmd {
         chunk_workers: Vec<String>,
         #[arg(long, default_value_t = fluxfs_chunk::DEFAULT_MAX_PENDING_CHUNK_OPS)]
         chunk_max_pending: usize,
+        #[command(flatten)]
+        tls: TlsClientArgs,
     },
     /// Compact a local Worker pack store (rewrite live chunks, drop hole segments).
     CompactChunks {
@@ -132,6 +174,7 @@ async fn main() -> Result<()> {
             meta_addr,
             chunk_workers,
             chunk_max_pending,
+            tls,
         } => match (no_ufs, ufs.as_deref()) {
             (true, None) => run_mount(
                 data_dir,
@@ -140,6 +183,7 @@ async fn main() -> Result<()> {
                 chunk_workers,
                 chunk_max_pending,
                 None,
+                tls,
             )?,
             (false, Some(uri)) => {
                 let ufs = open_ufs_uri(uri).context("open --ufs")?;
@@ -150,6 +194,7 @@ async fn main() -> Result<()> {
                     chunk_workers,
                     chunk_max_pending,
                     Some(ufs),
+                    tls,
                 )?;
             }
             (true, Some(_)) => bail!("pass either --no-ufs or --ufs, not both"),
@@ -157,8 +202,8 @@ async fn main() -> Result<()> {
                 bail!("mount requires --no-ufs (Ephemeral) or --ufs <uri> (UFS-backed)")
             }
         },
-        Cmd::MetaPing { addr } => {
-            run_meta_ping(&addr)?;
+        Cmd::MetaPing { addr, tls } => {
+            run_meta_ping(&addr, &tls)?;
         }
         Cmd::UfsCheck { key } => {
             run_ufs_check(&key).await?;
@@ -168,8 +213,9 @@ async fn main() -> Result<()> {
             meta_addr,
             chunk_workers,
             chunk_max_pending,
+            tls,
         } => {
-            run_orphan_gc_cmd(data_dir, meta_addr, chunk_workers, chunk_max_pending)?;
+            run_orphan_gc_cmd(data_dir, meta_addr, chunk_workers, chunk_max_pending, tls)?;
         }
     }
     Ok(())
@@ -296,6 +342,7 @@ fn run_mount(
     chunk_workers: Vec<String>,
     chunk_max_pending: usize,
     ufs: Option<Ufs>,
+    tls: TlsClientArgs,
 ) -> Result<()> {
     if !fluxfs_fuse::mount_supported() {
         bail!("FUSE mount only supported on Linux in this build");
@@ -308,7 +355,15 @@ fn run_mount(
             data_dir.join("chunks/worker-1"),
         )
         .context("open local RF=2 chunks")?;
-        return mount_with_chunks(data_dir, mountpoint, meta_addr, chunks, "local RF=2", ufs);
+        return mount_with_chunks(
+            data_dir,
+            mountpoint,
+            meta_addr,
+            chunks,
+            "local RF=2",
+            ufs,
+            tls,
+        );
     }
     if chunk_workers.len() != 3 {
         bail!(
@@ -316,9 +371,15 @@ fn run_mount(
             chunk_workers.len()
         );
     }
-    let chunks =
-        RemoteReplicatedChunkStore::new_with_max_pending(chunk_workers, 2, chunk_max_pending)
-            .context("configure remote RF=2 chunks")?;
+    let chunk_tls = tls.build(None)?;
+    let chunks = RemoteReplicatedChunkStore::new_with_max_pending_tls(
+        chunk_workers,
+        2,
+        chunk_max_pending,
+        chunk_tls,
+        tls.allow_insecure_dev,
+    )
+    .context("configure remote RF=2 chunks")?;
     let available = chunks
         .available_workers()
         .context("probe remote ChunkWorkers")?;
@@ -331,7 +392,15 @@ fn run_mount(
         "remote RF=2: background repair scrub page={} (non-blocking mount)",
         fluxfs_chunk::REPAIR_PAGE_SIZE
     );
-    mount_with_chunks(data_dir, mountpoint, meta_addr, chunks, "remote RF=2", ufs)
+    mount_with_chunks(
+        data_dir,
+        mountpoint,
+        meta_addr,
+        chunks,
+        "remote RF=2",
+        ufs,
+        tls,
+    )
 }
 
 fn mount_with_chunks<C: ChunkStore + 'static>(
@@ -341,6 +410,7 @@ fn mount_with_chunks<C: ChunkStore + 'static>(
     chunks: C,
     chunk_mode: &str,
     ufs: Option<Ufs>,
+    tls: TlsClientArgs,
 ) -> Result<()> {
     let mode = if ufs.is_some() {
         "UFS External/Dirty write-back"
@@ -348,7 +418,9 @@ fn mount_with_chunks<C: ChunkStore + 'static>(
         "Ephemeral"
     };
     if let Some(addr) = meta_addr {
-        let meta = RemoteMetaStore::connect(&addr).context("connect meta")?;
+        let meta_tls = tls.build(None)?;
+        let meta = RemoteMetaStore::connect_tls(&addr, meta_tls, tls.allow_insecure_dev)
+            .context("connect meta")?;
         // Touch root to fail fast if MetaMaster is down.
         meta.get_inode(ROOT_INODE).context("meta get root")?;
         let client = build_client(meta, chunks, ufs)?;
@@ -453,6 +525,7 @@ fn run_orphan_gc_cmd(
     meta_addr: Option<String>,
     chunk_workers: Vec<String>,
     chunk_max_pending: usize,
+    tls: TlsClientArgs,
 ) -> Result<()> {
     std::fs::create_dir_all(&data_dir)?;
     if chunk_workers.is_empty() {
@@ -461,7 +534,7 @@ fn run_orphan_gc_cmd(
             data_dir.join("chunks/worker-1"),
         )
         .context("open local RF=2 chunks")?;
-        run_orphan_gc_with_chunks(data_dir, meta_addr, chunks)
+        run_orphan_gc_with_chunks(data_dir, meta_addr, chunks, &tls)
     } else {
         if chunk_workers.len() != 3 {
             bail!(
@@ -469,10 +542,16 @@ fn run_orphan_gc_cmd(
                 chunk_workers.len()
             );
         }
-        let chunks =
-            RemoteReplicatedChunkStore::new_with_max_pending(chunk_workers, 2, chunk_max_pending)
-                .context("configure remote RF=2 chunks")?;
-        run_orphan_gc_with_chunks(data_dir, meta_addr, chunks)
+        let chunk_tls = tls.build(None)?;
+        let chunks = RemoteReplicatedChunkStore::new_with_max_pending_tls(
+            chunk_workers,
+            2,
+            chunk_max_pending,
+            chunk_tls,
+            tls.allow_insecure_dev,
+        )
+        .context("configure remote RF=2 chunks")?;
+        run_orphan_gc_with_chunks(data_dir, meta_addr, chunks, &tls)
     }
 }
 
@@ -480,9 +559,12 @@ fn run_orphan_gc_with_chunks<C: ChunkStore>(
     data_dir: PathBuf,
     meta_addr: Option<String>,
     chunks: C,
+    tls: &TlsClientArgs,
 ) -> Result<()> {
     if let Some(addr) = meta_addr {
-        let meta = RemoteMetaStore::connect(&addr).context("connect meta")?;
+        let meta_tls = tls.build(None)?;
+        let meta = RemoteMetaStore::connect_tls(&addr, meta_tls, tls.allow_insecure_dev)
+            .context("connect meta")?;
         let client = FluxClient::new(meta, chunks);
         let report = client.run_orphan_gc().context("orphan gc")?;
         println!(
@@ -547,8 +629,10 @@ fn build_client<M: MetaStore + 'static, C: ChunkStore + 'static>(
     Ok(Arc::new(client))
 }
 
-fn run_meta_ping(addr: &str) -> Result<()> {
-    let meta = RemoteMetaStore::connect(addr).context("connect")?;
+fn run_meta_ping(addr: &str, tls: &TlsClientArgs) -> Result<()> {
+    let meta_tls = tls.build(None)?;
+    let meta =
+        RemoteMetaStore::connect_tls(addr, meta_tls, tls.allow_insecure_dev).context("connect")?;
     let root = meta.get_inode(ROOT_INODE).context("get root")?;
     println!(
         "meta-ping ok addr={addr} root_inode={} locality={:?}",

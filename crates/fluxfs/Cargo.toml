@@ -16,6 +16,7 @@ fluxfs-chunk = { workspace = true }
 fluxfs-client = { workspace = true }
 fluxfs-fuse = { workspace = true }
 fluxfs-meta = { workspace = true }
+fluxfs-tls = { workspace = true }
 fluxfs-types = { workspace = true }
 fluxfs-ufs = { workspace = true }
 tempfile = { workspace = true }

@@ -52,6 +52,20 @@ struct Cli {
     /// Optional Prometheus text endpoint, e.g. 127.0.0.1:9101 (`GET /metrics`).
     #[arg(long)]
     metrics_listen: Option<SocketAddr>,
+    // ===== C1 mTLS (task #30) =====
+    /// Cluster CA cert (PEM) used to verify client certs. Required when
+    /// --tls-server-cert is set (mTLS); production default.
+    #[arg(long)]
+    tls_ca_cert: Option<PathBuf>,
+    /// Server identity cert (PEM). Setting this enables TLS.
+    #[arg(long)]
+    tls_server_cert: Option<PathBuf>,
+    /// Server identity key (PEM). Paired with --tls-server-cert.
+    #[arg(long)]
+    tls_server_key: Option<PathBuf>,
+    /// Explicit plaintext opt-in (tests only). Production MUST pass TLS flags.
+    #[arg(long, default_value_t = false)]
+    allow_insecure_dev: bool,
 }
 
 struct MetaSvc {
@@ -680,7 +694,30 @@ async fn main() -> Result<()> {
         cli.data_dir.display(),
         raft_dir.display()
     );
-    tonic::transport::Server::builder()
+    // ===== C1 mTLS wiring (task #30 Phase 2) =====
+    use fluxfs_tls::ServerTlsOptions;
+    let tls_opts = ServerTlsOptions::from_cli(
+        cli.tls_ca_cert.clone(),
+        cli.tls_server_cert.clone(),
+        cli.tls_server_key.clone(),
+        cli.allow_insecure_dev,
+    )
+    .context("tls options")?;
+    let tls_config = tls_opts
+        .build_config()
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let mut server_builder = tonic::transport::Server::builder();
+    if let Some(tls) = tls_config {
+        tracing::info!(
+            "metamaster TLS enabled (mTLS require-client-cert={})",
+            !tls_opts.allow_no_client_cert
+        );
+        server_builder = server_builder.tls_config(tls).context("tls_config")?;
+    } else {
+        tracing::warn!("metamaster in INSECURE-DEV plaintext mode (--allow-insecure-dev)");
+    }
+    server_builder
         .add_service(MetaServiceServer::new(svc))
         .serve(cli.listen)
         .await

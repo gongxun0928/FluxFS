@@ -15,6 +15,7 @@ clap = { workspace = true }
 fluxfs-chunk = { workspace = true }
 fluxfs-metrics = { workspace = true }
 fluxfs-proto = { workspace = true }
+fluxfs-tls = { workspace = true }
 fluxfs-types = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }

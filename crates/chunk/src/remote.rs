@@ -90,10 +90,27 @@ impl RemoteReplicatedChunkStore {
         Self::new_with_max_pending(worker_endpoints, required, DEFAULT_MAX_PENDING_CHUNK_OPS)
     }
 
+    /// Plaintext constructor (tests only — production dials via
+    /// [`Self::new_with_max_pending_tls`]).
     pub fn new_with_max_pending(
         worker_endpoints: Vec<String>,
         required: usize,
         max_pending: usize,
+    ) -> Result<Self> {
+        Self::new_with_max_pending_tls(worker_endpoints, required, max_pending, None, true)
+    }
+
+    /// Construct with optional TLS (task #30 C1 Phase 2).
+    ///
+    /// - `tls=Some(opts)`: each worker endpoint is dialed with the shared
+    ///   client TLS config (mTLS identity + CA verification).
+    /// - `tls=None`: plaintext; `insecure_dev` must be true.
+    pub fn new_with_max_pending_tls(
+        worker_endpoints: Vec<String>,
+        required: usize,
+        max_pending: usize,
+        tls: Option<fluxfs_tls::ClientTlsOptions>,
+        insecure_dev: bool,
     ) -> Result<Self> {
         if required == 0 || worker_endpoints.len() < required {
             return Err(FluxError::InvalidArg(format!(
@@ -106,14 +123,35 @@ impl RemoteReplicatedChunkStore {
                 "remote chunk max_pending must be greater than zero".into(),
             ));
         }
+        let tls_cfg = if let Some(opts) = tls.as_ref() {
+            opts.build_config_blocking()
+                .map_err(|e| FluxError::Meta(e.to_string()))?
+        } else {
+            None
+        };
+        let insecure = fluxfs_tls::InsecureDev::allow(insecure_dev);
         let mut channels = Vec::with_capacity(worker_endpoints.len());
         for endpoint in worker_endpoints {
-            let channel = Endpoint::from_shared(endpoint.clone())
+            let url = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+                endpoint.clone()
+            } else if tls_cfg.is_some() {
+                format!("https://{endpoint}")
+            } else {
+                format!("http://{endpoint}")
+            };
+            insecure
+                .check_endpoint(&url)
+                .map_err(|e| FluxError::InvalidArg(e.to_string()))?;
+            let mut ep = Endpoint::from_shared(url.clone())
                 .map_err(|error| FluxError::InvalidArg(format!("{endpoint}: {error}")))?
                 .connect_timeout(Duration::from_secs(1))
-                .timeout(Duration::from_secs(2))
-                .connect_lazy();
-            channels.push(channel);
+                .timeout(Duration::from_secs(2));
+            if let Some(cfg) = tls_cfg.as_ref() {
+                ep = ep
+                    .tls_config(cfg.clone())
+                    .map_err(|error| FluxError::InvalidArg(format!("{endpoint}: tls: {error}")))?;
+            }
+            channels.push(ep.connect_lazy());
         }
 
         let (sender, receiver) = mpsc::sync_channel(max_pending);

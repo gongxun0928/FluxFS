@@ -34,25 +34,64 @@ pub struct RemoteMetaStore {
 }
 
 impl RemoteMetaStore {
-    pub fn connect(addr: impl AsRef<str>) -> Result<Self> {
+    /// Plaintext connect (tests only — production dials via [`Self::connect_tls`]).
+    ///
+    /// Refuses `http://` unless `insecure_dev` is true, to prevent silent
+    /// plaintext downgrade in production. Bare `host:port` is treated as
+    /// plaintext and also requires `insecure_dev`.
+    pub fn connect(addr: impl AsRef<str>, insecure_dev: bool) -> Result<Self> {
+        Self::connect_tls(addr, None, insecure_dev)
+    }
+
+    /// Connect with optional TLS (task #30 C1 Phase 2).
+    ///
+    /// - `tls=Some(opts)`: builds a tonic `ClientTlsConfig` from `opts` and
+    ///   dials with TLS + mTLS client identity.
+    /// - `tls=None`: plaintext. `insecure_dev` must be true.
+    pub fn connect_tls(
+        addr: impl AsRef<str>,
+        tls: Option<fluxfs_tls::ClientTlsOptions>,
+        insecure_dev: bool,
+    ) -> Result<Self> {
+        use tonic::transport::Endpoint;
+
         let addr = addr.as_ref().to_string();
-        let endpoint = if addr.starts_with("http://") || addr.starts_with("https://") {
+        let url = if addr.starts_with("http://") || addr.starts_with("https://") {
             addr
+        } else if tls.is_some() {
+            format!("https://{addr}")
         } else {
             format!("http://{addr}")
         };
+        fluxfs_tls::InsecureDev::allow(insecure_dev)
+            .check_endpoint(&url)
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+
+        let build_endpoint = || -> Result<Endpoint> {
+            let mut endpoint = Endpoint::from_shared(url.clone())
+                .map_err(|e| FluxError::Meta(format!("meta endpoint: {e}")))?;
+            if let Some(opts) = tls.as_ref() {
+                let cfg = opts
+                    .build_config_blocking()
+                    .map_err(|e| FluxError::Meta(e.to_string()))?;
+                if let Some(cfg) = cfg {
+                    endpoint = endpoint
+                        .tls_config(cfg)
+                        .map_err(|e| FluxError::Meta(format!("meta tls_config: {e}")))?;
+                }
+            }
+            Ok(endpoint)
+        };
 
         let (rt, client) = if let Ok(handle) = Handle::try_current() {
-            let client = tokio::task::block_in_place(|| {
-                handle.block_on(MetaServiceClient::connect(endpoint.clone()))
-            })
-            .map_err(|e| FluxError::Meta(format!("meta connect: {e}")))?;
+            let endpoint = build_endpoint()?;
+            let _ = &handle;
+            let client = MetaServiceClient::new(endpoint.connect_lazy());
             (None, client)
         } else {
             let rt = Runtime::new().map_err(|e| FluxError::Meta(e.to_string()))?;
-            let client = rt
-                .block_on(MetaServiceClient::connect(endpoint))
-                .map_err(|e| FluxError::Meta(format!("meta connect: {e}")))?;
+            let endpoint = build_endpoint()?;
+            let client = MetaServiceClient::new(endpoint.connect_lazy());
             (Some(rt), client)
         };
 
