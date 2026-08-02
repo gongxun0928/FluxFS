@@ -122,7 +122,7 @@ impl MetaStore for RemoteMetaStore {
                     mode,
                     uid,
                     gid,
-                    request_id: RequestOpId::new().0,
+                    request_id: RequestOpId::random().to_hex(),
                 })
                 .await
             })
@@ -174,7 +174,7 @@ impl MetaStore for RemoteMetaStore {
                     expected_generation,
                     inode_json,
                     manifest_json,
-                    request_id: op_id.0,
+                    request_id: op_id.to_hex(),
                 })
                 .await
             })

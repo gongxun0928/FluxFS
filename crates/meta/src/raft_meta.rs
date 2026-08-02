@@ -120,7 +120,7 @@ impl MetaStore for RaftMetaStore {
         gid: u32,
     ) -> Result<Inode> {
         let resp = self.write(MetaRaftRequest::Create {
-            request_id: Some(RequestOpId::new()),
+            request_id: Some(RequestOpId::random()),
             parent,
             name: name.to_string(),
             file_type,
@@ -137,7 +137,7 @@ impl MetaStore for RaftMetaStore {
 
     fn put_inode(&self, inode: &Inode) -> Result<()> {
         let resp = self.write(MetaRaftRequest::PutInode {
-            request_id: Some(RequestOpId::new()),
+            request_id: Some(RequestOpId::random()),
             inode: Box::new(inode.clone()),
         })?;
         Self::map_empty(resp)
@@ -145,7 +145,7 @@ impl MetaStore for RaftMetaStore {
 
     fn put_manifest(&self, manifest: &Manifest) -> Result<ManifestId> {
         let resp = self.write(MetaRaftRequest::PutManifest {
-            request_id: Some(RequestOpId::new()),
+            request_id: Some(RequestOpId::random()),
             manifest: Box::new(manifest.clone()),
         })?;
         Self::map_manifest_id(resp)
@@ -157,7 +157,7 @@ impl MetaStore for RaftMetaStore {
         inode: &Inode,
         manifest: &Manifest,
     ) -> Result<Inode> {
-        self.commit_inode_manifest_with_id(RequestOpId::new(), expected_generation, inode, manifest)
+        self.commit_inode_manifest_with_id(RequestOpId::random(), expected_generation, inode, manifest)
     }
 
     fn commit_inode_manifest_with_id(
@@ -182,7 +182,7 @@ impl MetaStore for RaftMetaStore {
 
     fn unlink(&self, parent: InodeId, name: &str) -> Result<()> {
         let resp = self.write(MetaRaftRequest::Unlink {
-            request_id: Some(RequestOpId::new()),
+            request_id: Some(RequestOpId::random()),
             parent,
             name: name.to_string(),
         })?;

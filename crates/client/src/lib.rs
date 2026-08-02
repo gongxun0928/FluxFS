@@ -234,7 +234,7 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         inode.generation = inode.generation.saturating_add(1);
         inode.mtime_ms = now;
         inode.ctime_ms = now;
-        let op_id = RequestOpId::new();
+        let op_id = RequestOpId::random();
         self.meta.commit_inode_manifest_with_id(
             op_id,
             inode.generation.saturating_sub(1),
@@ -324,7 +324,7 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         );
         inode.mtime_ms = now;
         inode.ctime_ms = now;
-        let op_id = RequestOpId::new();
+        let op_id = RequestOpId::random();
         self.meta.commit_inode_manifest_with_id(
             op_id,
             expected_generation,

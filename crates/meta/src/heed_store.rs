@@ -199,8 +199,8 @@ impl HeedMetaStore {
             .write_txn()
             .map_err(|e| FluxError::Meta(e.to_string()))?;
 
-        if let Some(op_id) = req.request_id() {
-            if let Some(cached) = self.get_client_request_in_txn(&wtxn, op_id.as_str())? {
+        if let Some(op_id) = req.request_id().filter(|id| !id.is_none()) {
+            if let Some(cached) = self.get_client_request_in_txn(&wtxn, &op_id.to_hex())? {
                 // Still advance SM markers so the Raft log entry is durable.
                 self.put_sm_meta_raw(&mut wtxn, sm)?;
                 wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
@@ -259,9 +259,9 @@ impl HeedMetaStore {
             }
         };
 
-        if let Some(op_id) = req.request_id() {
+        if let Some(op_id) = req.request_id().filter(|id| !id.is_none()) {
             // Retain successes and typed application errors so retries are stable.
-            self.put_client_request_in_txn(&mut wtxn, op_id.as_str(), &resp)?;
+            self.put_client_request_in_txn(&mut wtxn, &op_id.to_hex(), &resp)?;
         }
 
         // Always advance applied markers with the mutation attempt (including typed Err).
@@ -895,32 +895,38 @@ impl MetaStore for HeedMetaStore {
             .env
             .write_txn()
             .map_err(|e| FluxError::Meta(e.to_string()))?;
-        if let Some(cached) = self.get_client_request_in_txn(&wtxn, op_id.as_str())? {
-            return match cached {
-                MetaRaftResponse::Inode(inode) => Ok(*inode),
-                MetaRaftResponse::Err(err) => Err(err),
-                other => Err(FluxError::Meta(format!(
-                    "bad retained commit response: {other:?}"
-                ))),
-            };
+        if !op_id.is_none() {
+            if let Some(cached) = self.get_client_request_in_txn(&wtxn, &op_id.to_hex())? {
+                return match cached {
+                    MetaRaftResponse::Inode(inode) => Ok(*inode),
+                    MetaRaftResponse::Err(err) => Err(err),
+                    other => Err(FluxError::Meta(format!(
+                        "bad retained commit response: {other:?}"
+                    ))),
+                };
+            }
         }
         let next =
             match self.commit_inode_manifest_in_txn(&mut wtxn, expected_generation, inode, manifest)
             {
                 Ok(inode) => {
-                    self.put_client_request_in_txn(
-                        &mut wtxn,
-                        op_id.as_str(),
-                        &MetaRaftResponse::Inode(Box::new(inode.clone())),
-                    )?;
+                    if !op_id.is_none() {
+                        self.put_client_request_in_txn(
+                            &mut wtxn,
+                            &op_id.to_hex(),
+                            &MetaRaftResponse::Inode(Box::new(inode.clone())),
+                        )?;
+                    }
                     inode
                 }
                 Err(err) => {
-                    self.put_client_request_in_txn(
-                        &mut wtxn,
-                        op_id.as_str(),
-                        &MetaRaftResponse::Err(err.clone()),
-                    )?;
+                    if !op_id.is_none() {
+                        self.put_client_request_in_txn(
+                            &mut wtxn,
+                            &op_id.to_hex(),
+                            &MetaRaftResponse::Err(err.clone()),
+                        )?;
+                    }
                     wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
                     return Err(err);
                 }

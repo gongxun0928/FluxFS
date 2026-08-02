@@ -11,44 +11,6 @@ use thiserror::Error;
 pub type InodeId = u64;
 pub type Generation = u64;
 
-/// Client-generated id for one logical Meta mutation.
-///
-/// Retries of the same logical op MUST reuse the same id so Raft apply can
-/// return the retained result instead of double-effecting `alloc_inode` /
-/// `unlink` / generation bumps.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct RequestOpId(pub String);
-
-impl RequestOpId {
-    /// Fresh unique id (UUID v4). Call once per logical op; reuse on retry.
-    pub fn new() -> Self {
-        Self(uuid::Uuid::new_v4().to_string())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Default for RequestOpId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl fmt::Display for RequestOpId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// Whether a mutation was freshly applied or replayed from the retention ledger.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DedupOutcome {
-    Fresh,
-    Replay,
-}
-
 /// Per-inode data generation. `head_gen > ufs_gen` ⇒ Dirty.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
@@ -123,9 +85,17 @@ impl fmt::Debug for ChunkId {
 /// Minimal hex helper without extra crate dependency on all paths.
 mod hex {
     pub fn encode(bytes: [u8; 32]) -> String {
+        encode_slice(&bytes)
+    }
+
+    pub fn encode_16(bytes: [u8; 16]) -> String {
+        encode_slice(&bytes)
+    }
+
+    fn encode_slice(bytes: &[u8]) -> String {
         const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut out = String::with_capacity(64);
-        for b in bytes {
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for &b in bytes {
             out.push(HEX[(b >> 4) as usize] as char);
             out.push(HEX[(b & 0xf) as usize] as char);
         }
@@ -625,9 +595,95 @@ pub const CHUNK_SIZE: u64 = 4 * 1024 * 1024; // 4 MiB
 /// Default TTL for External lazy-imported dentry cache.
 pub const EXTERNAL_CACHE_TTL_SECS: u64 = 60;
 
+// ===== Client request-op idempotency (A3 / N1) =====
+//
+// Raft does NOT dedup client retries. The server retains each completed
+// `RequestOpId` result for a retry horizon. See task #13 / ZeroFS dedup.rs.
+
+/// Client-supplied id for non-idempotent mutation deduplication.
+///
+/// All-zero (`RequestOpId::NONE`) means "no id supplied" — not dedupable.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RequestOpId([u8; 16]);
+
+impl RequestOpId {
+    /// Sentinel: client supplied no op id (no deduplication possible).
+    pub const NONE: Self = Self([0u8; 16]);
+
+    /// Wrap a raw 128-bit id (caller is responsible for uniqueness).
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// Fresh random id (UUID v4 bytes). Call once per logical op; reuse on retry.
+    pub fn random() -> Self {
+        Self(*uuid::Uuid::new_v4().as_bytes())
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+
+    /// Stable ledger / wire key (32 lowercase hex chars).
+    pub fn to_hex(&self) -> String {
+        hex::encode_16(self.0)
+    }
+
+    /// True if the client supplied no op id (`NONE`).
+    pub fn is_none(&self) -> bool {
+        self.0 == [0u8; 16]
+    }
+}
+
+impl Default for RequestOpId {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
+impl fmt::Debug for RequestOpId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_none() {
+            return write!(f, "RequestOpId(NONE)");
+        }
+        write!(f, "RequestOpId({})", hex::encode_16(self.0))
+    }
+}
+
+/// Retained result of a completed non-idempotent mutation (types contract).
+///
+/// Meta currently also retains the full [`crate`]-adjacent apply response for
+/// commits that must return a full inode; this enum remains the portable shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DedupResult {
+    Applied,
+    Created { inode: InodeId },
+    Generation { gen: Generation },
+    Failed { error: FluxError },
+}
+
+/// One completed mutation plus its retained result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DedupEntry {
+    pub op_id: RequestOpId,
+    pub result: DedupResult,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_op_id_none_is_all_zero_and_default() {
+        assert!(RequestOpId::NONE.is_none());
+        assert!(RequestOpId::default().is_none());
+        assert_eq!(RequestOpId::NONE.as_bytes(), &[0u8; 16]);
+    }
+
+    #[test]
+    fn request_op_id_random_is_not_none() {
+        assert!(!RequestOpId::random().is_none());
+    }
 
     #[test]
     fn chunk_id_raw_wire_roundtrip() {

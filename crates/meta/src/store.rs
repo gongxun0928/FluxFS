@@ -45,7 +45,7 @@ pub trait MetaStore: Send + Sync {
         inode: &Inode,
         manifest: &Manifest,
     ) -> Result<Inode> {
-        self.commit_inode_manifest_with_id(RequestOpId::new(), expected_generation, inode, manifest)
+        self.commit_inode_manifest_with_id(RequestOpId::random(), expected_generation, inode, manifest)
     }
 
     /// Same as [`Self::commit_inode_manifest`] but with an explicit op id for retries.

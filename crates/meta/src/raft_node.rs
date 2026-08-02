@@ -204,9 +204,9 @@ mod tests {
             .await
             .expect("start raft");
 
-        let op_id = RequestOpId::new();
+        let op_id = RequestOpId::random();
         let req = MetaRaftRequest::Create {
-            request_id: Some(op_id.clone()),
+            request_id: Some(op_id),
             parent: ROOT_INODE,
             name: "once.txt".into(),
             file_type: FileType::Regular,

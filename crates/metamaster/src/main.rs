@@ -120,11 +120,7 @@ impl MetaService for MetaSvc {
     ) -> Result<Response<CreateResponse>, Status> {
         let r = req.into_inner();
         let ft = file_type_from_wire(r.file_type).map_err(status_from_flux)?;
-        let request_id = if r.request_id.is_empty() {
-            Some(RequestOpId::new())
-        } else {
-            Some(RequestOpId(r.request_id))
-        };
+        let request_id = parse_request_op_id(&r.request_id);
         let resp = self
             .write(MetaRaftRequest::Create {
                 request_id,
@@ -160,7 +156,7 @@ impl MetaService for MetaSvc {
         let inode = decode_inode(&req.into_inner().inode_json).map_err(status_from_flux)?;
         let resp = self
             .write(MetaRaftRequest::PutInode {
-                request_id: Some(RequestOpId::new()),
+                request_id: Some(RequestOpId::random()),
                 inode: Box::new(inode),
             })
             .await?;
@@ -176,7 +172,7 @@ impl MetaService for MetaSvc {
             decode_manifest(&req.into_inner().manifest_json).map_err(status_from_flux)?;
         let resp = self
             .write(MetaRaftRequest::PutManifest {
-                request_id: Some(RequestOpId::new()),
+                request_id: Some(RequestOpId::random()),
                 manifest: Box::new(manifest),
             })
             .await?;
@@ -191,11 +187,7 @@ impl MetaService for MetaSvc {
         let r = req.into_inner();
         let inode = decode_inode(&r.inode_json).map_err(status_from_flux)?;
         let manifest = decode_manifest(&r.manifest_json).map_err(status_from_flux)?;
-        let request_id = if r.request_id.is_empty() {
-            Some(RequestOpId::new())
-        } else {
-            Some(RequestOpId(r.request_id))
-        };
+        let request_id = parse_request_op_id(&r.request_id);
         let resp = self
             .write(MetaRaftRequest::CommitInodeManifest {
                 request_id,
@@ -233,13 +225,49 @@ impl MetaService for MetaSvc {
         let r = req.into_inner();
         let resp = self
             .write(MetaRaftRequest::Unlink {
-                request_id: Some(RequestOpId::new()),
+                request_id: Some(RequestOpId::random()),
                 parent: r.parent,
                 name: r.name,
             })
             .await?;
         Self::map_resp_empty(resp)?;
         Ok(Response::new(UnlinkResponse {}))
+    }
+}
+
+fn parse_request_op_id(s: &str) -> Option<RequestOpId> {
+    if s.is_empty() {
+        return Some(RequestOpId::random());
+    }
+    let bytes = hex::decode(s).ok()?;
+    let arr: [u8; 16] = bytes.try_into().ok()?;
+    Some(RequestOpId::from_bytes(arr))
+}
+
+// Minimal hex decode for request ids (lowercase/uppercase).
+mod hex {
+    pub fn decode(s: &str) -> Result<Vec<u8>, ()> {
+        if s.len() % 2 != 0 {
+            return Err(());
+        }
+        let mut out = Vec::with_capacity(s.len() / 2);
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let hi = from_hex(bytes[i])?;
+            let lo = from_hex(bytes[i + 1])?;
+            out.push((hi << 4) | lo);
+            i += 2;
+        }
+        Ok(out)
+    }
+    fn from_hex(b: u8) -> Result<u8, ()> {
+        match b {
+            b'0'..=b'9' => Ok(b - b'0'),
+            b'a'..=b'f' => Ok(b - b'a' + 10),
+            b'A'..=b'F' => Ok(b - b'A' + 10),
+            _ => Err(()),
+        }
     }
 }
 
