@@ -29,7 +29,7 @@ foyer = "0.22"
 fuser = "0.18"
 heed = "0.22"
 opendal = { version = "0.58", features = ["services-fs", "services-s3"] }
-openraft = { version = "0.9", features = ["serde"] }
+openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 proptest = "1.11"
 fail = "0.5"
 prost = "0.14"

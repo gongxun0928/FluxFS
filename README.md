@@ -10,14 +10,16 @@ The current MVP can mount a local Ephemeral (`--no-ufs`) filesystem. Metadata
 is persisted with heed; authoritative chunks are acknowledged after two local
 replicas durably store and checksum them. Basic create/read/write, random write,
 truncate, mkdir/readdir, unlink, unmount/remount, process-crash recovery, and
-single-replica read fallback are executable. OpenRaft replication and UFS-backed
-lazy read/write-back remain next-stage work.
+single-replica read fallback are executable. UFS-backed lazy read/write-back
+remains next-stage work.
 
 The same Ephemeral path also runs as five localhost processes: one MetaMaster,
 three ChunkWorkers, and one FUSE/client. Meta and chunk traffic use tonic/TCP;
 worker-0/1 form the initial fixed RF=2 set and worker-2 is a repair spare.
-OpenRaft is not yet on the Meta write path, so this is process separation rather
-than metadata HA.
+Meta writes pass through an OpenRaft single-voter state machine. Its Raft log is
+currently process-local and snapshots contain only a marker; heed persists the
+application state across restart. This validates the write-path wiring, not
+durable Raft recovery, replication, or metadata HA.
 
 Design: [`docs/mvp-v0.1.md`](docs/mvp-v0.1.md) · Alpha gates: [`docs/alpha-checklist.md`](docs/alpha-checklist.md)
 
@@ -26,7 +28,7 @@ Design: [`docs/mvp-v0.1.md`](docs/mvp-v0.1.md) · Alpha gates: [`docs/alpha-chec
 ```
 crates/
   types/    shared inode/dentry/chunk types
-  meta/     MetaStore trait, heed backend, openraft stubs
+  meta/     MetaStore trait, heed backend, openraft single-voter wiring
   proto/    tonic/protobuf Meta and ChunkWorker contracts
   metamaster/ independent heed + tonic metadata process
   chunk/    RF=2 authoritative disk store + evictable foyer facade

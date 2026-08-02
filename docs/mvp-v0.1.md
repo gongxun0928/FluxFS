@@ -261,13 +261,13 @@ Per @gongxun: proceed with agent-recommended defaults without blocking.
 
 | Layer | Choice | W1 status |
 |---|---|---|
-| Consensus | openraft | TypeConfig stub in `fluxfs-meta`; single-voter Raft bring-up next |
+| Consensus | openraft | Single-voter writes reach a heed-backed state machine; Raft log/snapshot durability and multi-voter HA remain |
 | Meta engine | heed + `MetaStore` trait | create/lookup/readdir/put_inode working |
 | Chunk cache | foyer + `ChunkStore` trait | Disk durable + hybrid facade (HybridCache async wire-up next) |
 | UFS | OpenDAL | local FS + S3 features; head/range/write_full |
 | Client | internal API | shared by CLI; public SDK / get_by_key → v0.2 |
-| Access | FUSE + internal CLI | `fluxfs-fuse` skeleton; full mount later |
-| Topology | crate-split, co-located binary | `fluxfs` binary runs Meta+Chunk in-process |
+| Access | FUSE + internal CLI | Ephemeral create/read/write/readdir/unlink/truncate mounts locally |
+| Topology | crate-split, multi-process localhost path | MetaMaster + 3 ChunkWorkers + FUSE/client communicate over tonic/TCP |
 | External consistency | best-effort | documented; no full materialize on partial write |
 
 ### W1 exit commands
