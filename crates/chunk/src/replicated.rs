@@ -208,8 +208,9 @@ mod tests {
         let secondary = temp.path().join("worker-b");
         let store = ReplicatedChunkStore::open_rf2(&primary, &secondary).unwrap();
 
-        fs::remove_dir(secondary.join("objects")).unwrap();
-        fs::write(secondary.join("objects"), b"not a directory").unwrap();
+        // Break secondary segment dir so puts fail closed (env stays open).
+        fs::remove_dir_all(secondary.join("segments")).unwrap();
+        fs::write(secondary.join("segments"), b"not a directory").unwrap();
         assert!(store.put_replicated(b"must not ack").is_err());
         assert!(!store
             .contains(&ChunkId::from_bytes(b"must not ack"))
@@ -221,11 +222,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let primary = temp.path().join("worker-a");
         let secondary = temp.path().join("worker-b");
-        let store = ReplicatedChunkStore::open_rf2(&primary, &secondary).unwrap();
-        let id = store.put(b"repair me").unwrap();
+        let id = {
+            let store = ReplicatedChunkStore::open_rf2(&primary, &secondary).unwrap();
+            store.put(b"repair me").unwrap()
+        };
+        // Drop the primary replica while no env is open on that path.
+        DiskChunkStore::open(&primary).unwrap().delete(&id).unwrap();
 
-        let first = DiskChunkStore::open(&primary).unwrap();
-        fs::write(first.object_path(&id), b"corrupt").unwrap();
+        let store = ReplicatedChunkStore::open_rf2(&primary, &secondary).unwrap();
         assert_eq!(store.get(&id).unwrap(), b"repair me");
         assert_eq!(store.health(&id).healthy, 1);
         assert!(!store.contains(&id).unwrap());

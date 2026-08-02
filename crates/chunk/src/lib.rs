@@ -4,12 +4,14 @@
 
 mod disk;
 mod foyer_store;
+mod pack;
 mod remote;
 mod replicated;
 mod store;
 
 pub use disk::DiskChunkStore;
 pub use foyer_store::FoyerChunkStore;
+pub use pack::CompactReport;
 pub use remote::{
     RemoteReplicatedChunkStore, RepairReport, DEFAULT_MAX_PENDING_CHUNK_OPS, REPAIR_PAGE_SIZE,
 };

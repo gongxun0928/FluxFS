@@ -11,6 +11,7 @@ if ! command -v fusermount3 >/dev/null 2>&1; then
 fi
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+count_chunks() { "$repo_dir/scripts/count-pack-chunks.sh" "$1"; }
 test_root=$(mktemp -d -t fluxfs-crash-test.XXXXXX)
 data_dir="$test_root/data"
 mount_dir="$test_root/mnt"
@@ -56,8 +57,8 @@ printf 'acknowledged before crash\n' >"$mount_dir/durable.txt"
 test "$(cat "$mount_dir/durable.txt")" = "acknowledged before crash"
 
 # An acknowledged Ephemeral write must exist on both local Worker replicas.
-test "$(find "$data_dir/chunks/worker-0/objects" -type f | wc -l)" -ge 1
-test "$(find "$data_dir/chunks/worker-1/objects" -type f | wc -l)" -ge 1
+test "$(count_chunks "$data_dir/chunks/worker-0")" -ge 1
+test "$(count_chunks "$data_dir/chunks/worker-1")" -ge 1
 
 kill -KILL "$mount_pid"
 wait "$mount_pid" 2>/dev/null || true
@@ -65,9 +66,9 @@ mount_pid=""
 fusermount3 -u "$mount_dir"
 
 # Corrupt one replica while FluxFS is down; the other must remain readable.
-primary_object=$(find "$data_dir/chunks/worker-0/objects" -type f | head -n 1)
-test -n "$primary_object"
-printf 'corrupt replica' >"$primary_object"
+primary_seg=$(find "$data_dir/chunks/worker-0/segments" -name 'seg-*.dat' -type f | head -n 1)
+test -n "$primary_seg"
+printf 'corrupt replica' >"$primary_seg"
 
 start_mount
 test "$(cat "$mount_dir/durable.txt")" = "acknowledged before crash"

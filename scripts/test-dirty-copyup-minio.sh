@@ -11,6 +11,7 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+count_chunks() { "$repo_dir/scripts/count-pack-chunks.sh" "$1"; }
 test_root=$(mktemp -d -t fluxfs-dirty-copyup.XXXXXX)
 mount_dir="$test_root/mnt"
 prefix="dirty-copyup-$$"
@@ -148,9 +149,9 @@ for path in sys.argv[1:]:
         os.close(fd)
 PY
 cmp "$test_root/expected.bin" "$mount_dir/large.bin"
-test "$(find "$test_root/worker-0/objects" -type f | wc -l)" -eq 1
-test "$(find "$test_root/worker-1/objects" -type f | wc -l)" -eq 1
-test "$(find "$test_root/worker-2/objects" -type f 2>/dev/null | wc -l)" -eq 0
+test "$(count_chunks "$test_root/worker-0")" -eq 1
+test "$(count_chunks "$test_root/worker-1")" -eq 1
+test "$(count_chunks "$test_root/worker-2")" -eq 0
 
 # Copy-up is write-back: the original MinIO object is untouched before flush.
 mc_sh "mc cat local/${minio_bucket}/${prefix}/large.bin" >"$test_root/backing.bin"
@@ -174,7 +175,7 @@ for path in sys.argv[1:]:
         os.close(fd)
 PY
 cmp "$test_root/expected.bin" "$mount_dir/large.bin"
-test "$(find "$test_root/worker-2/objects" -type f | wc -l)" -ge 2
+test "$(count_chunks "$test_root/worker-2")" -ge 2
 
 # fsync is the explicit write-back boundary: durable intent, conditional Put,
 # HEAD digest verification, and metadata CAS to a clean UFS-only manifest.
@@ -204,8 +205,8 @@ cmp "$test_root/expected.bin" "$test_root/backing-after-remount.bin"
     --chunk-worker "http://127.0.0.1:$worker0_port" \
     --chunk-worker "http://127.0.0.1:$worker1_port" \
     --chunk-worker "http://127.0.0.1:$worker2_port"
-test "$(find "$test_root/worker-1/objects" -type f | wc -l)" -eq 0
-test "$(find "$test_root/worker-2/objects" -type f | wc -l)" -eq 0
+test "$(count_chunks "$test_root/worker-1")" -eq 0
+test "$(count_chunks "$test_root/worker-2")" -eq 0
 fusermount3 -u "$mount_dir"
 wait "$mount_pid"
 mount_pid=""

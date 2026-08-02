@@ -11,6 +11,7 @@ if ! command -v fusermount3 >/dev/null 2>&1; then
 fi
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+count_chunks() { "$repo_dir/scripts/count-pack-chunks.sh" "$1"; }
 test_root=$(mktemp -d -t fluxfs-multiprocess.XXXXXX)
 mount_dir="$test_root/mnt"
 base_port=$((30000 + ($$ % 19000)))
@@ -117,9 +118,9 @@ dd if=/dev/zero of="$test_root/large.expected" bs=1M count=4 status=none
 printf 'chunk-boundary-ok' >>"$test_root/large.expected"
 cp "$test_root/large.expected" "$mount_dir/large.bin"
 cmp "$test_root/large.expected" "$mount_dir/large.bin"
-test "$(find "$test_root/worker-0/objects" -type f | wc -l)" -ge 1
-test "$(find "$test_root/worker-1/objects" -type f | wc -l)" -ge 1
-test "$(find "$test_root/worker-2/objects" -type f 2>/dev/null | wc -l)" -eq 0
+test "$(count_chunks "$test_root/worker-0")" -ge 1
+test "$(count_chunks "$test_root/worker-1")" -ge 1
+test "$(count_chunks "$test_root/worker-2")" -eq 0
 
 # The initial RF=2 set is workers 0/1. With worker 0 down, reads from worker 1
 # lazily copy accessed chunks to spare worker 2. Before the next write ACKs, a
@@ -129,7 +130,7 @@ wait "$worker0_pid" 2>/dev/null || true
 worker0_pid=""
 test "$(cat "$mount_dir/durable.txt")" = "multiprocess durable"
 cmp "$test_root/large.expected" "$mount_dir/large.bin"
-test "$(find "$test_root/worker-2/objects" -type f | wc -l)" -ge 3
+test "$(count_chunks "$test_root/worker-2")" -ge 3
 printf 'repaired-to-spare\n' >>"$mount_dir/durable.txt"
 test "$(tail -n 1 "$mount_dir/durable.txt")" = "repaired-to-spare"
 
