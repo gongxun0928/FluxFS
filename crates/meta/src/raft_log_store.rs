@@ -1,7 +1,7 @@
 //! Heed-backed `RaftLogStorage` for MetaMaster.
 //!
-//! Stores vote / log entries / committed / last_purged, plus state-machine
-//! applied markers so a MetaMaster restart can resume without re-initialize wipe.
+//! Stores vote / log entries / committed / last_purged under `meta/raft/`.
+//! SM applied markers live in [`crate::HeedMetaStore`] for same-txn apply.
 
 #![allow(clippy::result_large_err)] // openraft StorageError is large by design
 #![allow(clippy::redundant_closure)]
@@ -15,7 +15,6 @@ use heed::types::{Bytes, Str};
 use heed::{Database, Env, EnvOpenOptions};
 use openraft::storage::LogFlushed;
 use openraft::storage::RaftLogStorage;
-use openraft::BasicNode;
 use openraft::Entry;
 use openraft::LogId;
 use openraft::LogState;
@@ -23,7 +22,6 @@ use openraft::RaftLogId;
 use openraft::RaftLogReader;
 use openraft::StorageError;
 use openraft::StorageIOError;
-use openraft::StoredMembership;
 use openraft::Vote;
 
 use crate::raft_types::{FluxRaftTypeConfig, NodeId};
@@ -35,16 +33,8 @@ type MetaDb = Database<Str, Bytes>;
 const KEY_VOTE: &str = "vote";
 const KEY_COMMITTED: &str = "committed";
 const KEY_LAST_PURGED: &str = "last_purged";
-const KEY_SM_LAST_APPLIED: &str = "sm_last_applied";
-const KEY_SM_LAST_MEMBERSHIP: &str = "sm_last_membership";
 
-#[derive(Debug, Clone, Default)]
-pub struct SmAppliedMeta {
-    pub last_applied_log: Option<LogId<NodeId>>,
-    pub last_membership: StoredMembership<NodeId, BasicNode>,
-}
-
-/// Durable Raft log + SM applied markers (separate heed env from inode MetaStore).
+/// Durable Raft vote/log store (heed env under `meta/raft/`).
 pub struct HeedRaftStore {
     env: Env,
     logs: LogDb,
@@ -78,60 +68,6 @@ impl HeedRaftStore {
             meta,
             write_lock: Mutex::new(()),
         })
-    }
-
-    pub fn load_sm_meta(&self) -> FluxResult<SmAppliedMeta> {
-        let rtxn = self
-            .env
-            .read_txn()
-            .map_err(|e| FluxError::Meta(e.to_string()))?;
-        let last_applied_log = match self
-            .meta
-            .get(&rtxn, KEY_SM_LAST_APPLIED)
-            .map_err(|e| FluxError::Meta(e.to_string()))?
-        {
-            Some(bytes) => {
-                Some(serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))?)
-            }
-            None => None,
-        };
-        let last_membership = match self
-            .meta
-            .get(&rtxn, KEY_SM_LAST_MEMBERSHIP)
-            .map_err(|e| FluxError::Meta(e.to_string()))?
-        {
-            Some(bytes) => {
-                serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))?
-            }
-            None => StoredMembership::default(),
-        };
-        Ok(SmAppliedMeta {
-            last_applied_log,
-            last_membership,
-        })
-    }
-
-    pub fn save_sm_meta(&self, sm: &SmAppliedMeta) -> FluxResult<()> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|_| FluxError::Meta("raft write lock poisoned".into()))?;
-        let mut wtxn = self
-            .env
-            .write_txn()
-            .map_err(|e| FluxError::Meta(e.to_string()))?;
-        let applied =
-            serde_json::to_vec(&sm.last_applied_log).map_err(|e| FluxError::Meta(e.to_string()))?;
-        self.meta
-            .put(&mut wtxn, KEY_SM_LAST_APPLIED, &applied)
-            .map_err(|e| FluxError::Meta(e.to_string()))?;
-        let membership =
-            serde_json::to_vec(&sm.last_membership).map_err(|e| FluxError::Meta(e.to_string()))?;
-        self.meta
-            .put(&mut wtxn, KEY_SM_LAST_MEMBERSHIP, &membership)
-            .map_err(|e| FluxError::Meta(e.to_string()))?;
-        wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
-        Ok(())
     }
 }
 

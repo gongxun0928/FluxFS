@@ -5,12 +5,21 @@
 
 use openraft::declare_raft_types;
 use openraft::BasicNode;
+use openraft::LogId;
+use openraft::StoredMembership;
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 
 use fluxfs_types::{FileType, FluxError, Inode, Manifest};
 
 pub type NodeId = u64;
+
+/// Durable SM applied markers (stored alongside MetaStore data).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SmAppliedMeta {
+    pub last_applied_log: Option<LogId<NodeId>>,
+    pub last_membership: StoredMembership<NodeId, BasicNode>,
+}
 
 /// Application request logged through Raft (write path only).
 #[derive(Debug, Clone, Serialize, Deserialize)]

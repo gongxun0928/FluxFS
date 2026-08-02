@@ -22,8 +22,8 @@ pub const SINGLE_VOTER_ID: NodeId = 1;
 
 /// Start openraft with one voter, wait until this node is leader.
 ///
-/// Raft vote/log and SM applied markers live under `raft_dir` (heed).
-/// Application inode state remains in [`HeedMetaStore`].
+/// Raft vote/log live under `raft_dir` (heed). SM applied markers and inode
+/// state live in [`HeedMetaStore`] (same write txn on normal apply).
 pub async fn start_single_voter(
     store: Arc<HeedMetaStore>,
     raft_dir: impl AsRef<Path>,
@@ -46,9 +46,9 @@ pub async fn start_single_voter(
     );
 
     let raft_store = Arc::new(HeedRaftStore::open(raft_dir)?);
-    let log_store = HeedRaftLogStore::new(raft_store.clone());
-    let state_machine = MetaStateMachine::new(store, raft_store)
-        .map_err(|e| FluxError::Meta(format!("raft sm: {e}")))?;
+    let log_store = HeedRaftLogStore::new(raft_store);
+    let state_machine =
+        MetaStateMachine::new(store).map_err(|e| FluxError::Meta(format!("raft sm: {e}")))?;
     let network = StubNetwork;
 
     let raft = FluxRaft::new(SINGLE_VOTER_ID, config, network, log_store, state_machine)
@@ -188,5 +188,49 @@ mod tests {
         store
             .lookup(ROOT_INODE, "after-restart.txt")
             .expect("visible after restart write");
+    }
+
+    #[tokio::test]
+    async fn snapshot_roundtrip_restores_inodes() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(HeedMetaStore::open(dir.path().join("meta")).unwrap());
+        let raft = start_single_voter(store.clone(), dir.path().join("raft"), "127.0.0.1:0")
+            .await
+            .expect("start raft");
+        raft.client_write(MetaRaftRequest::Create {
+            parent: ROOT_INODE,
+            name: "snap.txt".into(),
+            file_type: FileType::Regular,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        })
+        .await
+        .expect("create");
+
+        let sm = MetaStateMachine::new(store.clone()).expect("sm");
+        let snapshot = {
+            use openraft::storage::RaftSnapshotBuilder;
+            let mut builder = sm.clone();
+            builder.build_snapshot().await.expect("build snapshot")
+        };
+        assert!(snapshot.snapshot.get_ref().len() > 20);
+        assert!(!snapshot
+            .snapshot
+            .get_ref()
+            .starts_with(b"fluxfs-meta-snapshot"));
+
+        // Wipe app state then install snapshot.
+        let empty = Arc::new(HeedMetaStore::open(dir.path().join("meta2")).unwrap());
+        let mut sm2 = MetaStateMachine::new(empty.clone()).expect("sm2");
+        use openraft::storage::RaftStateMachine;
+        sm2.install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .expect("install");
+        empty
+            .lookup(ROOT_INODE, "snap.txt")
+            .expect("restored from snapshot");
+        let _ = sm; // keep first sm alive until after build
+        raft.shutdown().await.expect("shutdown");
     }
 }

@@ -14,9 +14,7 @@ use openraft::{
 use tokio::sync::RwLock;
 
 use crate::heed_store::HeedMetaStore;
-use crate::raft_log_store::{HeedRaftStore, SmAppliedMeta};
-use crate::raft_types::{FluxRaftTypeConfig, MetaRaftRequest, MetaRaftResponse, NodeId};
-use crate::store::MetaStore;
+use crate::raft_types::{FluxRaftTypeConfig, MetaRaftResponse, NodeId, SmAppliedMeta};
 
 #[derive(Debug)]
 struct StoredSnapshot {
@@ -26,74 +24,27 @@ struct StoredSnapshot {
 
 /// State machine backed by durable Heed for inode/dentry/manifest.
 ///
-/// Applied log id / membership are persisted in [`HeedRaftStore`] so restart
-/// resumes without re-applying committed entries.
+/// Normal applies persist mutation + `last_applied` in one MetaStore write txn.
 pub struct MetaStateMachine {
     store: Arc<HeedMetaStore>,
-    raft_store: Arc<HeedRaftStore>,
     meta: RwLock<SmAppliedMeta>,
     snapshot_idx: AtomicU64,
     current_snapshot: RwLock<Option<StoredSnapshot>>,
 }
 
 impl MetaStateMachine {
-    pub fn new(
-        store: Arc<HeedMetaStore>,
-        raft_store: Arc<HeedRaftStore>,
-    ) -> Result<Arc<Self>, StorageError<NodeId>> {
-        let sm_meta = raft_store.load_sm_meta().map_err(|e| {
+    pub fn new(store: Arc<HeedMetaStore>) -> Result<Arc<Self>, StorageError<NodeId>> {
+        let sm_meta = store.load_sm_meta().map_err(|e| {
             StorageError::from(StorageIOError::<NodeId>::read_state_machine(
                 &std::io::Error::other(e.to_string()),
             ))
         })?;
         Ok(Arc::new(Self {
             store,
-            raft_store,
             meta: RwLock::new(sm_meta),
             snapshot_idx: AtomicU64::new(0),
             current_snapshot: RwLock::new(None),
         }))
-    }
-
-    fn persist_sm_meta(&self, sm: &SmAppliedMeta) -> Result<(), StorageError<NodeId>> {
-        self.raft_store.save_sm_meta(sm).map_err(|e| {
-            StorageError::from(StorageIOError::<NodeId>::write_state_machine(
-                &std::io::Error::other(e.to_string()),
-            ))
-        })
-    }
-
-    fn apply_request(&self, req: &MetaRaftRequest) -> MetaRaftResponse {
-        match req {
-            MetaRaftRequest::Create {
-                parent,
-                name,
-                file_type,
-                mode,
-                uid,
-                gid,
-            } => match self
-                .store
-                .create(*parent, name, *file_type, *mode, *uid, *gid)
-            {
-                Ok(inode) => MetaRaftResponse::Inode(Box::new(inode)),
-                Err(e) => MetaRaftResponse::Err(e),
-            },
-            MetaRaftRequest::PutInode { inode } => match self.store.put_inode(inode.as_ref()) {
-                Ok(()) => MetaRaftResponse::Empty,
-                Err(e) => MetaRaftResponse::Err(e),
-            },
-            MetaRaftRequest::PutManifest { manifest } => {
-                match self.store.put_manifest(manifest.as_ref()) {
-                    Ok(id) => MetaRaftResponse::ManifestId(id.0),
-                    Err(e) => MetaRaftResponse::Err(e),
-                }
-            }
-            MetaRaftRequest::Unlink { parent, name } => match self.store.unlink(*parent, name) {
-                Ok(()) => MetaRaftResponse::Empty,
-                Err(e) => MetaRaftResponse::Err(e),
-            },
-        }
     }
 }
 
@@ -102,8 +53,16 @@ impl RaftSnapshotBuilder<FluxRaftTypeConfig> for Arc<MetaStateMachine> {
         &mut self,
     ) -> Result<Snapshot<FluxRaftTypeConfig>, StorageError<NodeId>> {
         let sm = self.meta.read().await;
-        // Heed is SoT for app data; snapshot payload is a marker only.
-        let data = b"fluxfs-meta-snapshot-v1".to_vec();
+        let snap = self.store.export_snapshot(&sm).map_err(|e| {
+            StorageError::from(StorageIOError::<NodeId>::read_state_machine(
+                &std::io::Error::other(e.to_string()),
+            ))
+        })?;
+        let data = serde_json::to_vec(&snap).map_err(|e| {
+            StorageError::from(StorageIOError::<NodeId>::read_state_machine(
+                &std::io::Error::other(e.to_string()),
+            ))
+        })?;
 
         let last_applied_log = sm.last_applied_log;
         let last_membership = sm.last_membership.clone();
@@ -158,15 +117,33 @@ impl RaftStateMachine<FluxRaftTypeConfig> for Arc<MetaStateMachine> {
             sm.last_applied_log = Some(entry.log_id);
 
             match entry.payload {
-                EntryPayload::Blank => res.push(MetaRaftResponse::Empty),
-                EntryPayload::Normal(ref req) => res.push(self.apply_request(req)),
+                EntryPayload::Blank => {
+                    self.store.save_sm_meta_only(&sm).map_err(|e| {
+                        StorageError::from(StorageIOError::<NodeId>::write_state_machine(
+                            &std::io::Error::other(e.to_string()),
+                        ))
+                    })?;
+                    res.push(MetaRaftResponse::Empty);
+                }
+                EntryPayload::Normal(ref req) => {
+                    let resp = self.store.apply_raft_request(req, &sm).map_err(|e| {
+                        StorageError::from(StorageIOError::<NodeId>::write_state_machine(
+                            &std::io::Error::other(e.to_string()),
+                        ))
+                    })?;
+                    res.push(resp);
+                }
                 EntryPayload::Membership(ref mem) => {
                     sm.last_membership = StoredMembership::new(Some(entry.log_id), mem.clone());
+                    self.store.save_sm_meta_only(&sm).map_err(|e| {
+                        StorageError::from(StorageIOError::<NodeId>::write_state_machine(
+                            &std::io::Error::other(e.to_string()),
+                        ))
+                    })?;
                     res.push(MetaRaftResponse::Empty);
                 }
             }
         }
-        self.persist_sm_meta(&sm)?;
         Ok(res)
     }
 
@@ -181,16 +158,37 @@ impl RaftStateMachine<FluxRaftTypeConfig> for Arc<MetaStateMachine> {
         meta: &SnapshotMeta<NodeId, BasicNode>,
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
+        let data = snapshot.into_inner();
+        let snap: crate::heed_store::MetaSnapshotData =
+            serde_json::from_slice(&data).map_err(|e| {
+                StorageError::from(StorageIOError::<NodeId>::read_snapshot(
+                    Some(meta.signature()),
+                    &e,
+                ))
+            })?;
+        self.store.install_snapshot_data(&snap).map_err(|e| {
+            StorageError::from(StorageIOError::<NodeId>::write_snapshot(
+                Some(meta.signature()),
+                &std::io::Error::other(e.to_string()),
+            ))
+        })?;
+
         let mut sm = self.meta.write().await;
-        sm.last_applied_log = meta.last_log_id;
+        *sm = snap.sm;
+        // Prefer snapshot meta's applied markers if present.
+        sm.last_applied_log = meta.last_log_id.or(sm.last_applied_log);
         sm.last_membership = meta.last_membership.clone();
-        self.persist_sm_meta(&sm)?;
+        self.store.save_sm_meta_only(&sm).map_err(|e| {
+            StorageError::from(StorageIOError::<NodeId>::write_state_machine(
+                &std::io::Error::other(e.to_string()),
+            ))
+        })?;
         drop(sm);
 
         let mut current_snapshot = self.current_snapshot.write().await;
         *current_snapshot = Some(StoredSnapshot {
             meta: meta.clone(),
-            data: snapshot.into_inner(),
+            data,
         });
         Ok(())
     }

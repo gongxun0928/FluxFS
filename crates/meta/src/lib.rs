@@ -16,6 +16,8 @@ mod proptest_smoke;
 
 pub use heed_store::HeedMetaStore;
 pub use raft_node::{start_single_voter, SINGLE_VOTER_ID};
-pub use raft_types::{FluxRaft, FluxRaftTypeConfig, MetaRaftRequest, MetaRaftResponse, NodeId};
+pub use raft_types::{
+    FluxRaft, FluxRaftTypeConfig, MetaRaftRequest, MetaRaftResponse, NodeId, SmAppliedMeta,
+};
 pub use remote::RemoteMetaStore;
 pub use store::MetaStore;
