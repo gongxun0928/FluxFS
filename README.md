@@ -6,7 +6,12 @@ Unified write-cache (JuiceFS-like) + transparent UFS read (Alluxio-like) filesys
 
 ## Status
 
-Week-1 skeleton: MetaStore (heed) + ChunkStore (disk/foyer facade) + OpenDAL UFS + internal CLI smoke. FUSE crate stubbed. openraft types declared for MetaMaster.
+The current MVP can mount a local Ephemeral (`--no-ufs`) filesystem. Metadata
+is persisted with heed; authoritative chunks are acknowledged after two local
+replicas durably store and checksum them. Basic create/read/write, random write,
+truncate, mkdir/readdir, unlink, unmount/remount, process-crash recovery, and
+single-replica read fallback are executable. OpenRaft replication and UFS-backed
+lazy read/write-back remain next-stage work.
 
 Design: [`docs/mvp-v0.1.md`](docs/mvp-v0.1.md) · Alpha gates: [`docs/alpha-checklist.md`](docs/alpha-checklist.md)
 
@@ -16,10 +21,10 @@ Design: [`docs/mvp-v0.1.md`](docs/mvp-v0.1.md) · Alpha gates: [`docs/alpha-chec
 crates/
   types/    shared inode/dentry/chunk types
   meta/     MetaStore trait, heed backend, openraft stubs
-  chunk/    ChunkStore trait, disk + foyer hybrid facade
+  chunk/    RF=2 authoritative disk store + evictable foyer facade
   ufs/      OpenDAL adapter
   client/   internal API (not public SDK)
-  fuse/     FUSE skeleton
+  fuse/     Ephemeral FUSE operations
   fluxfs/   co-located binary + CLI
 ```
 
@@ -29,6 +34,10 @@ crates/
 cargo test --workspace
 cargo run -p fluxfs -- info
 cargo run -p fluxfs -- smoke --data-dir /tmp/fluxfs-smoke
+
+# Automated local acceptance (exit 77 when FUSE is unavailable)
+./scripts/test-local-mount.sh
+./scripts/test-local-crash-restart.sh
 
 # Ephemeral local mount (no UFS)
 mkdir -p /tmp/fluxfs-data /tmp/fluxfs-mnt
