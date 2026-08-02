@@ -33,15 +33,19 @@
 //! * **Breaking layout changes**: override [`Versioned::migrate_from`] to
 //!   hand-translate older payload bytes into the current shape.
 //!
-//! ## Phase 1 scope (this commit)
+//! ## Scope
 //!
-//! Ships the envelope, trait, encode/decode helpers, per-type impls, test
-//! matrix. Wires `meta_codec::{encode,decode}_inode|manifest|flush_intent|
-//! dentries` to the envelope. Other codec functions (GC plan/batch/tombstone,
-//! chunk-id lists, worker-target lists) migrate incrementally as those
-//! subsystems are touched — not blocking this commit. Raw `serde_json::*`
-//! callsites in `heed_store` / `raft_log_store` likewise convert
-//! incrementally.
+//! Ships the envelope, trait, encode/decode helpers, per-type impls, and
+//! test matrix. All `meta_codec::{encode,decode}_*` functions route through
+//! `encode_versioned` / `decode_versioned`, covering: inode, manifest,
+//! flush_intent, dentries, ufs_object, flush_intents, gc_plan, chunk_ids,
+//! gc_batch, gc_tombstones, worker_targets, gc_delete_acks.
+//!
+//! Raw `serde_json::*` callsites in `heed_store` / `raft_log_store` /
+//! `raft_sm` (Raft log payloads, vote state, snapshot envelopes) are **not**
+//! migrated here — they convert incrementally as those subsystems are
+//! touched, since each requires careful audit of crash-recovery semantics
+//! that is out of scope for the codec-level envelope.
 //!
 //! ## Field-name invariant
 //!
