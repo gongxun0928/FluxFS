@@ -955,6 +955,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fluxfs-tls"
+version = "0.1.0"
+dependencies = [
+ "fluxfs-types",
+ "tempfile",
+ "tokio",
+ "tonic",
+ "tracing",
+]
+
+[[package]]
 name = "fluxfs-types"
 version = "0.1.0"
 dependencies = [
@@ -3067,7 +3078,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -3673,6 +3686,7 @@ dependencies = [
  "socket2",
  "sync_wrapper",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tower",
  "tower-layer",

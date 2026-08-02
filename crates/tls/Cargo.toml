@@ -1,0 +1,15 @@
+[package]
+name = "fluxfs-tls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "mTLS / transport-security helpers for FluxFS RPCs (task #30 C1)"
+
+[dependencies]
+fluxfs-types = { workspace = true }
+tonic = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

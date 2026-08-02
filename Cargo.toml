@@ -4,6 +4,7 @@ members = [
     "crates/types",
     "crates/metrics",
     "crates/proto",
+    "crates/tls",
     "crates/meta",
     "crates/testkit",
     "crates/chunk",
@@ -40,12 +41,13 @@ tempfile = "3"
 thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "sync", "time"] }
-tonic = { version = "0.14", features = ["transport"] }
+tonic = { version = "0.14", features = ["transport", "tls-ring", "tls-connect-info"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 fluxfs-types = { path = "crates/types" }
 fluxfs-metrics = { path = "crates/metrics" }
 fluxfs-proto = { path = "crates/proto" }
+fluxfs-tls = { path = "crates/tls" }
 fluxfs-meta = { path = "crates/meta" }
 fluxfs-testkit = { path = "crates/testkit" }
 fluxfs-chunk = { path = "crates/chunk" }
