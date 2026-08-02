@@ -1,4 +1,4 @@
-use fluxfs_types::{ChunkId, Result, WorkerTargetId};
+use fluxfs_types::{ChunkId, ChunkPage, FluxError, Result, WorkerTargetId};
 
 /// Engine-agnostic chunk put/get. Default RF / replication is a higher-layer concern.
 pub trait ChunkStore: Send + Sync {
@@ -10,6 +10,29 @@ pub trait ChunkStore: Send + Sync {
         Err(fluxfs_types::FluxError::Capability(
             "chunk store does not support GC inventory".into(),
         ))
+    }
+
+    fn list_chunks_page(&self, cursor: Option<ChunkId>, limit: usize) -> Result<ChunkPage> {
+        if limit == 0 {
+            return Err(FluxError::InvalidArg(
+                "chunk inventory page limit must be non-zero".into(),
+            ));
+        }
+        let mut chunks = self.list_chunks()?;
+        chunks.sort_by_key(ChunkId::to_hex);
+        chunks.dedup();
+        let mut page = chunks
+            .into_iter()
+            .filter(|chunk| cursor.is_none_or(|cursor| *chunk > cursor))
+            .take(limit.saturating_add(1))
+            .collect::<Vec<_>>();
+        let has_more = page.len() > limit;
+        page.truncate(limit);
+        let next_cursor = has_more.then(|| *page.last().expect("non-empty page"));
+        Ok(ChunkPage {
+            chunks: page,
+            next_cursor,
+        })
     }
 
     fn delete(&self, _id: &ChunkId) -> Result<()> {

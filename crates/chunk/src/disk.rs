@@ -213,4 +213,29 @@ mod tests {
         assert!(!store.contains(&id).unwrap());
         assert!(store.list_chunks().unwrap().is_empty());
     }
+
+    #[test]
+    fn paginated_inventory_has_no_gaps_or_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DiskChunkStore::open(dir.path()).unwrap();
+        for value in [b"one".as_slice(), b"two", b"three", b"four", b"five"] {
+            store.put(value).unwrap();
+        }
+        let expected = store.list_chunks().unwrap();
+        let mut actual = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = store.list_chunks_page(cursor, 2).unwrap();
+            assert!(page.chunks.len() <= 2);
+            let next_cursor = page.next_cursor;
+            actual.extend(page.chunks);
+            let Some(next) = next_cursor else { break };
+            cursor = Some(next);
+        }
+        assert_eq!(actual, expected);
+        assert!(matches!(
+            store.list_chunks_page(None, 0),
+            Err(FluxError::InvalidArg(_))
+        ));
+    }
 }

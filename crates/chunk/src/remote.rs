@@ -11,7 +11,7 @@ use fluxfs_proto::chunk::v1::{
     PutChunkRequest,
 };
 use fluxfs_proto::ChunkWorkerClient;
-use fluxfs_types::{ChunkId, FluxError, Result, WorkerTargetId, CHUNK_SIZE};
+use fluxfs_types::{ChunkId, ChunkPage, FluxError, Result, WorkerTargetId, CHUNK_SIZE};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc;
 use std::thread;
@@ -42,8 +42,10 @@ enum Command {
     Repair {
         reply: RpcReply<RepairReport>,
     },
-    ListChunks {
-        reply: RpcReply<Vec<ChunkId>>,
+    ListChunksPage {
+        cursor: Option<ChunkId>,
+        limit: usize,
+        reply: RpcReply<ChunkPage>,
     },
     TargetCount {
         reply: RpcReply<u64>,
@@ -66,6 +68,8 @@ pub struct RepairReport {
 pub struct RemoteReplicatedChunkStore {
     sender: Option<mpsc::SyncSender<Command>>,
     rpc_thread: Option<thread::JoinHandle<()>>,
+    gc_sender: Option<mpsc::SyncSender<Command>>,
+    gc_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl RemoteReplicatedChunkStore {
@@ -100,13 +104,21 @@ impl RemoteReplicatedChunkStore {
         }
 
         let (sender, receiver) = mpsc::sync_channel(max_pending);
+        let (gc_sender, gc_receiver) = mpsc::sync_channel(8);
+        let gc_channels = channels.clone();
         let rpc_thread = thread::Builder::new()
             .name("fluxfs-chunk-rpc".into())
             .spawn(move || rpc_loop(channels, required, receiver))
             .map_err(|error| FluxError::Io(format!("spawn chunk RPC thread: {error}")))?;
+        let gc_thread = thread::Builder::new()
+            .name("fluxfs-chunk-gc-rpc".into())
+            .spawn(move || rpc_loop(gc_channels, required, gc_receiver))
+            .map_err(|error| FluxError::Io(format!("spawn chunk GC RPC thread: {error}")))?;
         Ok(Self {
             sender: Some(sender),
             rpc_thread: Some(rpc_thread),
+            gc_sender: Some(gc_sender),
+            gc_thread: Some(gc_thread),
         })
     }
 
@@ -122,6 +134,16 @@ impl RemoteReplicatedChunkStore {
     fn call<T>(&self, command: impl FnOnce(RpcReply<T>) -> Command) -> Result<T> {
         let (reply, response) = mpsc::channel();
         self.sender
+            .as_ref()
+            .ok_or(FluxError::Busy)?
+            .try_send(command(reply))
+            .map_err(|_| FluxError::Busy)?;
+        response.recv().map_err(|_| FluxError::Busy)?
+    }
+
+    fn call_gc<T>(&self, command: impl FnOnce(RpcReply<T>) -> Command) -> Result<T> {
+        let (reply, response) = mpsc::channel();
+        self.gc_sender
             .as_ref()
             .ok_or(FluxError::Busy)?
             .try_send(command(reply))
@@ -147,7 +169,23 @@ impl ChunkStore for RemoteReplicatedChunkStore {
     }
 
     fn list_chunks(&self) -> Result<Vec<ChunkId>> {
-        self.call(|reply| Command::ListChunks { reply })
+        let mut chunks = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self.list_chunks_page(cursor, 1024)?;
+            chunks.extend(page.chunks);
+            let Some(next) = page.next_cursor else { break };
+            cursor = Some(next);
+        }
+        Ok(chunks)
+    }
+
+    fn list_chunks_page(&self, cursor: Option<ChunkId>, limit: usize) -> Result<ChunkPage> {
+        self.call_gc(|reply| Command::ListChunksPage {
+            cursor,
+            limit,
+            reply,
+        })
     }
 
     fn delete(&self, id: &ChunkId) -> Result<()> {
@@ -158,12 +196,12 @@ impl ChunkStore for RemoteReplicatedChunkStore {
     }
 
     fn gc_delete_targets(&self) -> Result<Vec<WorkerTargetId>> {
-        let count = self.call(|reply| Command::TargetCount { reply })?;
+        let count = self.call_gc(|reply| Command::TargetCount { reply })?;
         Ok((0..count).map(WorkerTargetId).collect())
     }
 
     fn delete_from_target(&self, id: &ChunkId, target: WorkerTargetId) -> Result<()> {
-        self.call(|reply| Command::DeleteTarget {
+        self.call_gc(|reply| Command::DeleteTarget {
             id: *id,
             target,
             reply,
@@ -174,7 +212,11 @@ impl ChunkStore for RemoteReplicatedChunkStore {
 impl Drop for RemoteReplicatedChunkStore {
     fn drop(&mut self) {
         self.sender.take();
+        self.gc_sender.take();
         if let Some(thread) = self.rpc_thread.take() {
+            let _ = thread.join();
+        }
+        if let Some(thread) = self.gc_thread.take() {
             let _ = thread.join();
         }
     }
@@ -358,8 +400,12 @@ async fn handle_command(
             .await;
             let _ = reply.send(result);
         }
-        Command::ListChunks { reply } => {
-            let result = all_chunks(clients).await;
+        Command::ListChunksPage {
+            cursor,
+            limit,
+            reply,
+        } => {
+            let result = all_chunks_page(clients, cursor, limit).await;
             let _ = reply.send(result);
         }
         Command::TargetCount { reply } => {
@@ -387,13 +433,33 @@ async fn handle_command(
     }
 }
 
-async fn all_chunks(clients: &mut [ChunkWorkerClient<Channel>]) -> Result<Vec<ChunkId>> {
+async fn all_chunks_page(
+    clients: &mut [ChunkWorkerClient<Channel>],
+    cursor: Option<ChunkId>,
+    limit: usize,
+) -> Result<ChunkPage> {
+    if limit == 0 {
+        return Err(FluxError::InvalidArg(
+            "chunk inventory page limit must be non-zero".into(),
+        ));
+    }
     let mut chunks = Vec::new();
     let mut reached = 0usize;
+    let mut worker_has_more = false;
     for client in clients.iter_mut() {
-        if let Ok(response) = client.list_chunks(ListChunksRequest {}).await {
+        if let Ok(response) = client
+            .list_chunks(ListChunksRequest {
+                after_chunk_id: cursor
+                    .map(|chunk| chunk.as_bytes().to_vec())
+                    .unwrap_or_default(),
+                limit: limit.try_into().unwrap_or(u32::MAX),
+            })
+            .await
+        {
             reached += 1;
-            for raw in response.into_inner().chunk_ids {
+            let response = response.into_inner();
+            worker_has_more |= !response.next_cursor.is_empty();
+            for raw in response.chunk_ids {
                 chunks.push(ChunkId::try_from(raw.as_slice())?);
             }
         }
@@ -403,7 +469,13 @@ async fn all_chunks(clients: &mut [ChunkWorkerClient<Channel>]) -> Result<Vec<Ch
     }
     chunks.sort_by_key(ChunkId::to_hex);
     chunks.dedup();
-    Ok(chunks)
+    let has_more = worker_has_more || chunks.len() > limit;
+    chunks.truncate(limit);
+    let next_cursor = has_more.then(|| *chunks.last().expect("non-empty inventory page"));
+    Ok(ChunkPage {
+        chunks,
+        next_cursor,
+    })
 }
 
 async fn healthy_workers(
@@ -469,7 +541,10 @@ async fn repair_with_health(
     let mut inventory = BTreeMap::<ChunkId, BTreeSet<u64>>::new();
     for (worker_id, index) in healthy {
         let response = clients[*index]
-            .list_chunks(ListChunksRequest {})
+            .list_chunks(ListChunksRequest {
+                after_chunk_id: Vec::new(),
+                limit: u32::MAX,
+            })
             .await
             .map_err(rpc_status_error)?
             .into_inner();
@@ -571,7 +646,34 @@ mod tests {
         let store = RemoteReplicatedChunkStore {
             sender: Some(sender),
             rpc_thread: None,
+            gc_sender: None,
+            gc_thread: None,
         };
         assert_eq!(store.available_workers(), Err(FluxError::Busy));
+    }
+
+    #[test]
+    fn saturated_foreground_queue_does_not_block_gc_queue() {
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        let (reply, _response) = mpsc::channel();
+        sender
+            .try_send(Command::AvailableWorkers { reply })
+            .unwrap();
+        let (gc_sender, gc_receiver) = mpsc::sync_channel(1);
+        let gc_thread = thread::spawn(move || {
+            if let Ok(Command::TargetCount { reply }) = gc_receiver.recv() {
+                let _ = reply.send(Ok(3));
+            }
+        });
+        let store = RemoteReplicatedChunkStore {
+            sender: Some(sender),
+            rpc_thread: None,
+            gc_sender: Some(gc_sender),
+            gc_thread: Some(gc_thread),
+        };
+        assert_eq!(
+            store.gc_delete_targets().unwrap(),
+            vec![WorkerTargetId(0), WorkerTargetId(1), WorkerTargetId(2)]
+        );
     }
 }

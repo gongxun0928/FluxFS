@@ -29,6 +29,9 @@ struct Cli {
     /// Maximum concurrent data operations. Excess RPCs fail fast with RESOURCE_EXHAUSTED.
     #[arg(long, default_value_t = 128)]
     max_in_flight: usize,
+    /// Independent low-priority GC operations; never consume foreground permits.
+    #[arg(long, default_value_t = 1)]
+    gc_max_in_flight: usize,
     /// Optional Prometheus text endpoint, e.g. 127.0.0.1:9102 (`GET /metrics`).
     #[arg(long)]
     metrics_listen: Option<SocketAddr>,
@@ -38,12 +41,17 @@ struct ChunkSvc {
     worker_id: u64,
     store: Arc<DiskChunkStore>,
     in_flight: Arc<Semaphore>,
+    gc_in_flight: Arc<Semaphore>,
     metrics: Arc<FluxMetrics>,
 }
 
 impl ChunkSvc {
     fn try_enter(&self) -> Result<OwnedSemaphorePermit, Status> {
         try_enter(&self.in_flight)
+    }
+
+    fn try_enter_gc(&self) -> Result<OwnedSemaphorePermit, Status> {
+        try_enter(&self.gc_in_flight)
     }
 }
 
@@ -144,20 +152,35 @@ impl ChunkWorker for ChunkSvc {
 
     async fn list_chunks(
         &self,
-        _request: Request<ListChunksRequest>,
+        request: Request<ListChunksRequest>,
     ) -> Result<Response<ListChunksResponse>, Status> {
-        let _permit = self.try_enter()?;
+        let _permit = self.try_enter_gc()?;
+        let request = request.into_inner();
+        let limit = usize::try_from(request.limit)
+            .ok()
+            .filter(|limit| *limit > 0)
+            .ok_or_else(|| Status::invalid_argument("inventory limit must be non-zero"))?;
+        let cursor = if request.after_chunk_id.is_empty() {
+            None
+        } else {
+            Some(ChunkId::try_from(request.after_chunk_id.as_slice()).map_err(status_from_flux)?)
+        };
         let store = Arc::clone(&self.store);
-        let chunks = tokio::task::spawn_blocking(move || store.list_chunks())
+        let page = tokio::task::spawn_blocking(move || store.list_chunks_page(cursor, limit))
             .await
             .map_err(|error| Status::internal(format!("chunk inventory task: {error}")))?
             .map_err(status_from_flux)?;
         Ok(Response::new(ListChunksResponse {
-            chunk_ids: chunks
+            chunk_ids: page
+                .chunks
                 .into_iter()
                 .map(|chunk| chunk.as_bytes().to_vec())
                 .collect(),
             worker_id: self.worker_id,
+            next_cursor: page
+                .next_cursor
+                .map(|chunk| chunk.as_bytes().to_vec())
+                .unwrap_or_default(),
         }))
     }
 
@@ -165,7 +188,7 @@ impl ChunkWorker for ChunkSvc {
         &self,
         request: Request<DeleteChunkRequest>,
     ) -> Result<Response<DeleteChunkResponse>, Status> {
-        let _permit = self.try_enter()?;
+        let _permit = self.try_enter_gc()?;
         let chunk = ChunkId::try_from(request.into_inner().chunk_id.as_slice())
             .map_err(status_from_flux)?;
         let store = Arc::clone(&self.store);
@@ -194,8 +217,8 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let cli = Cli::parse();
-    if cli.max_in_flight == 0 {
-        anyhow::bail!("--max-in-flight must be greater than zero");
+    if cli.max_in_flight == 0 || cli.gc_max_in_flight == 0 {
+        anyhow::bail!("--max-in-flight and --gc-max-in-flight must be greater than zero");
     }
     let store = Arc::new(DiskChunkStore::open(&cli.data_dir).context("open chunk store")?);
     let metrics = FluxMetrics::new();
@@ -207,6 +230,7 @@ async fn main() -> Result<()> {
         worker_id: cli.worker_id,
         store,
         in_flight: Arc::new(Semaphore::new(cli.max_in_flight)),
+        gc_in_flight: Arc::new(Semaphore::new(cli.gc_max_in_flight)),
         metrics,
     };
     println!(

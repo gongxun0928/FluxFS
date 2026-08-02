@@ -129,6 +129,12 @@ pub struct HydrateToken(pub u64);
 )]
 pub struct ChunkIndex(pub u32);
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChunkPage {
+    pub chunks: Vec<ChunkId>,
+    pub next_cursor: Option<ChunkId>,
+}
+
 /// Content-addressed chunk id (blake3).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ChunkId([u8; 32]);

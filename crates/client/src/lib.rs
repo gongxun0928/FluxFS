@@ -314,29 +314,15 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
             report.removed_chunks += self.reclaim_tombstones(batch)?;
             return Ok(report);
         }
-        let mut inventory = self.chunks.list_chunks()?;
-        inventory.sort_by_key(ChunkId::to_hex);
         let mut cursor = self
             .gc_cursor
             .lock()
             .map_err(|_| FluxError::Io("GC cursor lock poisoned".into()))?;
-        let start = match *cursor {
-            Some(last) => inventory
-                .iter()
-                .position(|chunk| *chunk > last)
-                .unwrap_or(0),
-            None => 0,
-        };
-        let end = start.saturating_add(batch_size).min(inventory.len());
-        let candidates = &inventory[start..end];
-        *cursor = if end == inventory.len() {
-            None
-        } else {
-            candidates.last().copied()
-        };
+        let page = self.chunks.list_chunks_page(*cursor, batch_size)?;
+        *cursor = page.next_cursor;
         drop(cursor);
 
-        let batch = self.meta.tombstone_gc_batch(candidates)?;
+        let batch = self.meta.tombstone_gc_batch(&page.chunks)?;
         report.removed_manifests += batch.removed_manifests;
         let created = self
             .meta
