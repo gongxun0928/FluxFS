@@ -42,7 +42,7 @@ pub struct HydrateToken(pub u64);
 pub struct ChunkIndex(pub u32);
 
 /// Content-addressed chunk id (blake3).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ChunkId([u8; 32]);
 
 impl ChunkId {

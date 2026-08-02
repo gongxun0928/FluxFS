@@ -56,6 +56,14 @@ start_worker0() {
     wait_port "$worker0_port"
 }
 
+start_worker1() {
+    "$repo_dir/target/debug/fluxfs-chunkworker" \
+        --worker-id 1 --listen "127.0.0.1:$worker1_port" \
+        --data-dir "$test_root/worker-1" >"$test_root/worker-1.log" 2>&1 &
+    worker1_pid=$!
+    wait_port "$worker1_port"
+}
+
 start_meta() {
     "$repo_dir/target/debug/fluxfs-metamaster" \
         --listen "127.0.0.1:$meta_port" --data-dir "$test_root/meta" \
@@ -94,16 +102,12 @@ cargo build --manifest-path "$repo_dir/Cargo.toml" \
 
 start_meta
 start_worker0
-"$repo_dir/target/debug/fluxfs-chunkworker" \
-    --worker-id 1 --listen "127.0.0.1:$worker1_port" \
-    --data-dir "$test_root/worker-1" >"$test_root/worker-1.log" 2>&1 &
-worker1_pid=$!
+start_worker1
 "$repo_dir/target/debug/fluxfs-chunkworker" \
     --worker-id 2 --listen "127.0.0.1:$worker2_port" \
     --data-dir "$test_root/worker-2" >"$test_root/worker-2.log" 2>&1 &
 worker2_pid=$!
 
-wait_port "$worker1_port"
 wait_port "$worker2_port"
 start_mount
 
@@ -117,22 +121,30 @@ test "$(find "$test_root/worker-0/objects" -type f | wc -l)" -ge 1
 test "$(find "$test_root/worker-1/objects" -type f | wc -l)" -ge 1
 test "$(find "$test_root/worker-2/objects" -type f 2>/dev/null | wc -l)" -eq 0
 
-# The fixed RF=2 set is workers 0/1. With worker 0 down, old data remains
-# readable from worker 1, but a new authoritative write must not ACK.
+# The initial RF=2 set is workers 0/1. With worker 0 down, reads from worker 1
+# lazily copy accessed chunks to spare worker 2. Before the next write ACKs, a
+# full inventory sweep restores every reachable authoritative chunk to RF=2.
 kill "$worker0_pid"
 wait "$worker0_pid" 2>/dev/null || true
 worker0_pid=""
 test "$(cat "$mount_dir/durable.txt")" = "multiprocess durable"
 cmp "$test_root/large.expected" "$mount_dir/large.bin"
-if printf 'must-not-ack\n' >>"$mount_dir/durable.txt" 2>/dev/null; then
-    echo "write unexpectedly ACKed below RF=2" >&2
-    exit 1
-fi
-test "$(cat "$mount_dir/durable.txt")" = "multiprocess durable"
+test "$(find "$test_root/worker-2/objects" -type f | wc -l)" -ge 3
+printf 'repaired-to-spare\n' >>"$mount_dir/durable.txt"
+test "$(tail -n 1 "$mount_dir/durable.txt")" = "repaired-to-spare"
 
 start_worker0
-printf 'repaired-service\n' >>"$mount_dir/durable.txt"
-test "$(tail -n 1 "$mount_dir/durable.txt")" = "repaired-service"
+printf 'worker-zero-returned\n' >>"$mount_dir/durable.txt"
+test "$(tail -n 1 "$mount_dir/durable.txt")" = "worker-zero-returned"
+
+# A second topology change repairs the mixed 0/1 and 1/2 placements to 0/2
+# before allowing a new write.
+kill "$worker1_pid"
+wait "$worker1_pid" 2>/dev/null || true
+worker1_pid=""
+test "$(tail -n 1 "$mount_dir/durable.txt")" = "worker-zero-returned"
+printf 'rebalanced-to-zero-two\n' >>"$mount_dir/durable.txt"
+test "$(tail -n 1 "$mount_dir/durable.txt")" = "rebalanced-to-zero-two"
 
 # MetaMaster is a separate process too. Before OpenRaft HA lands, killing it
 # makes metadata-dependent reads unavailable; reopening the same heed state
@@ -145,16 +157,16 @@ if cat "$mount_dir/durable.txt" >/dev/null 2>&1; then
     exit 1
 fi
 start_meta
-test "$(tail -n 1 "$mount_dir/durable.txt")" = "repaired-service"
+test "$(tail -n 1 "$mount_dir/durable.txt")" = "rebalanced-to-zero-two"
 
 fusermount3 -u "$mount_dir"
 wait "$mount_pid"
 mount_pid=""
 start_mount
-test "$(tail -n 1 "$mount_dir/durable.txt")" = "repaired-service"
+test "$(tail -n 1 "$mount_dir/durable.txt")" = "rebalanced-to-zero-two"
 cmp "$test_root/large.expected" "$mount_dir/large.bin"
 fusermount3 -u "$mount_dir"
 wait "$mount_pid"
 mount_pid=""
 
-echo "multi-process Meta + 3 Workers + FUSE, RF=2 failure policy: ok"
+echo "multi-process Meta + 3 Workers + FUSE, RF=2 automatic repair/rebalance: ok"

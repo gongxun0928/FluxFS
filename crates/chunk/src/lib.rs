@@ -10,6 +10,6 @@ mod store;
 
 pub use disk::DiskChunkStore;
 pub use foyer_store::FoyerChunkStore;
-pub use remote::RemoteReplicatedChunkStore;
+pub use remote::{RemoteReplicatedChunkStore, RepairReport};
 pub use replicated::{PutReceipt, ReplicaHealth, ReplicatedChunkStore};
 pub use store::ChunkStore;

@@ -161,6 +161,9 @@ fn run_mount(
     if available.len() < 2 {
         bail!("RF=2 requires two ready distinct ChunkWorkers; ready={available:?}");
     }
+    chunks
+        .repair()
+        .context("repair remote RF=2 chunks before mount")?;
     mount_with_chunks(data_dir, mountpoint, meta_addr, chunks, "remote RF=2")
 }
 

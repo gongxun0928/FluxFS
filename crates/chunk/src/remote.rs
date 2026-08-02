@@ -7,11 +7,11 @@
 
 use crate::ChunkStore;
 use fluxfs_proto::chunk::v1::{
-    ContainsChunkRequest, GetChunkRequest, HealthRequest, PutChunkRequest,
+    ContainsChunkRequest, GetChunkRequest, HealthRequest, ListChunksRequest, PutChunkRequest,
 };
 use fluxfs_proto::ChunkWorkerClient;
 use fluxfs_types::{ChunkId, FluxError, Result, CHUNK_SIZE};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -37,6 +37,16 @@ enum Command {
     AvailableWorkers {
         reply: RpcReply<Vec<u64>>,
     },
+    Repair {
+        reply: RpcReply<RepairReport>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairReport {
+    pub healthy_workers: Vec<u64>,
+    pub checked_chunks: usize,
+    pub repaired_replicas: usize,
 }
 
 /// RF=N client whose ACK requires distinct durable Worker process responses.
@@ -76,6 +86,11 @@ impl RemoteReplicatedChunkStore {
 
     pub fn available_workers(&self) -> Result<Vec<u64>> {
         self.call(|reply| Command::AvailableWorkers { reply })
+    }
+
+    /// Scrub all reachable Worker inventories and restore every known chunk to RF=N.
+    pub fn repair(&self) -> Result<RepairReport> {
+        self.call(|reply| Command::Repair { reply })
     }
 
     fn call<T>(&self, command: impl FnOnce(RpcReply<T>) -> Command) -> Result<T> {
@@ -131,36 +146,51 @@ fn rpc_loop(channels: Vec<Channel>, required: usize, receiver: mpsc::Receiver<Co
                 .max_encoding_message_size(MAX_CHUNK_RPC_MESSAGE)
         })
         .collect::<Vec<_>>();
+    let mut last_healthy = BTreeSet::new();
     while let Ok(command) = receiver.recv() {
-        runtime.block_on(handle_command(&mut clients, required, command));
+        runtime.block_on(handle_command(
+            &mut clients,
+            required,
+            &mut last_healthy,
+            command,
+        ));
     }
 }
 
 async fn handle_command(
     clients: &mut [ChunkWorkerClient<Channel>],
     required: usize,
+    last_healthy: &mut BTreeSet<u64>,
     command: Command,
 ) {
     match command {
         Command::Put { data, reply } => {
             let expected = ChunkId::from_bytes(&data);
+            let healthy = match healthy_workers(clients).await {
+                Ok(healthy) => healthy,
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                    return;
+                }
+            };
+            let current = healthy.keys().copied().collect::<BTreeSet<_>>();
+            if &current != last_healthy {
+                match repair_with_health(clients, required, &healthy).await {
+                    Ok(_) => *last_healthy = current,
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                        return;
+                    }
+                }
+            }
             let mut durable_workers = BTreeSet::new();
             let mut errors = Vec::new();
-            for client in clients.iter_mut().take(required) {
-                match client
-                    .put_chunk(PutChunkRequest { data: data.clone() })
-                    .await
-                {
-                    Ok(response) => {
-                        let response = response.into_inner();
-                        match ChunkId::try_from(response.chunk_id.as_slice()) {
-                            Ok(id) if id == expected && response.durable => {
-                                durable_workers.insert(response.worker_id);
-                            }
-                            Ok(_) => {
-                                errors.push("worker returned mismatched/non-durable chunk".into())
-                            }
-                            Err(error) => errors.push(error.to_string()),
+            for (worker_id, index) in &healthy {
+                match put_one(&mut clients[*index], *worker_id, &data, expected).await {
+                    Ok(()) => {
+                        durable_workers.insert(*worker_id);
+                        if durable_workers.len() == required {
+                            break;
                         }
                     }
                     Err(error) => errors.push(error.to_string()),
@@ -182,7 +212,8 @@ async fn handle_command(
         Command::Get { id, reply } => {
             let mut errors = Vec::new();
             let mut result = None;
-            for client in clients.iter_mut().take(required) {
+            let mut source_worker = None;
+            for client in clients.iter_mut() {
                 match client
                     .get_chunk(GetChunkRequest {
                         chunk_id: id.as_bytes().to_vec(),
@@ -190,14 +221,35 @@ async fn handle_command(
                     .await
                 {
                     Ok(response) => {
-                        let data = response.into_inner().data;
+                        let response = response.into_inner();
+                        let data = response.data;
                         if ChunkId::from_bytes(&data) == id {
                             result = Some(data);
+                            source_worker = Some(response.worker_id);
                             break;
                         }
                         errors.push("worker returned data with wrong checksum".into());
                     }
                     Err(error) => errors.push(error.to_string()),
+                }
+            }
+            if let (Some(data), Some(source_worker)) = (result.as_ref(), source_worker) {
+                if let Ok(healthy) = healthy_workers(clients).await {
+                    let mut repaired = BTreeSet::from([source_worker]);
+                    for (worker_id, index) in healthy {
+                        if repaired.len() == required {
+                            break;
+                        }
+                        if repaired.contains(&worker_id) {
+                            continue;
+                        }
+                        if put_one(&mut clients[index], worker_id, data, id)
+                            .await
+                            .is_ok()
+                        {
+                            repaired.insert(worker_id);
+                        }
+                    }
                 }
             }
             let _ = reply.send(result.ok_or_else(|| {
@@ -210,7 +262,7 @@ async fn handle_command(
         }
         Command::Contains { id, reply } => {
             let mut present_workers = BTreeSet::new();
-            for client in clients.iter_mut().take(required) {
+            for client in clients.iter_mut() {
                 if let Ok(response) = client
                     .contains_chunk(ContainsChunkRequest {
                         chunk_id: id.as_bytes().to_vec(),
@@ -226,18 +278,150 @@ async fn handle_command(
             let _ = reply.send(Ok(present_workers.len() >= required));
         }
         Command::AvailableWorkers { reply } => {
-            let mut workers = BTreeSet::new();
-            for client in clients.iter_mut() {
-                if let Ok(response) = client.health(HealthRequest {}).await {
-                    let response = response.into_inner();
-                    if response.ready {
-                        workers.insert(response.worker_id);
-                    }
-                }
+            let result = healthy_workers(clients).await.map(|healthy| {
+                let workers = healthy.keys().copied().collect::<Vec<_>>();
+                *last_healthy = workers.iter().copied().collect();
+                workers
+            });
+            let _ = reply.send(result);
+        }
+        Command::Repair { reply } => {
+            let result = async {
+                let healthy = healthy_workers(clients).await?;
+                let report = repair_with_health(clients, required, &healthy).await?;
+                *last_healthy = healthy.keys().copied().collect();
+                Ok(report)
             }
-            let _ = reply.send(Ok(workers.into_iter().collect()));
+            .await;
+            let _ = reply.send(result);
         }
     }
+}
+
+async fn healthy_workers(
+    clients: &mut [ChunkWorkerClient<Channel>],
+) -> Result<BTreeMap<u64, usize>> {
+    let mut healthy = BTreeMap::new();
+    for (index, client) in clients.iter_mut().enumerate() {
+        if let Ok(response) = client.health(HealthRequest {}).await {
+            let response = response.into_inner();
+            if response.ready && healthy.insert(response.worker_id, index).is_some() {
+                return Err(FluxError::InvalidArg(format!(
+                    "duplicate remote worker id {}",
+                    response.worker_id
+                )));
+            }
+        }
+    }
+    Ok(healthy)
+}
+
+async fn put_one(
+    client: &mut ChunkWorkerClient<Channel>,
+    expected_worker: u64,
+    data: &[u8],
+    expected_chunk: ChunkId,
+) -> Result<()> {
+    let response = client
+        .put_chunk(PutChunkRequest {
+            data: data.to_vec(),
+        })
+        .await
+        .map_err(|error| FluxError::Io(error.to_string()))?
+        .into_inner();
+    let chunk = ChunkId::try_from(response.chunk_id.as_slice())?;
+    if response.worker_id != expected_worker || chunk != expected_chunk || !response.durable {
+        return Err(FluxError::Io(format!(
+            "worker {expected_worker} returned mismatched/non-durable chunk"
+        )));
+    }
+    Ok(())
+}
+
+async fn repair_with_health(
+    clients: &mut [ChunkWorkerClient<Channel>],
+    required: usize,
+    healthy: &BTreeMap<u64, usize>,
+) -> Result<RepairReport> {
+    if healthy.len() < required {
+        return Err(FluxError::Io(format!(
+            "repair requires {required} healthy workers, found {}",
+            healthy.len()
+        )));
+    }
+
+    let mut inventory = BTreeMap::<ChunkId, BTreeSet<u64>>::new();
+    for (worker_id, index) in healthy {
+        let response = clients[*index]
+            .list_chunks(ListChunksRequest {})
+            .await
+            .map_err(|error| FluxError::Io(format!("list worker {worker_id}: {error}")))?
+            .into_inner();
+        if response.worker_id != *worker_id {
+            return Err(FluxError::Io(format!(
+                "inventory worker id mismatch: expected {worker_id}, got {}",
+                response.worker_id
+            )));
+        }
+        for raw in response.chunk_ids {
+            inventory
+                .entry(ChunkId::try_from(raw.as_slice())?)
+                .or_default()
+                .insert(*worker_id);
+        }
+    }
+
+    let checked_chunks = inventory.len();
+    let mut repaired_replicas = 0;
+    for (chunk, mut holders) in inventory {
+        if holders.len() >= required {
+            continue;
+        }
+        let source = holders
+            .iter()
+            .next()
+            .and_then(|worker_id| healthy.get(worker_id))
+            .copied()
+            .ok_or_else(|| FluxError::Io(format!("no source replica for {}", chunk.to_hex())))?;
+        let response = clients[source]
+            .get_chunk(GetChunkRequest {
+                chunk_id: chunk.as_bytes().to_vec(),
+            })
+            .await
+            .map_err(|error| FluxError::Io(format!("read repair source: {error}")))?
+            .into_inner();
+        if ChunkId::from_bytes(&response.data) != chunk {
+            return Err(FluxError::Io(format!(
+                "repair source checksum mismatch for {}",
+                chunk.to_hex()
+            )));
+        }
+        for (worker_id, index) in healthy {
+            if holders.len() >= required {
+                break;
+            }
+            if holders.contains(worker_id) {
+                continue;
+            }
+            put_one(&mut clients[*index], *worker_id, &response.data, chunk).await?;
+            holders.insert(*worker_id);
+            repaired_replicas += 1;
+        }
+        if holders.len() < required {
+            return Err(FluxError::Io(format!(
+                "repair left {} at {}/{} replicas",
+                chunk.to_hex(),
+                holders.len(),
+                required
+            )));
+        }
+    }
+
+    Ok(RepairReport {
+        healthy_workers: healthy.keys().copied().collect(),
+        checked_chunks,
+        repaired_replicas,
+    })
 }
 
 #[cfg(test)]
