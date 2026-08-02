@@ -13,6 +13,12 @@ truncate, mkdir/readdir, unlink, unmount/remount, process-crash recovery, and
 single-replica read fallback are executable. OpenRaft replication and UFS-backed
 lazy read/write-back remain next-stage work.
 
+The same Ephemeral path also runs as five localhost processes: one MetaMaster,
+three ChunkWorkers, and one FUSE/client. Meta and chunk traffic use tonic/TCP;
+worker-0/1 form the initial fixed RF=2 set and worker-2 is a repair spare.
+OpenRaft is not yet on the Meta write path, so this is process separation rather
+than metadata HA.
+
 Design: [`docs/mvp-v0.1.md`](docs/mvp-v0.1.md) · Alpha gates: [`docs/alpha-checklist.md`](docs/alpha-checklist.md)
 
 ## Workspace
@@ -21,7 +27,10 @@ Design: [`docs/mvp-v0.1.md`](docs/mvp-v0.1.md) · Alpha gates: [`docs/alpha-chec
 crates/
   types/    shared inode/dentry/chunk types
   meta/     MetaStore trait, heed backend, openraft stubs
+  proto/    tonic/protobuf Meta and ChunkWorker contracts
+  metamaster/ independent heed + tonic metadata process
   chunk/    RF=2 authoritative disk store + evictable foyer facade
+  chunkworker/ independent durable chunk process
   ufs/      OpenDAL adapter
   client/   internal API (not public SDK)
   fuse/     Ephemeral FUSE operations
@@ -38,6 +47,7 @@ cargo run -p fluxfs -- smoke --data-dir /tmp/fluxfs-smoke
 # Automated local acceptance (exit 77 when FUSE is unavailable)
 ./scripts/test-local-mount.sh
 ./scripts/test-local-crash-restart.sh
+./scripts/test-multiprocess.sh
 
 # Ephemeral local mount (no UFS)
 mkdir -p /tmp/fluxfs-data /tmp/fluxfs-mnt
