@@ -11,6 +11,7 @@ use fluxfs_types::{ChunkId, FluxError, CHUNK_SIZE};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response, Status};
 
 const MAX_CHUNK_RPC_MESSAGE: usize = CHUNK_SIZE as usize + 64 * 1024;
@@ -24,11 +25,27 @@ struct Cli {
     data_dir: PathBuf,
     #[arg(long)]
     listen: SocketAddr,
+    /// Maximum concurrent data operations. Excess RPCs fail fast with RESOURCE_EXHAUSTED.
+    #[arg(long, default_value_t = 128)]
+    max_in_flight: usize,
 }
 
 struct ChunkSvc {
     worker_id: u64,
     store: Arc<DiskChunkStore>,
+    in_flight: Arc<Semaphore>,
+}
+
+impl ChunkSvc {
+    fn try_enter(&self) -> Result<OwnedSemaphorePermit, Status> {
+        try_enter(&self.in_flight)
+    }
+}
+
+fn try_enter(in_flight: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit, Status> {
+    Arc::clone(in_flight)
+        .try_acquire_owned()
+        .map_err(|_| Status::resource_exhausted("chunk worker in-flight limit reached"))
 }
 
 #[tonic::async_trait]
@@ -37,6 +54,7 @@ impl ChunkWorker for ChunkSvc {
         &self,
         request: Request<PutChunkRequest>,
     ) -> Result<Response<PutChunkResponse>, Status> {
+        let _permit = self.try_enter()?;
         let data = request.into_inner().data;
         let store = Arc::clone(&self.store);
         let chunk = tokio::task::spawn_blocking(move || store.put(&data))
@@ -54,6 +72,7 @@ impl ChunkWorker for ChunkSvc {
         &self,
         request: Request<GetChunkRequest>,
     ) -> Result<Response<GetChunkResponse>, Status> {
+        let _permit = self.try_enter()?;
         let chunk = ChunkId::try_from(request.into_inner().chunk_id.as_slice())
             .map_err(status_from_flux)?;
         let store = Arc::clone(&self.store);
@@ -71,6 +90,7 @@ impl ChunkWorker for ChunkSvc {
         &self,
         request: Request<ContainsChunkRequest>,
     ) -> Result<Response<ContainsChunkResponse>, Status> {
+        let _permit = self.try_enter()?;
         let chunk = ChunkId::try_from(request.into_inner().chunk_id.as_slice())
             .map_err(status_from_flux)?;
         let store = Arc::clone(&self.store);
@@ -98,6 +118,7 @@ impl ChunkWorker for ChunkSvc {
         &self,
         _request: Request<ListChunksRequest>,
     ) -> Result<Response<ListChunksResponse>, Status> {
+        let _permit = self.try_enter()?;
         let store = Arc::clone(&self.store);
         let chunks = tokio::task::spawn_blocking(move || store.list_chunks())
             .await
@@ -116,6 +137,7 @@ impl ChunkWorker for ChunkSvc {
         &self,
         request: Request<DeleteChunkRequest>,
     ) -> Result<Response<DeleteChunkResponse>, Status> {
+        let _permit = self.try_enter()?;
         let chunk = ChunkId::try_from(request.into_inner().chunk_id.as_slice())
             .map_err(status_from_flux)?;
         let store = Arc::clone(&self.store);
@@ -144,16 +166,21 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let cli = Cli::parse();
+    if cli.max_in_flight == 0 {
+        anyhow::bail!("--max-in-flight must be greater than zero");
+    }
     let store = Arc::new(DiskChunkStore::open(&cli.data_dir).context("open chunk store")?);
     let service = ChunkSvc {
         worker_id: cli.worker_id,
         store,
+        in_flight: Arc::new(Semaphore::new(cli.max_in_flight)),
     };
     println!(
-        "fluxfs-chunkworker id={} listening on {} data_dir={}",
+        "fluxfs-chunkworker id={} listening on {} data_dir={} max_in_flight={}",
         cli.worker_id,
         cli.listen,
-        cli.data_dir.display()
+        cli.data_dir.display(),
+        cli.max_in_flight
     );
     tonic::transport::Server::builder()
         .add_service(
@@ -165,4 +192,17 @@ async fn main() -> Result<()> {
         .await
         .context("serve chunk worker")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn in_flight_gate_rejects_without_queueing() {
+        let gate = Arc::new(Semaphore::new(1));
+        let _held = try_enter(&gate).unwrap();
+        let error = try_enter(&gate).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    }
 }

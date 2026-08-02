@@ -19,6 +19,7 @@ use std::time::Duration;
 use tonic::transport::{Channel, Endpoint};
 
 const MAX_CHUNK_RPC_MESSAGE: usize = CHUNK_SIZE as usize + 64 * 1024;
+pub const DEFAULT_MAX_PENDING_CHUNK_OPS: usize = 64;
 
 type RpcReply<T> = mpsc::Sender<Result<T>>;
 
@@ -59,17 +60,30 @@ pub struct RepairReport {
 
 /// RF=N client whose ACK requires distinct durable Worker process responses.
 pub struct RemoteReplicatedChunkStore {
-    sender: Option<mpsc::Sender<Command>>,
+    sender: Option<mpsc::SyncSender<Command>>,
     rpc_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl RemoteReplicatedChunkStore {
     pub fn new(worker_endpoints: Vec<String>, required: usize) -> Result<Self> {
+        Self::new_with_max_pending(worker_endpoints, required, DEFAULT_MAX_PENDING_CHUNK_OPS)
+    }
+
+    pub fn new_with_max_pending(
+        worker_endpoints: Vec<String>,
+        required: usize,
+        max_pending: usize,
+    ) -> Result<Self> {
         if required == 0 || worker_endpoints.len() < required {
             return Err(FluxError::InvalidArg(format!(
                 "remote replication requires {required} workers, got {} endpoints",
                 worker_endpoints.len()
             )));
+        }
+        if max_pending == 0 {
+            return Err(FluxError::InvalidArg(
+                "remote chunk max_pending must be greater than zero".into(),
+            ));
         }
         let mut channels = Vec::with_capacity(worker_endpoints.len());
         for endpoint in worker_endpoints {
@@ -81,7 +95,7 @@ impl RemoteReplicatedChunkStore {
             channels.push(channel);
         }
 
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(max_pending);
         let rpc_thread = thread::Builder::new()
             .name("fluxfs-chunk-rpc".into())
             .spawn(move || rpc_loop(channels, required, receiver))
@@ -106,7 +120,7 @@ impl RemoteReplicatedChunkStore {
         self.sender
             .as_ref()
             .ok_or(FluxError::Busy)?
-            .send(command(reply))
+            .try_send(command(reply))
             .map_err(|_| FluxError::Busy)?;
         response.recv().map_err(|_| FluxError::Busy)?
     }
@@ -201,6 +215,7 @@ async fn handle_command(
             }
             let mut durable_workers = BTreeSet::new();
             let mut errors = Vec::new();
+            let mut overloaded = false;
             for (worker_id, index) in &healthy {
                 match put_one(&mut clients[*index], *worker_id, &data, expected).await {
                     Ok(()) => {
@@ -209,11 +224,16 @@ async fn handle_command(
                             break;
                         }
                     }
-                    Err(error) => errors.push(error.to_string()),
+                    Err(error) => {
+                        overloaded |= error == FluxError::Busy;
+                        errors.push(error.to_string());
+                    }
                 }
             }
             let result = if durable_workers.len() >= required {
                 Ok(expected)
+            } else if overloaded {
+                Err(FluxError::Busy)
             } else {
                 Err(FluxError::Io(format!(
                     "remote chunk {} reached {}/{} distinct durable workers: {}",
@@ -229,6 +249,7 @@ async fn handle_command(
             let mut errors = Vec::new();
             let mut result = None;
             let mut source_worker = None;
+            let mut overloaded = false;
             for client in clients.iter_mut() {
                 match client
                     .get_chunk(GetChunkRequest {
@@ -246,7 +267,10 @@ async fn handle_command(
                         }
                         errors.push("worker returned data with wrong checksum".into());
                     }
-                    Err(error) => errors.push(error.to_string()),
+                    Err(error) => {
+                        overloaded |= error.code() == tonic::Code::ResourceExhausted;
+                        errors.push(error.to_string());
+                    }
                 }
             }
             if let (Some(data), Some(source_worker)) = (result.as_ref(), source_worker) {
@@ -268,13 +292,16 @@ async fn handle_command(
                     }
                 }
             }
-            let _ = reply.send(result.ok_or_else(|| {
-                FluxError::Io(format!(
+            let result = match result {
+                Some(data) => Ok(data),
+                None if overloaded => Err(FluxError::Busy),
+                None => Err(FluxError::Io(format!(
                     "no readable remote replica for {}: {}",
                     id.to_hex(),
                     errors.join("; ")
-                ))
-            }));
+                ))),
+            };
+            let _ = reply.send(result);
         }
         Command::Contains { id, reply } => {
             let mut present_workers = BTreeSet::new();
@@ -391,7 +418,7 @@ async fn put_one(
             data: data.to_vec(),
         })
         .await
-        .map_err(|error| FluxError::Io(error.to_string()))?
+        .map_err(rpc_status_error)?
         .into_inner();
     let chunk = ChunkId::try_from(response.chunk_id.as_slice())?;
     if response.worker_id != expected_worker || chunk != expected_chunk || !response.durable {
@@ -400,6 +427,14 @@ async fn put_one(
         )));
     }
     Ok(())
+}
+
+fn rpc_status_error(error: tonic::Status) -> FluxError {
+    if error.code() == tonic::Code::ResourceExhausted {
+        FluxError::Busy
+    } else {
+        FluxError::Io(error.to_string())
+    }
 }
 
 async fn repair_with_health(
@@ -419,7 +454,7 @@ async fn repair_with_health(
         let response = clients[*index]
             .list_chunks(ListChunksRequest {})
             .await
-            .map_err(|error| FluxError::Io(format!("list worker {worker_id}: {error}")))?
+            .map_err(rpc_status_error)?
             .into_inner();
         if response.worker_id != *worker_id {
             return Err(FluxError::Io(format!(
@@ -452,7 +487,7 @@ async fn repair_with_health(
                 chunk_id: chunk.as_bytes().to_vec(),
             })
             .await
-            .map_err(|error| FluxError::Io(format!("read repair source: {error}")))?
+            .map_err(rpc_status_error)?
             .into_inner();
         if ChunkId::from_bytes(&response.data) != chunk {
             return Err(FluxError::Io(format!(
@@ -495,5 +530,31 @@ mod tests {
     #[test]
     fn rejects_too_few_worker_endpoints() {
         assert!(RemoteReplicatedChunkStore::new(vec!["http://127.0.0.1:1".into()], 2).is_err());
+    }
+
+    #[test]
+    fn rejects_zero_pending_capacity() {
+        assert!(matches!(
+            RemoteReplicatedChunkStore::new_with_max_pending(
+                vec!["http://127.0.0.1:1".into()],
+                1,
+                0,
+            ),
+            Err(FluxError::InvalidArg(_))
+        ));
+    }
+
+    #[test]
+    fn full_client_queue_returns_busy_without_blocking() {
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        let (reply, _response) = mpsc::channel();
+        sender
+            .try_send(Command::AvailableWorkers { reply })
+            .unwrap();
+        let store = RemoteReplicatedChunkStore {
+            sender: Some(sender),
+            rpc_thread: None,
+        };
+        assert_eq!(store.available_workers(), Err(FluxError::Busy));
     }
 }

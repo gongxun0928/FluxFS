@@ -14,14 +14,18 @@ imported into FUSE and read with pinned, bounded Range GETs. Random writes copy
 up only touched 4 MiB windows into RF=2 Local extents, keep untouched bytes as
 pinned UFS ranges, then atomically CAS the inode to Dirty. Basic create/read/write, random write,
 truncate, mkdir/readdir, unlink, unmount/remount, process-crash recovery, and
-single-replica read fallback are executable. Safe UFS write-back remains
-next-stage work.
+single-replica read fallback are executable. `fsync` performs conditional,
+digest-verified UFS write-back; startup reconciles durable flush intents and
+reclaims unreachable manifests/chunks before serving FUSE.
 
 The same Ephemeral path also runs as five localhost processes: one MetaMaster,
 three ChunkWorkers, and one FUSE/client. Meta and chunk traffic use tonic/TCP;
 worker-0/1 form the initial RF=2 set and worker-2 is a repair spare. A Worker
 topology change triggers a checksum-valid inventory sweep before the next write;
 missing replicas are copied to healthy Workers until RF=2 is restored.
+ChunkWorkers fail fast above a configurable `--max-in-flight` limit, while the
+remote client bounds queued operations with `--chunk-max-pending` and returns
+typed `Busy` backpressure instead of growing memory without bound.
 Meta writes pass through an OpenRaft single-voter state machine. Vote/log live
 under `meta/raft/`; inode mutations and SM `last_applied` commit in one MetaStore
 write txn. Snapshots export/import full inode/dentry/manifest state. This is

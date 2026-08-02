@@ -44,6 +44,9 @@ enum Cmd {
         /// The first two form the fixed RF=2 replica set; the third is a repair spare.
         #[arg(long = "chunk-worker")]
         chunk_workers: Vec<String>,
+        /// Maximum chunk operations waiting in the remote client queue.
+        #[arg(long, default_value_t = fluxfs_chunk::DEFAULT_MAX_PENDING_CHUNK_OPS)]
+        chunk_max_pending: usize,
     },
     /// Ping a remote MetaMaster (multi-process smoke).
     MetaPing {
@@ -94,11 +97,26 @@ async fn main() -> Result<()> {
             ufs,
             meta_addr,
             chunk_workers,
+            chunk_max_pending,
         } => match (no_ufs, ufs.as_deref()) {
-            (true, None) => run_mount(data_dir, mountpoint, meta_addr, chunk_workers, None)?,
+            (true, None) => run_mount(
+                data_dir,
+                mountpoint,
+                meta_addr,
+                chunk_workers,
+                chunk_max_pending,
+                None,
+            )?,
             (false, Some(uri)) => {
                 let ufs = open_ufs_uri(uri).context("open --ufs")?;
-                run_mount(data_dir, mountpoint, meta_addr, chunk_workers, Some(ufs))?;
+                run_mount(
+                    data_dir,
+                    mountpoint,
+                    meta_addr,
+                    chunk_workers,
+                    chunk_max_pending,
+                    Some(ufs),
+                )?;
             }
             (true, Some(_)) => bail!("pass either --no-ufs or --ufs, not both"),
             (false, None) => {
@@ -234,6 +252,7 @@ fn run_mount(
     mountpoint: PathBuf,
     meta_addr: Option<String>,
     chunk_workers: Vec<String>,
+    chunk_max_pending: usize,
     ufs: Option<Ufs>,
 ) -> Result<()> {
     if !fluxfs_fuse::mount_supported() {
@@ -255,8 +274,9 @@ fn run_mount(
             chunk_workers.len()
         );
     }
-    let chunks = RemoteReplicatedChunkStore::new(chunk_workers, 2)
-        .context("configure remote RF=2 chunks")?;
+    let chunks =
+        RemoteReplicatedChunkStore::new_with_max_pending(chunk_workers, 2, chunk_max_pending)
+            .context("configure remote RF=2 chunks")?;
     let available = chunks
         .available_workers()
         .context("probe remote ChunkWorkers")?;

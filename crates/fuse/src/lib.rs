@@ -321,6 +321,7 @@ fn map_err(e: FluxError) -> Errno {
         FluxError::NotDirectory => Errno::ENOTDIR,
         FluxError::IsDirectory => Errno::EISDIR,
         FluxError::Capability(_) => Errno::ENOSPC,
+        FluxError::Busy => Errno::EAGAIN,
         FluxError::ReadOnly => Errno::EROFS,
         FluxError::InvalidArg(_) => Errno::EPERM,
         _ => Errno::EIO,
@@ -332,4 +333,14 @@ fn ms_to_systime(ms: i64) -> SystemTime {
         return UNIX_EPOCH;
     }
     UNIX_EPOCH + Duration::from_millis(ms as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn busy_is_exposed_as_retryable_eagain() {
+        assert_eq!(map_err(FluxError::Busy), Errno::EAGAIN);
+    }
 }

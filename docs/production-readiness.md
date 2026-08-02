@@ -93,9 +93,10 @@ write-back, full POSIX behavior, multi-tenant security, or production operations
 - Lazy namespace path state is an in-memory map and imported metadata has no real
   TTL/event invalidation. Make cache entries discardable and persistent open
   handles stable across refresh/restart.
-- The synchronous FUSE adapter uses blocking runtime bridges. Production should
-  pool async clients, batch/coalesce I/O, propagate cancellation, and control
-  backpressure.
+- The synchronous FUSE adapter uses blocking runtime bridges. ChunkWorker
+  concurrency and the remote-client pending queue are bounded with fail-fast
+  backpressure, but production should also pool async clients, batch/coalesce
+  I/O, propagate cancellation/deadlines, and add adaptive admission control.
 - External create/unlink/truncate remain read-only, and rename, fsync durability,
   locks, links, symlinks, xattrs, mmap, permissions/ACLs, and complete errno
   behavior are not implemented. Freeze the supported POSIX contract before a
