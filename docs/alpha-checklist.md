@@ -95,7 +95,10 @@ W1 exit: create/lookup via meta WAL + single-process chunk put/get smoke; plus b
 EOF
 ## Review amendments (@ubuntu-cc msg 3d6c2e40) — accepted
 
-1. **Meta store (alpha)**: use **heed (LMDB)** for embedded ACID; revisit RocksDB/LSM when approaching Mantle-scale beta.
+1. **Meta store (alpha)**: use **heed (LMDB)** for embedded ACID. B1's
+   [qualification workload](meta-engine.md) keeps it while the measured gate
+   passes; target-scale/concurrent-write evidence, not engine preference,
+   triggers a RocksDB/LSM evaluation.
 2. **File size cap (alpha)**: e.g. **1 GiB** max to avoid multipart flush complexity (single Put path).
 3. **ChunkWorker topology**: deploy **3 workers** in alpha so RF=2 can tolerate 1 failure; W2 must exercise 3-node failure modes.
 4. **proptest in W1**: pin property-test deps in skeleton; invariants must be enforceable from day 1, not bolted on in W3.

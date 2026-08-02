@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use fluxfs_meta::{
-    start_single_voter, FluxRaft, HeedMetaStore, MetaRaftRequest, MetaRaftResponse, MetaStore,
+    start_single_voter, FluxRaft, HeedMetaStore, HeedMetaStoreOptions, MetaRaftRequest,
+    MetaRaftResponse, MetaStore,
 };
 use fluxfs_metrics::{spawn_prometheus, FluxMetrics};
 use fluxfs_proto::meta::v1::{
@@ -42,6 +43,9 @@ struct Cli {
     /// Persist MetaStore (heed) directory.
     #[arg(long, default_value = "/tmp/fluxfs-meta")]
     data_dir: PathBuf,
+    /// LMDB virtual map capacity in GiB (does not preallocate disk blocks).
+    #[arg(long, default_value_t = 4)]
+    map_size_gib: usize,
     /// Listen address, e.g. 127.0.0.1:50051
     #[arg(long, default_value = "127.0.0.1:50051")]
     listen: SocketAddr,
@@ -648,7 +652,14 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     std::fs::create_dir_all(&cli.data_dir)?;
-    let store = Arc::new(HeedMetaStore::open(&cli.data_dir).context("open heed meta")?);
+    let map_size_bytes = cli
+        .map_size_gib
+        .checked_mul(1024 * 1024 * 1024)
+        .context("--map-size-gib overflow")?;
+    let store = Arc::new(
+        HeedMetaStore::open_with_options(&cli.data_dir, HeedMetaStoreOptions { map_size_bytes })
+            .context("open heed meta")?,
+    );
     let raft_dir = cli.data_dir.join("raft");
     let raft = start_single_voter(store.clone(), &raft_dir, &cli.listen.to_string())
         .await

@@ -56,9 +56,13 @@ write-back, full POSIX behavior, multi-tenant security, or production operations
 
 ### Scale and resource control
 
-1. **heed is a bounded single-writer MVP engine.** Fixed map sizes and the
-   current key layout need workload benchmarks and a migration path to a
-   partitioned/LSM metadata design without leaking engine types through VFS APIs.
+1. **heed is a measured single-writer alpha engine, not a billion-inode claim.**
+   B1 added configurable map capacity, durable schema versions with explicit
+   upgrade/downgrade policy, a portable snapshot migration boundary, and a
+   deterministic 70/20/10 metadata workload with machine-readable gates. The
+   100k-inode/1M-operation local baseline passes, so heed remains the default;
+   target-hardware scale/concurrency runs decide when an LSM path is justified.
+   See [metadata engine qualification](meta-engine.md).
 2. **Manifests and snapshots are whole-object structures.** Extents are a linear
    `Vec` serialized as JSON, and Raft snapshots serialize all metadata into one
    in-memory buffer. Use versioned binary schemas, indexed extent trees, and

@@ -16,6 +16,8 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::schema::{migration_path, CURRENT_META_SCHEMA_VERSION};
+
 type InodeDb = Database<Bytes, Bytes>;
 type DentryDb = Database<Str, Bytes>;
 type MetaDb = Database<Str, Bytes>;
@@ -25,6 +27,7 @@ type RequestDb = Database<Str, Bytes>;
 const KEY_SM_LAST_APPLIED: &str = "raft_sm_last_applied";
 const KEY_SM_LAST_MEMBERSHIP: &str = "raft_sm_last_membership";
 const KEY_GC_LEASE: &str = "gc_lease";
+const KEY_META_SCHEMA_VERSION: &str = "meta_schema_version";
 const RESERVATION_PREFIX: &str = "write_reservation:";
 const TOMBSTONE_PREFIX: &str = "gc_tombstone:";
 
@@ -63,12 +66,37 @@ pub struct HeedMetaStore {
     write_lock: Mutex<()>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeedMetaStoreOptions {
+    pub map_size_bytes: usize,
+}
+
+impl Default for HeedMetaStoreOptions {
+    fn default() -> Self {
+        Self {
+            map_size_bytes: 512 * 1024 * 1024,
+        }
+    }
+}
+
 impl HeedMetaStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_options(path, HeedMetaStoreOptions::default())
+    }
+
+    pub fn open_with_options(
+        path: impl AsRef<Path>,
+        options: HeedMetaStoreOptions,
+    ) -> Result<Self> {
+        if options.map_size_bytes == 0 {
+            return Err(FluxError::InvalidArg(
+                "heed map size must be non-zero".into(),
+            ));
+        }
         std::fs::create_dir_all(path.as_ref()).map_err(|e| FluxError::Io(e.to_string()))?;
         let env = unsafe {
             EnvOpenOptions::new()
-                .map_size(512 * 1024 * 1024)
+                .map_size(options.map_size_bytes)
                 .max_dbs(16)
                 .open(path.as_ref())
                 .map_err(|e| FluxError::Meta(e.to_string()))?
@@ -92,6 +120,21 @@ impl HeedMetaStore {
         let client_requests: RequestDb = env
             .create_database(&mut wtxn, Some("client_requests"))
             .map_err(|e| FluxError::Meta(e.to_string()))?;
+
+        let stored_schema = meta
+            .get(&wtxn, KEY_META_SCHEMA_VERSION)
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+            .map(u32_from_bytes)
+            .transpose()?
+            .unwrap_or(0);
+        let migrations = migration_path(stored_schema, CURRENT_META_SCHEMA_VERSION)?;
+        for migration in migrations {
+            // v0 -> v1 only records the version; data keys and encodings are
+            // unchanged. Future steps belong here and run in this one txn.
+            debug_assert_eq!(migration.to, CURRENT_META_SCHEMA_VERSION);
+            meta.put(&mut wtxn, KEY_META_SCHEMA_VERSION, &u32_bytes(migration.to))
+                .map_err(|e| FluxError::Meta(e.to_string()))?;
+        }
 
         if inodes
             .get(&wtxn, &inode_key(ROOT_INODE))
@@ -152,6 +195,19 @@ impl HeedMetaStore {
             client_requests,
             write_lock: Mutex::new(()),
         })
+    }
+
+    pub fn schema_version(&self) -> Result<u32> {
+        let rtxn = self
+            .env
+            .read_txn()
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        let raw = self
+            .meta
+            .get(&rtxn, KEY_META_SCHEMA_VERSION)
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+            .ok_or_else(|| FluxError::Meta("metadata schema marker missing".into()))?;
+        u32_from_bytes(raw)
     }
 
     pub fn load_sm_meta(&self) -> Result<SmAppliedMeta> {
@@ -2157,6 +2213,17 @@ fn u64_from_bytes(bytes: &[u8]) -> Result<u64> {
     Ok(u64::from_be_bytes(arr))
 }
 
+fn u32_bytes(v: u32) -> [u8; 4] {
+    v.to_be_bytes()
+}
+
+fn u32_from_bytes(bytes: &[u8]) -> Result<u32> {
+    let arr: [u8; 4] = bytes
+        .try_into()
+        .map_err(|_| FluxError::Meta("bad metadata schema version bytes".into()))?;
+    Ok(u32::from_be_bytes(arr))
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2168,6 +2235,70 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use crate::MetaStore;
+
+    #[test]
+    fn schema_marker_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HeedMetaStore::open(dir.path()).unwrap();
+        assert_eq!(store.schema_version().unwrap(), CURRENT_META_SCHEMA_VERSION);
+        drop(store);
+        assert_eq!(
+            HeedMetaStore::open(dir.path())
+                .unwrap()
+                .schema_version()
+                .unwrap(),
+            CURRENT_META_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn unmarked_legacy_store_is_upgraded_without_data_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HeedMetaStore::open(dir.path()).unwrap();
+        let file = store
+            .create(ROOT_INODE, "legacy", FileType::Regular, 0o644, 0, 0)
+            .unwrap();
+        {
+            let mut txn = store.env.write_txn().unwrap();
+            assert!(store
+                .meta
+                .delete(&mut txn, KEY_META_SCHEMA_VERSION)
+                .unwrap());
+            txn.commit().unwrap();
+        }
+        drop(store);
+
+        let upgraded = HeedMetaStore::open(dir.path()).unwrap();
+        assert_eq!(
+            upgraded.schema_version().unwrap(),
+            CURRENT_META_SCHEMA_VERSION
+        );
+        assert_eq!(upgraded.lookup(ROOT_INODE, "legacy").unwrap().id, file.id);
+    }
+
+    #[test]
+    fn newer_schema_is_rejected_without_downgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HeedMetaStore::open(dir.path()).unwrap();
+        {
+            let mut txn = store.env.write_txn().unwrap();
+            store
+                .meta
+                .put(
+                    &mut txn,
+                    KEY_META_SCHEMA_VERSION,
+                    &u32_bytes(CURRENT_META_SCHEMA_VERSION + 1),
+                )
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        drop(store);
+        let err = match HeedMetaStore::open(dir.path()) {
+            Ok(_) => panic!("newer schema unexpectedly opened"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("newer than supported"));
+    }
     use fluxfs_types::RequestOpId;
 
     #[test]
