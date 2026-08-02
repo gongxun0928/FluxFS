@@ -217,9 +217,19 @@ impl HeedMetaStore {
                 mode,
                 uid,
                 gid,
+                expected_parent_generation,
                 ..
             } => {
-                match self.create_in_txn(&mut wtxn, *parent, name, *file_type, *mode, *uid, *gid) {
+                match self.create_in_txn(
+                    &mut wtxn,
+                    *expected_parent_generation,
+                    *parent,
+                    name,
+                    *file_type,
+                    *mode,
+                    *uid,
+                    *gid,
+                ) {
                     Ok(inode) => MetaRaftResponse::Inode(Box::new(inode)),
                     Err(e) => MetaRaftResponse::Err(e),
                 }
@@ -303,9 +313,11 @@ impl HeedMetaStore {
                 name,
                 inode,
                 manifest,
+                expected_parent_generation,
                 ..
             } => match self.import_external_in_txn(
                 &mut wtxn,
+                *expected_parent_generation,
                 *parent,
                 name,
                 inode.as_ref(),
@@ -314,12 +326,20 @@ impl HeedMetaStore {
                 Ok(inode) => MetaRaftResponse::Inode(Box::new(inode)),
                 Err(e) => MetaRaftResponse::Err(e),
             },
-            MetaRaftRequest::Unlink { parent, name, .. } => {
-                match self.unlink_in_txn(&mut wtxn, *parent, name) {
-                    Ok(()) => MetaRaftResponse::Empty,
-                    Err(e) => MetaRaftResponse::Err(e),
-                }
-            }
+            MetaRaftRequest::Unlink {
+                parent,
+                name,
+                expected_parent_generation,
+                ..
+            } => match self.unlink_in_txn(
+                &mut wtxn,
+                *expected_parent_generation,
+                *parent,
+                name,
+            ) {
+                Ok(()) => MetaRaftResponse::Empty,
+                Err(e) => MetaRaftResponse::Err(e),
+            },
         };
 
         if let Some(op_id) = req.request_id().filter(|id| !id.is_none()) {
@@ -556,19 +576,13 @@ impl HeedMetaStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn create_in_txn(
+    /// Load parent directory, optional generation CAS, then bump generation/mtime.
+    fn load_and_bump_parent_dir(
         &self,
         wtxn: &mut heed::RwTxn,
         parent: InodeId,
-        name: &str,
-        file_type: FileType,
-        mode: u32,
-        uid: u32,
-        gid: u32,
+        expected_parent_generation: Option<u64>,
     ) -> Result<Inode> {
-        if name.is_empty() || name.contains('/') || name == "." || name == ".." {
-            return Err(FluxError::InvalidArg(format!("bad name: {name}")));
-        }
         let parent_bytes = self
             .inodes
             .get(wtxn, &inode_key(parent))
@@ -580,6 +594,36 @@ impl HeedMetaStore {
         if parent_ino.file_type != FileType::Directory {
             return Err(FluxError::NotDirectory);
         }
+        if let Some(expected) = expected_parent_generation {
+            if parent_ino.generation != expected {
+                return Err(FluxError::CasFailed {
+                    expected,
+                    actual: parent_ino.generation,
+                });
+            }
+        }
+        let now = now_ms();
+        parent_ino.generation = parent_ino.generation.saturating_add(1);
+        parent_ino.mtime_ms = now;
+        parent_ino.ctime_ms = now;
+        put_inode_raw(&self.inodes, wtxn, &parent_ino)?;
+        Ok(parent_ino)
+    }
+
+    fn create_in_txn(
+        &self,
+        wtxn: &mut heed::RwTxn,
+        expected_parent_generation: Option<u64>,
+        parent: InodeId,
+        name: &str,
+        file_type: FileType,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Inode> {
+        if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+            return Err(FluxError::InvalidArg(format!("bad name: {name}")));
+        }
         if self
             .dentries
             .get(wtxn, &dentry_key(parent, name))
@@ -588,6 +632,8 @@ impl HeedMetaStore {
         {
             return Err(FluxError::AlreadyExists);
         }
+        // CAS + bump parent before allocating child so failed CAS leaves no orphan id.
+        self.load_and_bump_parent_dir(wtxn, parent, expected_parent_generation)?;
         let id = self.alloc_inode(wtxn)?;
         let now = now_ms();
         let inode = Inode {
@@ -626,9 +672,6 @@ impl HeedMetaStore {
         self.dentries
             .put(wtxn, &dentry_key(parent, name), &u64_bytes(id))
             .map_err(|e| FluxError::Meta(e.to_string()))?;
-        parent_ino.mtime_ms = now;
-        parent_ino.ctime_ms = now;
-        put_inode_raw(&self.inodes, wtxn, &parent_ino)?;
         Ok(inode)
     }
 
@@ -649,6 +692,7 @@ impl HeedMetaStore {
     fn import_external_in_txn(
         &self,
         wtxn: &mut heed::RwTxn,
+        expected_parent_generation: Option<u64>,
         parent: InodeId,
         name: &str,
         template: &Inode,
@@ -667,17 +711,6 @@ impl HeedMetaStore {
                 "import_external requires External/Imported locality".into(),
             ));
         }
-        let parent_bytes = self
-            .inodes
-            .get(wtxn, &inode_key(parent))
-            .map_err(|e| FluxError::Meta(e.to_string()))?
-            .ok_or(FluxError::NotFound)?
-            .to_vec();
-        let mut parent_ino: Inode =
-            serde_json::from_slice(&parent_bytes).map_err(|e| FluxError::Meta(e.to_string()))?;
-        if parent_ino.file_type != FileType::Directory {
-            return Err(FluxError::NotDirectory);
-        }
         if self
             .dentries
             .get(wtxn, &dentry_key(parent, name))
@@ -686,6 +719,7 @@ impl HeedMetaStore {
         {
             return Err(FluxError::AlreadyExists);
         }
+        self.load_and_bump_parent_dir(wtxn, parent, expected_parent_generation)?;
 
         let id = self.alloc_inode(wtxn)?;
         let mut inode = template.clone();
@@ -715,10 +749,6 @@ impl HeedMetaStore {
         self.dentries
             .put(wtxn, &dentry_key(parent, name), &u64_bytes(id))
             .map_err(|e| FluxError::Meta(e.to_string()))?;
-        let now = now_ms();
-        parent_ino.mtime_ms = now;
-        parent_ino.ctime_ms = now;
-        put_inode_raw(&self.inodes, wtxn, &parent_ino)?;
         Ok(inode)
     }
 
@@ -886,18 +916,13 @@ impl HeedMetaStore {
         Ok(inode)
     }
 
-    fn unlink_in_txn(&self, wtxn: &mut heed::RwTxn, parent: InodeId, name: &str) -> Result<()> {
-        let parent_bytes = self
-            .inodes
-            .get(wtxn, &inode_key(parent))
-            .map_err(|e| FluxError::Meta(e.to_string()))?
-            .ok_or(FluxError::NotFound)?
-            .to_vec();
-        let mut parent_ino: Inode =
-            serde_json::from_slice(&parent_bytes).map_err(|e| FluxError::Meta(e.to_string()))?;
-        if parent_ino.file_type != FileType::Directory {
-            return Err(FluxError::NotDirectory);
-        }
+    fn unlink_in_txn(
+        &self,
+        wtxn: &mut heed::RwTxn,
+        expected_parent_generation: Option<u64>,
+        parent: InodeId,
+        name: &str,
+    ) -> Result<()> {
         let key = dentry_key(parent, name);
         if self
             .dentries
@@ -907,13 +932,10 @@ impl HeedMetaStore {
         {
             return Err(FluxError::NotFound);
         }
+        self.load_and_bump_parent_dir(wtxn, parent, expected_parent_generation)?;
         self.dentries
             .delete(wtxn, &key)
             .map_err(|e| FluxError::Meta(e.to_string()))?;
-        let now = now_ms();
-        parent_ino.mtime_ms = now;
-        parent_ino.ctime_ms = now;
-        put_inode_raw(&self.inodes, wtxn, &parent_ino)?;
         Ok(())
     }
 
@@ -1010,8 +1032,9 @@ impl MetaStore for HeedMetaStore {
         serde_json::from_slice(&child_bytes).map_err(|e| FluxError::Meta(e.to_string()))
     }
 
-    fn create(
+    fn create_cas(
         &self,
+        expected_parent_generation: Option<u64>,
         parent: InodeId,
         name: &str,
         file_type: FileType,
@@ -1019,85 +1042,18 @@ impl MetaStore for HeedMetaStore {
         uid: u32,
         gid: u32,
     ) -> Result<Inode> {
-        if name.is_empty() || name.contains('/') || name == "." || name == ".." {
-            return Err(FluxError::InvalidArg(format!("bad name: {name}")));
-        }
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|_| FluxError::Meta("write lock poisoned".into()))?;
-
-        let mut wtxn = self
-            .env
-            .write_txn()
-            .map_err(|e| FluxError::Meta(e.to_string()))?;
-
-        let parent_bytes = self
-            .inodes
-            .get(&wtxn, &inode_key(parent))
-            .map_err(|e| FluxError::Meta(e.to_string()))?
-            .ok_or(FluxError::NotFound)?
-            .to_vec();
-        let mut parent_ino: Inode =
-            serde_json::from_slice(&parent_bytes).map_err(|e| FluxError::Meta(e.to_string()))?;
-        if parent_ino.file_type != FileType::Directory {
-            return Err(FluxError::NotDirectory);
-        }
-
-        if self
-            .dentries
-            .get(&wtxn, &dentry_key(parent, name))
-            .map_err(|e| FluxError::Meta(e.to_string()))?
-            .is_some()
-        {
-            return Err(FluxError::AlreadyExists);
-        }
-
-        let id = self.alloc_inode(&mut wtxn)?;
-        let now = now_ms();
-        let inode = Inode {
-            id,
-            file_type,
-            mode,
-            uid,
-            gid,
-            size: 0,
-            mtime_ms: now,
-            ctime_ms: now,
-            atime_ms: now,
-            link_count: if file_type == FileType::Directory {
-                2
-            } else {
-                1
-            },
-            generation: 1,
-            head_gen: DataGen(1),
-            ufs_gen: DataGen(0),
-            ufs_base_version: None,
-            locality: LocalityLabel::Ephemeral,
-            locality_fields: Some(LocalityFields {
-                backing_mode: BackingMode::Ephemeral,
-                data_state: DataState::Ephemeral,
-                op_state: OpState::None,
-                origin: Origin::FluxCreated,
-            }),
-            ufs: None,
-            extent_root: None,
-            manifest_id: None,
-            flush_intent: None,
-            last_error: None,
-        };
-        put_inode_raw(&self.inodes, &mut wtxn, &inode)?;
-        self.dentries
-            .put(&mut wtxn, &dentry_key(parent, name), &u64_bytes(id))
-            .map_err(|e| FluxError::Meta(e.to_string()))?;
-
-        parent_ino.mtime_ms = now;
-        parent_ino.ctime_ms = now;
-        put_inode_raw(&self.inodes, &mut wtxn, &parent_ino)?;
-
-        wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
-        Ok(inode)
+        self.with_write_txn(|store, wtxn| {
+            store.create_in_txn(
+                wtxn,
+                expected_parent_generation,
+                parent,
+                name,
+                file_type,
+                mode,
+                uid,
+                gid,
+            )
+        })
     }
 
     fn readdir(&self, dir: InodeId) -> Result<Vec<Dentry>> {
@@ -1302,6 +1258,7 @@ impl MetaStore for HeedMetaStore {
     fn import_external_with_id(
         &self,
         op_id: fluxfs_types::RequestOpId,
+        expected_parent_generation: Option<u64>,
         parent: InodeId,
         name: &str,
         inode: &Inode,
@@ -1326,7 +1283,14 @@ impl MetaStore for HeedMetaStore {
                 };
             }
         }
-        let next = match self.import_external_in_txn(&mut wtxn, parent, name, inode, manifest) {
+        let next = match self.import_external_in_txn(
+            &mut wtxn,
+            expected_parent_generation,
+            parent,
+            name,
+            inode,
+            manifest,
+        ) {
             Ok(inode) => {
                 if !op_id.is_none() {
                     self.put_client_request_in_txn(
@@ -1353,44 +1317,15 @@ impl MetaStore for HeedMetaStore {
         Ok(next)
     }
 
-    fn unlink(&self, parent: InodeId, name: &str) -> Result<()> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|_| FluxError::Meta("write lock poisoned".into()))?;
-        let mut wtxn = self
-            .env
-            .write_txn()
-            .map_err(|e| FluxError::Meta(e.to_string()))?;
-        let parent_bytes = self
-            .inodes
-            .get(&wtxn, &inode_key(parent))
-            .map_err(|e| FluxError::Meta(e.to_string()))?
-            .ok_or(FluxError::NotFound)?
-            .to_vec();
-        let mut parent_ino: Inode =
-            serde_json::from_slice(&parent_bytes).map_err(|e| FluxError::Meta(e.to_string()))?;
-        if parent_ino.file_type != FileType::Directory {
-            return Err(FluxError::NotDirectory);
-        }
-        let key = dentry_key(parent, name);
-        if self
-            .dentries
-            .get(&wtxn, &key)
-            .map_err(|e| FluxError::Meta(e.to_string()))?
-            .is_none()
-        {
-            return Err(FluxError::NotFound);
-        }
-        self.dentries
-            .delete(&mut wtxn, &key)
-            .map_err(|e| FluxError::Meta(e.to_string()))?;
-        let now = now_ms();
-        parent_ino.mtime_ms = now;
-        parent_ino.ctime_ms = now;
-        put_inode_raw(&self.inodes, &mut wtxn, &parent_ino)?;
-        wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
-        Ok(())
+    fn unlink_cas(
+        &self,
+        expected_parent_generation: Option<u64>,
+        parent: InodeId,
+        name: &str,
+    ) -> Result<()> {
+        self.with_write_txn(|store, wtxn| {
+            store.unlink_in_txn(wtxn, expected_parent_generation, parent, name)
+        })
     }
 }
 
@@ -1738,12 +1673,92 @@ mod tests {
             last_error: None,
         };
         let first = store
-            .import_external_with_id(op, ROOT_INODE, "empty.txt", &template, None)
+            .import_external_with_id(op, None, ROOT_INODE, "empty.txt", &template, None)
             .unwrap();
         let second = store
-            .import_external_with_id(op, ROOT_INODE, "empty.txt", &template, None)
+            .import_external_with_id(op, None, ROOT_INODE, "empty.txt", &template, None)
             .unwrap();
         assert_eq!(first.id, second.id);
         assert_eq!(store.readdir(ROOT_INODE).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn directory_generation_cas_guards_create_and_unlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HeedMetaStore::open(dir.path()).unwrap();
+        let root_gen = store.get_inode(ROOT_INODE).unwrap().generation;
+        assert_eq!(root_gen, 1);
+
+        store
+            .create_cas(
+                Some(root_gen),
+                ROOT_INODE,
+                "a.txt",
+                FileType::Regular,
+                0o644,
+                0,
+                0,
+            )
+            .unwrap();
+        let after_create = store.get_inode(ROOT_INODE).unwrap().generation;
+        assert_eq!(after_create, root_gen + 1);
+
+        // Stale parent generation must fail without creating a second name.
+        assert_eq!(
+            store
+                .create_cas(
+                    Some(root_gen),
+                    ROOT_INODE,
+                    "b.txt",
+                    FileType::Regular,
+                    0o644,
+                    0,
+                    0,
+                )
+                .unwrap_err(),
+            FluxError::CasFailed {
+                expected: root_gen,
+                actual: after_create
+            }
+        );
+        assert!(store.lookup(ROOT_INODE, "b.txt").is_err());
+        assert_eq!(
+            store.get_inode(ROOT_INODE).unwrap().generation,
+            after_create
+        );
+
+        store
+            .create_cas(
+                Some(after_create),
+                ROOT_INODE,
+                "b.txt",
+                FileType::Regular,
+                0o644,
+                0,
+                0,
+            )
+            .unwrap();
+        let after_b = store.get_inode(ROOT_INODE).unwrap().generation;
+
+        store
+            .unlink_cas(Some(after_b), ROOT_INODE, "a.txt")
+            .unwrap();
+        let after_unlink = store.get_inode(ROOT_INODE).unwrap().generation;
+        assert_eq!(after_unlink, after_b + 1);
+        assert_eq!(
+            store
+                .unlink_cas(Some(after_b), ROOT_INODE, "b.txt")
+                .unwrap_err(),
+            FluxError::CasFailed {
+                expected: after_b,
+                actual: after_unlink
+            }
+        );
+        // Compatible path without CAS still bumps generation.
+        store.unlink(ROOT_INODE, "b.txt").unwrap();
+        assert_eq!(
+            store.get_inode(ROOT_INODE).unwrap().generation,
+            after_unlink + 1
+        );
     }
 }

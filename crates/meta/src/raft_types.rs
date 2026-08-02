@@ -38,6 +38,9 @@ pub enum MetaRaftRequest {
         mode: u32,
         uid: u32,
         gid: u32,
+        /// When set, CAS `parent.generation` before inserting the dentry.
+        #[serde(default)]
+        expected_parent_generation: Option<u64>,
     },
     PutInode {
         #[serde(default)]
@@ -92,12 +95,16 @@ pub enum MetaRaftRequest {
         name: String,
         inode: Box<Inode>,
         manifest: Option<Box<Manifest>>,
+        #[serde(default)]
+        expected_parent_generation: Option<u64>,
     },
     Unlink {
         #[serde(default)]
         request_id: Option<RequestOpId>,
         parent: u64,
         name: String,
+        #[serde(default)]
+        expected_parent_generation: Option<u64>,
     },
 }
 

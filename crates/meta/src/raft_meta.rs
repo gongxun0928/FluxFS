@@ -110,8 +110,9 @@ impl MetaStore for RaftMetaStore {
         self.store.lookup(parent, name)
     }
 
-    fn create(
+    fn create_cas(
         &self,
+        expected_parent_generation: Option<u64>,
         parent: InodeId,
         name: &str,
         file_type: FileType,
@@ -127,6 +128,7 @@ impl MetaStore for RaftMetaStore {
             mode,
             uid,
             gid,
+            expected_parent_generation,
         })?;
         Self::map_inode(resp)
     }
@@ -240,6 +242,7 @@ impl MetaStore for RaftMetaStore {
     fn import_external_with_id(
         &self,
         op_id: RequestOpId,
+        expected_parent_generation: Option<u64>,
         parent: InodeId,
         name: &str,
         inode: &Inode,
@@ -251,14 +254,21 @@ impl MetaStore for RaftMetaStore {
             name: name.to_string(),
             inode: Box::new(inode.clone()),
             manifest: manifest.map(|m| Box::new(m.clone())),
+            expected_parent_generation,
         })?)
     }
 
-    fn unlink(&self, parent: InodeId, name: &str) -> Result<()> {
+    fn unlink_cas(
+        &self,
+        expected_parent_generation: Option<u64>,
+        parent: InodeId,
+        name: &str,
+    ) -> Result<()> {
         let resp = self.write(MetaRaftRequest::Unlink {
             request_id: Some(RequestOpId::random()),
             parent,
             name: name.to_string(),
+            expected_parent_generation,
         })?;
         Self::map_empty(resp)
     }

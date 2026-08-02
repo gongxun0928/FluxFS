@@ -44,6 +44,8 @@ message CreateRequest {
   uint32 uid = 5;
   uint32 gid = 6;
   string request_id = 7;
+  // 0 = unset (no directory CAS). Directory generations start at 1.
+  uint64 expected_parent_generation = 8;
 }
 message CreateResponse { bytes inode_json = 1; }
 
@@ -107,11 +109,15 @@ message ImportExternalRequest {
   // Empty = no manifest (directory / zero-size file).
   bytes manifest_json = 4;
   string request_id = 5;
+  // 0 = unset (no directory CAS). Directory generations start at 1.
+  uint64 expected_parent_generation = 6;
 }
 message ImportExternalResponse { bytes inode_json = 1; }
 
 message UnlinkRequest {
   uint64 parent = 1;
   string name = 2;
+  // 0 = unset (no directory CAS). Directory generations start at 1.
+  uint64 expected_parent_generation = 3;
 }
 message UnlinkResponse {}

@@ -24,6 +24,24 @@ pub trait MetaStore: Send + Sync {
         mode: u32,
         uid: u32,
         gid: u32,
+    ) -> Result<Inode> {
+        self.create_cas(None, parent, name, file_type, mode, uid, gid)
+    }
+
+    /// Create under `parent` with optional directory-generation CAS.
+    ///
+    /// When `expected_parent_generation` is `Some`, succeeds only if the
+    /// durable parent directory's `generation` matches; on success the parent
+    /// generation is incremented in the same transaction.
+    fn create_cas(
+        &self,
+        expected_parent_generation: Option<u64>,
+        parent: InodeId,
+        name: &str,
+        file_type: FileType,
+        mode: u32,
+        uid: u32,
+        gid: u32,
     ) -> Result<Inode>;
 
     fn readdir(&self, dir: InodeId) -> Result<Vec<Dentry>>;
@@ -125,12 +143,13 @@ pub trait MetaStore: Send + Sync {
         inode: &Inode,
         manifest: Option<&Manifest>,
     ) -> Result<Inode> {
-        self.import_external_with_id(RequestOpId::random(), parent, name, inode, manifest)
+        self.import_external_with_id(RequestOpId::random(), None, parent, name, inode, manifest)
     }
 
     fn import_external_with_id(
         &self,
         op_id: RequestOpId,
+        expected_parent_generation: Option<u64>,
         parent: InodeId,
         name: &str,
         inode: &Inode,
@@ -138,5 +157,15 @@ pub trait MetaStore: Send + Sync {
     ) -> Result<Inode>;
 
     /// Unlink name from parent directory (inode/chunk GC deferred).
-    fn unlink(&self, parent: InodeId, name: &str) -> Result<()>;
+    fn unlink(&self, parent: InodeId, name: &str) -> Result<()> {
+        self.unlink_cas(None, parent, name)
+    }
+
+    /// Unlink with optional directory-generation CAS (see [`Self::create_cas`]).
+    fn unlink_cas(
+        &self,
+        expected_parent_generation: Option<u64>,
+        parent: InodeId,
+        name: &str,
+    ) -> Result<()>;
 }

@@ -108,6 +108,7 @@ mod tests {
                 mode: 0o644,
                 uid: 0,
                 gid: 0,
+                expected_parent_generation: None,
             })
             .await
             .expect("client_write");
@@ -130,6 +131,7 @@ mod tests {
                 mode: 0o644,
                 uid: 0,
                 gid: 0,
+                expected_parent_generation: None,
             })
             .await
             .expect("duplicate reaches state machine");
@@ -158,6 +160,7 @@ mod tests {
                 mode: 0o644,
                 uid: 0,
                 gid: 0,
+                expected_parent_generation: None,
             })
             .await
             .expect("create");
@@ -185,6 +188,7 @@ mod tests {
                 mode: 0o644,
                 uid: 0,
                 gid: 0,
+                expected_parent_generation: None,
             })
             .await
             .expect("write after restart");
@@ -213,7 +217,8 @@ mod tests {
             mode: 0o644,
             uid: 0,
             gid: 0,
-        };
+                expected_parent_generation: None,
+            };
         let first = raft
             .client_write(req.clone())
             .await
@@ -253,6 +258,7 @@ mod tests {
                 mode: 0o644,
                 uid: 0,
                 gid: 0,
+                expected_parent_generation: None,
             })
             .await
             .expect("create")
@@ -327,7 +333,8 @@ mod tests {
             mode: 0o644,
             uid: 0,
             gid: 0,
-        })
+                expected_parent_generation: None,
+            })
         .await
         .expect("create");
 

@@ -132,6 +132,7 @@ impl MetaService for MetaSvc {
                 mode: r.mode,
                 uid: r.uid,
                 gid: r.gid,
+                expected_parent_generation: parent_gen_cas(r.expected_parent_generation),
             })
             .await?;
         let inode = Self::map_resp_inode(resp)?;
@@ -309,6 +310,7 @@ impl MetaService for MetaSvc {
                 name: r.name,
                 inode: Box::new(inode),
                 manifest: manifest.map(Box::new),
+                expected_parent_generation: parent_gen_cas(r.expected_parent_generation),
             })
             .await?;
         let inode = Self::map_resp_inode(resp)?;
@@ -327,10 +329,20 @@ impl MetaService for MetaSvc {
                 request_id: Some(RequestOpId::random()),
                 parent: r.parent,
                 name: r.name,
+                expected_parent_generation: parent_gen_cas(r.expected_parent_generation),
             })
             .await?;
         Self::map_resp_empty(resp)?;
         Ok(Response::new(UnlinkResponse {}))
+    }
+}
+
+fn parent_gen_cas(wire: u64) -> Option<u64> {
+    // Proto uses 0 as unset; directory generations start at 1.
+    if wire == 0 {
+        None
+    } else {
+        Some(wire)
     }
 }
 

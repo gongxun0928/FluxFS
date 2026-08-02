@@ -105,8 +105,9 @@ impl MetaStore for RemoteMetaStore {
         decode_inode(&resp.inode_json)
     }
 
-    fn create(
+    fn create_cas(
         &self,
+        expected_parent_generation: Option<u64>,
         parent: InodeId,
         name: &str,
         file_type: FileType,
@@ -125,6 +126,7 @@ impl MetaStore for RemoteMetaStore {
                     uid,
                     gid,
                     request_id: RequestOpId::random().to_hex(),
+                    expected_parent_generation: expected_parent_generation.unwrap_or(0),
                 })
                 .await
             })
@@ -272,6 +274,7 @@ impl MetaStore for RemoteMetaStore {
     fn import_external_with_id(
         &self,
         op_id: RequestOpId,
+        expected_parent_generation: Option<u64>,
         parent: InodeId,
         name: &str,
         inode: &Inode,
@@ -291,6 +294,7 @@ impl MetaStore for RemoteMetaStore {
                     inode_json,
                     manifest_json,
                     request_id: op_id.to_hex(),
+                    expected_parent_generation: expected_parent_generation.unwrap_or(0),
                 })
                 .await
             })
@@ -299,12 +303,18 @@ impl MetaStore for RemoteMetaStore {
         decode_inode(&response.inode_json)
     }
 
-    fn unlink(&self, parent: InodeId, name: &str) -> Result<()> {
+    fn unlink_cas(
+        &self,
+        expected_parent_generation: Option<u64>,
+        parent: InodeId,
+        name: &str,
+    ) -> Result<()> {
         let mut c = self.client()?;
         self.block_on(async {
             c.unlink(UnlinkRequest {
                 parent,
                 name: name.to_string(),
+                expected_parent_generation: expected_parent_generation.unwrap_or(0),
             })
             .await
         })
