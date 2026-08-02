@@ -233,6 +233,20 @@ impl<M: MetaStore + 'static, C: ChunkStore + 'static> Filesystem for FluxFs<M, C
         }
     }
 
+    fn fsync(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        match self.client.flush_inode(ino.0) {
+            Ok(_) => reply.ok(),
+            Err(error) => reply.error(map_err(error)),
+        }
+    }
+
     fn readdir(
         &self,
         _req: &Request,

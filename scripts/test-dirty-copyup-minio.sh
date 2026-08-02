@@ -144,7 +144,6 @@ for path in sys.argv[1:]:
     fd = os.open(path, os.O_RDWR)
     try:
         assert os.pwrite(fd, payload, offset) == len(payload)
-        os.fsync(fd)
     finally:
         os.close(fd)
 PY
@@ -171,12 +170,24 @@ for path in sys.argv[1:]:
     fd = os.open(path, os.O_RDWR)
     try:
         assert os.pwrite(fd, payload, offset) == len(payload)
-        os.fsync(fd)
     finally:
         os.close(fd)
 PY
 cmp "$test_root/expected.bin" "$mount_dir/large.bin"
 test "$(find "$test_root/worker-2/objects" -type f | wc -l)" -ge 2
+
+# fsync is the explicit write-back boundary: durable intent, conditional Put,
+# HEAD digest verification, and metadata CAS to a clean UFS-only manifest.
+python3 - "$mount_dir/large.bin" <<'PY'
+import os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
+mc_sh "mc cat local/${minio_bucket}/${prefix}/large.bin" >"$test_root/backing-after-flush.bin"
+cmp "$test_root/expected.bin" "$test_root/backing-after-flush.bin"
 
 fusermount3 -u "$mount_dir"
 wait "$mount_pid"
@@ -184,7 +195,7 @@ mount_pid=""
 start_mount
 cmp "$test_root/expected.bin" "$mount_dir/large.bin"
 mc_sh "mc cat local/${minio_bucket}/${prefix}/large.bin" >"$test_root/backing-after-remount.bin"
-cmp "$test_root/original.bin" "$test_root/backing-after-remount.bin"
+cmp "$test_root/expected.bin" "$test_root/backing-after-remount.bin"
 fusermount3 -u "$mount_dir"
 wait "$mount_pid"
 mount_pid=""

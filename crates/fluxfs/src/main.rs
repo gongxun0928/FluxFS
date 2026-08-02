@@ -2,9 +2,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use fluxfs_chunk::{ChunkStore, DiskChunkStore, RemoteReplicatedChunkStore, ReplicatedChunkStore};
 use fluxfs_client::FluxClient;
-use fluxfs_meta::{
-    start_single_voter, HeedMetaStore, MetaStore, RaftMetaStore, RemoteMetaStore,
-};
+use fluxfs_meta::{start_single_voter, HeedMetaStore, MetaStore, RaftMetaStore, RemoteMetaStore};
 use fluxfs_types::{FileType, ROOT_INODE};
 use fluxfs_ufs::{RangeReq, S3Options, Ufs};
 use std::path::PathBuf;
@@ -280,7 +278,7 @@ fn mount_with_chunks<C: ChunkStore + 'static>(
     ufs: Option<Ufs>,
 ) -> Result<()> {
     let mode = if ufs.is_some() {
-        "UFS External (read-only)"
+        "UFS External/Dirty write-back"
     } else {
         "Ephemeral"
     };
@@ -289,6 +287,7 @@ fn mount_with_chunks<C: ChunkStore + 'static>(
         // Touch root to fail fast if MetaMaster is down.
         meta.get_inode(ROOT_INODE).context("meta get root")?;
         let client = build_client(meta, chunks, ufs)?;
+        reconcile_before_mount(&client)?;
         println!(
             "mounting {mode} FluxFS ({chunk_mode}, remote meta={addr}) data_dir={} mountpoint={}",
             data_dir.display(),
@@ -303,14 +302,11 @@ fn mount_with_chunks<C: ChunkStore + 'static>(
         let store = Arc::new(HeedMetaStore::open(&meta_path).context("open meta")?);
         let rt = tokio::runtime::Runtime::new().context("tokio runtime")?;
         let raft = rt
-            .block_on(start_single_voter(
-                store.clone(),
-                &raft_dir,
-                "127.0.0.1:0",
-            ))
+            .block_on(start_single_voter(store.clone(), &raft_dir, "127.0.0.1:0"))
             .context("start embedded openraft")?;
         let meta = RaftMetaStore::new_owned(store, raft, rt);
         let client = build_client(meta, chunks, ufs)?;
+        reconcile_before_mount(&client)?;
         println!(
             "mounting {mode} FluxFS ({chunk_mode}, embedded raft) data_dir={} mountpoint={}",
             data_dir.display(),
@@ -328,6 +324,22 @@ fn mount_with_chunks<C: ChunkStore + 'static>(
             );
         }
         fluxfs_fuse::mount_ephemeral(client, &mountpoint).context("fuse mount")?;
+    }
+    Ok(())
+}
+
+fn reconcile_before_mount<M: MetaStore, C: ChunkStore>(client: &FluxClient<M, C>) -> Result<()> {
+    if !client.has_ufs() {
+        return Ok(());
+    }
+    let report = client
+        .reconcile_flushes()
+        .context("reconcile durable flush intents")?;
+    if report.completed + report.conflicts + report.pending > 0 {
+        println!(
+            "flush recovery: completed={} conflicts={} pending={}",
+            report.completed, report.conflicts, report.pending
+        );
     }
     Ok(())
 }

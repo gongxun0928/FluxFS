@@ -221,20 +221,24 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         }
         let bytes = self.read_inode_range(&inode, 0, inode.size)?;
         let target_digest = ChunkId::from_bytes(&bytes);
-        let expected_etag = inode
+        let target = inode
             .ufs
             .as_ref()
-            .and_then(|object| object.etag.clone())
-            .ok_or_else(|| {
-                FluxError::Capability(
-                    "safe flush requires a UFS ETag for conditional overwrite".into(),
-                )
-            })?;
+            .ok_or_else(|| FluxError::Meta("Dirty inode missing UFS target".into()))?;
+        let expected_ufs_version = match target.etag.clone() {
+            Some(etag) => Some(UfsVersion(etag)),
+            None if fields.origin == Origin::FluxCreated => None,
+            None => {
+                return Err(FluxError::Capability(
+                    "safe overwrite of imported data requires a UFS ETag".into(),
+                ));
+            }
+        };
         let intent = FlushIntent {
             flush_id: FlushId::random(),
             snapshot_gen: inode.head_gen,
             snapshot_manifest_root: manifest.root_digest(),
-            expected_ufs_version: Some(UfsVersion(expected_etag)),
+            expected_ufs_version,
             target_digest,
         };
         self.meta.begin_flush(inode.generation, inode.id, &intent)?;
@@ -296,15 +300,17 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
                         "flush reconstructed bytes do not match target digest",
                     );
                 }
-                let expected = intent.expected_ufs_version.as_ref().ok_or_else(|| {
-                    FluxError::Capability("flush intent missing expected UFS version".into())
-                })?;
-                match ufs.block_on(ufs.ufs.publish_full_verified(
-                    &object.key,
-                    &bytes,
-                    Some(&expected.0),
-                    &intent.target_digest,
-                )) {
+                match ufs.block_on(
+                    ufs.ufs.publish_full_verified(
+                        &object.key,
+                        &bytes,
+                        intent
+                            .expected_ufs_version
+                            .as_ref()
+                            .map(|version| version.0.as_str()),
+                        &intent.target_digest,
+                    ),
+                ) {
                     Ok(published) => published,
                     Err(FluxError::DirtyConflict) => {
                         return self.record_flush_conflict(
@@ -1043,5 +1049,120 @@ mod tests {
         assert!(matches!(manifest.extents[0], Extent::UfsRange { .. }));
         assert!(matches!(manifest.extents[1], Extent::Local { .. }));
         assert!(matches!(manifest.extents[2], Extent::UfsRange { .. }));
+    }
+
+    #[test]
+    fn recovery_replays_intents_before_and_after_ufs_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta_path = dir.path().join("meta");
+        let chunks_path = dir.path().join("chunks");
+        let ufs_root = dir.path().join("ufs");
+        std::fs::create_dir_all(&ufs_root).unwrap();
+
+        let meta = HeedMetaStore::open(&meta_path).unwrap();
+        let mut before_put = meta
+            .create(ROOT_INODE, "before.bin", FileType::Regular, 0o644, 0, 0)
+            .unwrap();
+        let mut after_put = meta
+            .create(ROOT_INODE, "after.bin", FileType::Regular, 0o644, 0, 0)
+            .unwrap();
+        for (inode, key) in [
+            (&mut before_put, "before.bin"),
+            (&mut after_put, "after.bin"),
+        ] {
+            inode.locality_fields = Some(LocalityFields {
+                backing_mode: BackingMode::UfsBacked,
+                data_state: DataState::Dirty,
+                op_state: OpState::None,
+                origin: Origin::FluxCreated,
+            });
+            inode.locality = LocalityLabel::Dirty;
+            inode.ufs = Some(UfsObject {
+                key: key.into(),
+                size: 0,
+                etag: None,
+                mtime_ms: None,
+            });
+            meta.put_inode(inode).unwrap();
+        }
+
+        let ufs = Ufs::local(&ufs_root).unwrap();
+        let publish_ufs = ufs.clone();
+        let client = FluxClient::new(meta, DiskChunkStore::open(&chunks_path).unwrap())
+            .with_ufs(ufs)
+            .unwrap();
+        client
+            .write_at(before_put.id, 0, b"replay-before-put")
+            .unwrap();
+        client
+            .write_at(after_put.id, 0, b"replay-after-put")
+            .unwrap();
+
+        let begin = |inode_id| {
+            let inode = client.get_inode(inode_id).unwrap();
+            let manifest = client
+                .meta
+                .get_manifest(inode.manifest_id.unwrap())
+                .unwrap();
+            let bytes = client.read_all(inode_id).unwrap();
+            let intent = FlushIntent {
+                flush_id: FlushId::random(),
+                snapshot_gen: inode.head_gen,
+                snapshot_manifest_root: manifest.root_digest(),
+                expected_ufs_version: None,
+                target_digest: ChunkId::from_bytes(&bytes),
+            };
+            client
+                .meta
+                .begin_flush(inode.generation, inode_id, &intent)
+                .unwrap();
+            (intent, bytes)
+        };
+        let (_before_intent, _before_bytes) = begin(before_put.id);
+        let (after_intent, after_bytes) = begin(after_put.id);
+
+        // Simulate crash after the conditional Put and before CommitFlush.
+        Runtime::new()
+            .unwrap()
+            .block_on(publish_ufs.publish_full_verified(
+                "after.bin",
+                &after_bytes,
+                None,
+                &after_intent.target_digest,
+            ))
+            .unwrap();
+        drop(client);
+
+        let recovered = FluxClient::new(
+            HeedMetaStore::open(&meta_path).unwrap(),
+            DiskChunkStore::open(&chunks_path).unwrap(),
+        )
+        .with_ufs(Ufs::local(&ufs_root).unwrap())
+        .unwrap();
+        let report = recovered.reconcile_flushes().unwrap();
+        assert_eq!(report.completed, 2);
+        assert_eq!(report.conflicts, 0);
+        assert_eq!(report.pending, 0);
+        assert_eq!(
+            recovered.read_all(before_put.id).unwrap(),
+            b"replay-before-put"
+        );
+        assert_eq!(
+            recovered.read_all(after_put.id).unwrap(),
+            b"replay-after-put"
+        );
+        for inode_id in [before_put.id, after_put.id] {
+            let inode = recovered.get_inode(inode_id).unwrap();
+            assert_eq!(inode.locality, LocalityLabel::Clean);
+            assert!(inode.flush_intent.is_none());
+            let manifest = recovered
+                .meta
+                .get_manifest(inode.manifest_id.unwrap())
+                .unwrap();
+            assert!(matches!(
+                manifest.extents.as_slice(),
+                [Extent::UfsRange { .. }]
+            ));
+        }
     }
 }
