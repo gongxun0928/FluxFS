@@ -308,9 +308,10 @@ impl RoleCapabilities {
                 ],
             },
             // Admin client / FUSE mount: full meta + GC + admin AND direct
-            // chunk put/get (the mount dials workers for FUSE data path).
-            // DeleteChunk is GC-driven (Meta orchestrates via workers) so it
-            // is intentionally withheld from client-admin.
+            // chunk put/get/delete (the mount dials workers for FUSE data
+            // path AND drives GC tombstone sweeps + orphan GC by issuing
+            // delete_chunk against workers). All three data-path caps are
+            // required by the mount's GC machinery.
             R::ClientAdmin => Self {
                 caps: &[
                     Capability::ReadMeta,
@@ -319,6 +320,7 @@ impl RoleCapabilities {
                     Capability::Admin,
                     Capability::PutChunk,
                     Capability::GetChunk,
+                    Capability::DeleteChunk,
                 ],
             },
         }
@@ -531,7 +533,7 @@ mod tests {
     }
 
     #[test]
-    fn client_admin_gets_meta_admin_gc_and_data_path_get_put() {
+    fn client_admin_gets_meta_admin_gc_and_data_path_get_put_delete() {
         let caps = RoleCapabilities::default_for(WorkloadRole::ClientAdmin);
         assert!(caps.contains(Capability::MutateMeta));
         assert!(caps.contains(Capability::Admin));
@@ -539,9 +541,9 @@ mod tests {
         // chunk content via the same identity.
         assert!(caps.contains(Capability::PutChunk));
         assert!(caps.contains(Capability::GetChunk));
-        // DeleteChunk is GC-driven (Meta orchestrates via workers) so it is
-        // withheld from client-admin.
-        assert!(!caps.contains(Capability::DeleteChunk));
+        // GC tombstone sweep + orphan GC drive worker delete_chunk via the
+        // same client identity.
+        assert!(caps.contains(Capability::DeleteChunk));
     }
 
     // ----- Principal::has + require -----

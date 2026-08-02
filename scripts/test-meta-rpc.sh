@@ -17,8 +17,9 @@ cleanup() {
 trap cleanup EXIT
 
 cargo build -q -p fluxfs-metamaster -p fluxfs
-./target/debug/fluxfs-metamaster --data-dir "$META_DIR" --listen "$LISTEN" &
+./target/debug/fluxfs-metamaster --data-dir "$META_DIR" --listen "$LISTEN" \
+    --allow-insecure-dev &
 META_PID=$!
 sleep 0.5
-./target/debug/fluxfs meta-ping --addr "$LISTEN"
+./target/debug/fluxfs meta-ping --addr "$LISTEN" --allow-insecure-dev
 echo "meta rpc: ok"

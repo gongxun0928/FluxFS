@@ -96,6 +96,18 @@ enum Cmd {
         #[command(flatten)]
         tls: TlsClientArgs,
     },
+    /// Probe a remote ChunkWorker via its Health RPC (mTLS / Phase 3 authz).
+    ///
+    /// Used by test-mtls-acceptance.sh to assert cross-role rejection at the
+    /// authz interceptor: a worker cert dialing a worker server hits
+    /// for_worker() (admits {Meta, ClientAdmin}) and must be rejected with
+    /// PermissionDenied — a real RPC, not Unimplemented from a wrong service.
+    ChunkProbe {
+        #[arg(long, default_value = "127.0.0.1:50061")]
+        addr: String,
+        #[command(flatten)]
+        tls: TlsClientArgs,
+    },
     /// OpenDAL/S3 smoke against MinIO (or any S3 endpoint via `FLUXFS_UFS_*`).
     UfsCheck {
         /// Object key to write/read (default: fluxfs-ufs-check.bin).
@@ -205,6 +217,9 @@ async fn main() -> Result<()> {
         },
         Cmd::MetaPing { addr, tls } => {
             run_meta_ping(&addr, &tls)?;
+        }
+        Cmd::ChunkProbe { addr, tls } => {
+            run_chunk_probe(&addr, &tls).await?;
         }
         Cmd::UfsCheck { key } => {
             run_ufs_check(&key).await?;
@@ -699,6 +714,51 @@ fn run_meta_ping(addr: &str, tls: &TlsClientArgs) -> Result<()> {
     println!(
         "meta-ping ok addr={addr} root_inode={} locality={:?}",
         root.id, root.locality
+    );
+    Ok(())
+}
+
+async fn run_chunk_probe(addr: &str, tls: &TlsClientArgs) -> Result<()> {
+    use fluxfs_proto::ChunkWorkerClient;
+    use tonic::transport::Endpoint;
+
+    let chunk_tls = tls.build(None)?;
+    let tls_enabled = chunk_tls.is_some();
+    let url = if addr.starts_with("http://") || addr.starts_with("https://") {
+        addr.to_string()
+    } else if tls_enabled {
+        format!("https://{addr}")
+    } else {
+        format!("http://{addr}")
+    };
+    let gate = fluxfs_tls::InsecureDev::allow(tls.allow_insecure_dev);
+    gate.check_endpoint(&url).context("tls endpoint")?;
+    gate.check_scheme_matches_tls(&url, tls_enabled)
+        .context("tls scheme")?;
+    let mut endpoint = Endpoint::from_shared(url.clone()).context("endpoint")?;
+    if let Some(opts) = chunk_tls.as_ref() {
+        let cfg = opts
+            .build_config_blocking()
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        if let Some(cfg) = cfg {
+            endpoint = endpoint
+                .tls_config(cfg)
+                .map_err(|e| anyhow::anyhow!("tls_config: {e}"))?;
+        }
+    }
+    // Connection is lazy; the Health RPC drives the TLS handshake + Phase 3
+    // authz interceptor evaluation.
+    let mut client = ChunkWorkerClient::new(endpoint.connect_lazy());
+    let resp = client
+        .health(tonic::Request::new(
+            fluxfs_proto::chunk::v1::HealthRequest::default(),
+        ))
+        .await
+        .context("chunk Health RPC")?;
+    let body = resp.into_inner();
+    println!(
+        "chunk-probe ok addr={addr} worker_id={} ready={}",
+        body.worker_id, body.ready
     );
     Ok(())
 }

@@ -191,6 +191,9 @@ impl MetaService for MetaSvc {
         &self,
         req: Request<RegisterWorkerRequest>,
     ) -> Result<Response<WorkerMembershipResponse>, Status> {
+        // B4 brought this handler in; capability enforcement added during
+        // c1-mtls-auth rebase (gpt56 msg 741e0837): mutating membership write.
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
         let request = req.into_inner();
         let registration =
             decode_worker_registration(&request.registration_json).map_err(status_from_flux)?;
@@ -208,8 +211,10 @@ impl MetaService for MetaSvc {
 
     async fn get_worker_membership(
         &self,
-        _req: Request<GetWorkerMembershipRequest>,
+        req: Request<GetWorkerMembershipRequest>,
     ) -> Result<Response<WorkerMembershipResponse>, Status> {
+        // Read-only membership snapshot; ClientAdmin/Meta/Worker all hold ReadMeta.
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::ReadMeta)?;
         let membership = self.store.worker_membership().map_err(status_from_flux)?;
         Ok(Response::new(WorkerMembershipResponse {
             membership_json: encode_worker_membership(&membership).map_err(status_from_flux)?,
@@ -802,9 +807,10 @@ async fn main() -> Result<()> {
             .context("serve")?;
     } else {
         tracing::warn!(
-            "metamaster in INSECURE-DEV plaintext mode (--allow-insecure-dev); authz interceptor OFF"
+            "metamaster in INSECURE-DEV plaintext mode (--allow-insecure-dev); injecting dev-bootstrap Principal (ClientAdmin caps) so per-handler require(cap) still runs"
         );
         tonic::transport::Server::builder()
+            .layer(fluxfs_tls::AuthzInterceptor::dev_bootstrap_layer())
             .add_service(MetaServiceServer::new(svc))
             .serve(cli.listen)
             .await

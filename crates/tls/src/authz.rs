@@ -371,6 +371,28 @@ impl AuthzInterceptor {
         Self::new(vec![WorkloadRole::Meta, WorkloadRole::ClientAdmin])
     }
 
+    /// Dev-only interceptor for plaintext `--allow-insecure-dev` mode.
+    ///
+    /// When a server runs without TLS, no peer cert exists, so the production
+    /// interceptor can't resolve a Principal. To keep per-handler
+    /// `require_in_extensions` working in dev tests, this installs a fixed
+    /// bootstrap Principal (ClientAdmin role, which carries every cap the
+    /// handlers might require) into request extensions. Production NEVER
+    /// enables this path — it is gated on `--allow-insecure-dev` at the
+    /// caller.
+    pub fn dev_bootstrap_layer() -> tonic::service::interceptor::InterceptorLayer<
+        impl Fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> + Clone + Send + Sync,
+    > {
+        let principal = Principal::new(
+            WorkloadIdentity::client_admin("dev-bootstrap"),
+            "dev-insecure".to_string(),
+        );
+        tonic::service::interceptor::InterceptorLayer::new(move |mut req: tonic::Request<()>| {
+            req.extensions_mut().insert(principal.clone());
+            Ok(req)
+        })
+    }
+
     /// Run the authz check for a request. Returns the resolved Principal on
     /// success. The interceptor layer (`InterceptorLayer::new(...)`) discards
     /// the return value — for per-method enforcement, use

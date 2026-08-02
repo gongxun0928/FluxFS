@@ -888,11 +888,13 @@ dependencies = [
  "fluxfs-client",
  "fluxfs-fuse",
  "fluxfs-meta",
+ "fluxfs-proto",
  "fluxfs-tls",
  "fluxfs-types",
  "fluxfs-ufs",
  "tempfile",
  "tokio",
+ "tonic",
  "tracing",
  "tracing-subscriber",
 ]

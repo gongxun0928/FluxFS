@@ -52,7 +52,8 @@ wait_port() {
 start_worker0() {
     "$repo_dir/target/debug/fluxfs-chunkworker" \
         --worker-id 0 --listen "127.0.0.1:$worker0_port" \
-        --data-dir "$test_root/worker-0" >"$test_root/worker-0.log" 2>&1 &
+        --data-dir "$test_root/worker-0" --allow-insecure-dev \
+        >"$test_root/worker-0.log" 2>&1 &
     worker0_pid=$!
     wait_port "$worker0_port"
 }
@@ -60,7 +61,8 @@ start_worker0() {
 start_worker1() {
     "$repo_dir/target/debug/fluxfs-chunkworker" \
         --worker-id 1 --listen "127.0.0.1:$worker1_port" \
-        --data-dir "$test_root/worker-1" >"$test_root/worker-1.log" 2>&1 &
+        --data-dir "$test_root/worker-1" --allow-insecure-dev \
+        >"$test_root/worker-1.log" 2>&1 &
     worker1_pid=$!
     wait_port "$worker1_port"
 }
@@ -68,6 +70,7 @@ start_worker1() {
 start_meta() {
     "$repo_dir/target/debug/fluxfs-metamaster" \
         --listen "127.0.0.1:$meta_port" --data-dir "$test_root/meta" \
+        --allow-insecure-dev \
         >"$test_root/meta.log" 2>&1 &
     meta_pid=$!
     wait_port "$meta_port"
@@ -80,6 +83,7 @@ start_mount() {
         --chunk-worker "http://127.0.0.1:$worker0_port" \
         --chunk-worker "http://127.0.0.1:$worker1_port" \
         --chunk-worker "http://127.0.0.1:$worker2_port" \
+        --allow-insecure-dev \
         >"$test_root/mount.log" 2>&1 &
     mount_pid=$!
     for _ in $(seq 1 100); do
@@ -106,7 +110,8 @@ start_worker0
 start_worker1
 "$repo_dir/target/debug/fluxfs-chunkworker" \
     --worker-id 2 --listen "127.0.0.1:$worker2_port" \
-    --data-dir "$test_root/worker-2" >"$test_root/worker-2.log" 2>&1 &
+    --data-dir "$test_root/worker-2" --allow-insecure-dev \
+    >"$test_root/worker-2.log" 2>&1 &
 worker2_pid=$!
 
 wait_port "$worker2_port"

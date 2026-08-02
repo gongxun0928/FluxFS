@@ -421,9 +421,10 @@ async fn main() -> Result<()> {
             .context("serve chunk worker")
     } else {
         tracing::warn!(
-            "chunkworker in INSECURE-DEV plaintext mode (--allow-insecure-dev); authz interceptor OFF"
+            "chunkworker in INSECURE-DEV plaintext mode (--allow-insecure-dev); injecting dev-bootstrap Principal (ClientAdmin caps) so per-handler require(cap) still runs"
         );
         tonic::transport::Server::builder()
+            .layer(fluxfs_tls::AuthzInterceptor::dev_bootstrap_layer())
             .add_service(
                 ChunkWorkerServer::new(service)
                     .max_decoding_message_size(MAX_CHUNK_RPC_MESSAGE)

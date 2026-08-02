@@ -230,24 +230,27 @@ fi
 rm -rf -- "$test_root/client-bad"
 echo "    PASS (plaintext dial rejected)"
 
-echo "==> [3/5] reject: no client cert"
-if start_mount_with "$cert_dir/client.crt" "$cert_dir/client.key" 2>/dev/null; then
-    # Should not get here: with no client cert configured, the mount binary
-    # should refuse to dial. But mount's TLS client currently requires CA +
-    # identity both-or-neither; CA-only mode dials without a client identity.
-    # So we test CA-only dials directly.
-    :
-fi
-# CA-only (no client cert) dial: the *server* requires a client cert, so the
-# TLS handshake must fail. Use grpcurl-style probe via fluxfs meta-ping.
+echo "==> [3/5] reject: no client cert (CA-only dial against mTLS server)"
+# Server requires client cert (--tls-server-cert without --allow-insecure-dev
+# forces mTLS); a CA-only dial (no --tls-client-cert) must fail the TLS
+# handshake. Drive a real RPC (MetaService.Ping via GetInode on root) so the
+# handshake actually completes — connection-lazy clients defer the failure
+# until first RPC.
 if "$repo_dir/target/debug/fluxfs" meta-ping \
-        --meta-addr "https://127.0.0.1:$meta_port" \
+        --addr "https://127.0.0.1:$meta_port" \
         --tls-ca-cert "$cert_dir/ca.crt" \
         --allow-insecure-dev \
         >"$test_root/no-cert-ping.log" 2>&1; then
     echo "    FAIL: no-client-cert dial succeeded" >&2
     cat "$test_root/no-cert-ping.log" >&2
     exit 1
+fi
+# Sanity-check that the failure is a TLS handshake error, not some unrelated
+# transport issue (port down, wrong CA, etc.). gRPC surfaces handshake
+# failures with one of these substrings.
+if ! grep -qiE "tls|handshake|certificate|alert" "$test_root/no-cert-ping.log"; then
+    echo "    WARN: no-client-cert dial failed but log lacks TLS error marker:" >&2
+    cat "$test_root/no-cert-ping.log" >&2
 fi
 echo "    PASS (no-client-cert rejected at TLS)"
 
@@ -265,30 +268,73 @@ fi
 echo "    PASS (rogue-CA client rejected at TLS)"
 
 echo "==> [5/5] reject: role-not-admitted (worker-1 cert dialing worker server)"
-# Worker server for_worker() admits only {meta, client-admin}. A worker-1
-# cert (spiffe://fluxfs/worker/1) should be rejected with Code::PermissionDenied
+# Worker server for_worker() admits only {Meta, ClientAdmin}. A worker-1
+# cert (spiffe://fluxfs/worker/1) is rejected with Code::PermissionDenied
 # AFTER TLS succeeds — this is the Phase 3 authz gate, not TLS.
-if "$repo_dir/target/debug/fluxfs" meta-ping \
-        --meta-addr "https://127.0.0.1:$worker1_port" \
+#
+# Real RPC: ChunkWorker.Health via the new `chunk-probe` subcommand. The
+# for_worker() interceptor runs as a Layer over the service, BEFORE method
+# dispatch, so PermissionDenied fires before the Health handler sees the
+# request. (Earlier meta-ping-against-worker was bogus: tonic returned
+# Unimplemented for unknown MetaService.Ping on a ChunkWorkerServer, masking
+# the authz path.)
+if "$repo_dir/target/debug/fluxfs" chunk-probe \
+        --addr "https://127.0.0.1:$worker1_port" \
         --tls-ca-cert "$cert_dir/ca.crt" \
         --tls-client-cert "$cert_dir/worker-1.crt" \
         --tls-client-key  "$cert_dir/worker-1.key" \
         >"$test_root/role-reject.log" 2>&1; then
-    # meta-ping against worker port: TLS ok (cert valid under CA), but the
-    # worker server's Health RPC isn't MetaService.Ping so the call fails
-    # with Code::Unimplemented. That's still a rejection — what matters is
-    # we never reach a successful application-level response.
-    if grep -qiE "permission denied|unimplemented|unauthenticated" \
-            "$test_root/role-reject.log"; then
-        :
-    else
-        echo "    WARN: unexpected success on cross-role dial:" >&2
-        cat "$test_root/role-reject.log" >&2
-    fi
+    echo "    FAIL: worker-1 cert admitted by worker server" >&2
+    cat "$test_root/role-reject.log" >&2
+    exit 1
 fi
-echo "    PASS (cross-role dial rejected)"
+# The error must surface from authz (Code::PermissionDenied), not TLS.
+# gRPC surfaces PermissionDenied with the canonical "does not have permission"
+# prefix; our authz layer wraps it as "role <r> not admitted by this server".
+if ! grep -qiE "does not have permission|not admitted|lacks|permission denied" \
+        "$test_root/role-reject.log"; then
+    echo "    FAIL: cross-role dial failed without PermissionDenied marker:" >&2
+    cat "$test_root/role-reject.log" >&2
+    exit 1
+fi
+echo "    PASS (cross-role dial rejected at Phase 3 authz with PermissionDenied)"
 
-echo "==> [bonus] cert rotation: regenerate client cert under same CA, reconnect"
+echo "==> [bonus 1] tombstone/delete/finalize: ClientAdmin drives GC under mTLS"
+# gpt56 aa9e8122: ClientAdmin directly dials Worker.delete_chunk during GC
+# sweep and orphan-GC. Without DeleteChunk in ClientAdmin's caps, every GC
+# delete_chunk under mTLS would return PermissionDenied. This exercises the
+# real path: remount client cert (ClientAdmin caps), write+delete a file,
+# then run fluxfs orphan-gc against the live cluster under mTLS and assert
+# it returns success (no PermissionDenied on delete_chunk).
+start_mount_with "$cert_dir/client.crt" "$cert_dir/client.key"
+printf 'gc-target\n' >"$mount_dir/gc-target.txt"
+test "$(cat "$mount_dir/gc-target.txt")" = "gc-target"
+rm -f "$mount_dir/gc-target.txt"
+fusermount3 -u "$mount_dir"
+wait "$mount_pid" 2>/dev/null || true
+mount_pid=""
+if ! "$repo_dir/target/debug/fluxfs" orphan-gc \
+        --data-dir "$test_root/client-gc" \
+        --meta-addr "https://127.0.0.1:$meta_port" \
+        --chunk-worker "https://127.0.0.1:$worker0_port" \
+        --chunk-worker "https://127.0.0.1:$worker1_port" \
+        --chunk-worker "https://127.0.0.1:$worker2_port" \
+        --tls-ca-cert "$cert_dir/ca.crt" \
+        --tls-client-cert "$cert_dir/client.crt" \
+        --tls-client-key  "$cert_dir/client.key" \
+        >"$test_root/orphan-gc.log" 2>&1; then
+    echo "    FAIL: orphan-gc under mTLS errored" >&2
+    cat "$test_root/orphan-gc.log" >&2
+    exit 1
+fi
+if grep -qiE "permission denied|unauthenticated" "$test_root/orphan-gc.log"; then
+    echo "    FAIL: orphan-gc hit authz rejection under mTLS" >&2
+    cat "$test_root/orphan-gc.log" >&2
+    exit 1
+fi
+echo "    PASS (ClientAdmin DeleteChunk cap drives GC sweep under mTLS)"
+
+echo "==> [bonus 2] cert rotation: regenerate client cert under same CA, reconnect"
 # Revoke the client cert by issuing a new one with a different serial. Since
 # we don't have CRL/OCSP (Phase 4), rotation here means: regenerate, remount,
 # confirm a fresh write succeeds. This proves the mTLS handshake picks up
