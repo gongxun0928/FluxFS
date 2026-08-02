@@ -469,6 +469,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn chunk_id_raw_wire_roundtrip() {
+        let expected = ChunkId::from_bytes(b"wire roundtrip");
+        let decoded = ChunkId::try_from(expected.as_bytes().as_slice()).unwrap();
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn chunk_id_wire_length_is_strict() {
+        for len in [0, 31, 33, 64] {
+            assert!(ChunkId::try_from(vec![0u8; len].as_slice()).is_err());
+        }
+        assert!(ChunkId::try_from([0u8; 32].as_slice()).is_ok());
+    }
+
+    #[test]
     fn dirty_label_derives_from_data_state() {
         let f = LocalityFields {
             backing_mode: BackingMode::UfsBacked,
