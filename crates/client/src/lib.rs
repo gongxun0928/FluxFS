@@ -184,9 +184,12 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         self.read_inode_range(&inode, offset, size as u64)
     }
 
-    /// Whole-file rewrite write path (MVP). Durable via ChunkStore + manifest CAS on inode.
+    /// Durable random write. External files copy up only the touched chunk-aligned
+    /// windows; Ephemeral files retain the MVP whole-file rewrite path.
     pub fn write_at(&self, ino: InodeId, offset: u64, data: &[u8]) -> Result<u32> {
-        self.reject_ufs_mutation()?;
+        if data.is_empty() {
+            return Ok(0);
+        }
         let _guard = self
             .io_lock
             .lock()
@@ -205,10 +208,17 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
             )));
         }
 
+        if matches!(
+            inode.locality_fields.as_ref().map(|f| f.backing_mode),
+            Some(BackingMode::UfsBacked)
+        ) {
+            return self.write_ufs_backed(&mut inode, offset, data, end);
+        }
+
         let mut buf = if inode.size == 0 {
             Vec::new()
         } else {
-            self.read_all(ino)?
+            self.read_inode_range(&inode, 0, inode.size)?
         };
         if (buf.len() as u64) < end {
             buf.resize(end as usize, 0);
@@ -218,15 +228,99 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
 
         let gen = DataGen(inode.head_gen.0.saturating_add(1));
         let manifest = self.build_local_manifest(ino, gen, &buf)?;
-        let mid = self.meta.put_manifest(&manifest)?;
         let now = now_ms();
         inode.size = buf.len() as u64;
         inode.head_gen = gen;
         inode.generation = inode.generation.saturating_add(1);
-        inode.manifest_id = Some(mid);
         inode.mtime_ms = now;
         inode.ctime_ms = now;
-        self.meta.put_inode(&inode)?;
+        self.meta
+            .commit_inode_manifest(inode.generation.saturating_sub(1), &inode, &manifest)?;
+        Ok(data.len() as u32)
+    }
+
+    /// Copy up each touched 4 MiB window as a durable Local extent, then atomically
+    /// switch the inode head. Untouched bytes remain pinned UFS ranges.
+    fn write_ufs_backed(
+        &self,
+        inode: &mut Inode,
+        offset: u64,
+        data: &[u8],
+        end: u64,
+    ) -> Result<u32> {
+        let expected_generation = inode.generation;
+        let old_size = inode.size;
+        let new_size = old_size.max(end);
+        let gen = DataGen(inode.head_gen.0.saturating_add(1));
+        let mut manifest = match inode.manifest_id {
+            Some(id) => self.meta.get_manifest(id)?,
+            None => Manifest::empty(inode.id, inode.head_gen),
+        };
+
+        let first_window = offset / CHUNK_SIZE;
+        let last_window = (end - 1) / CHUNK_SIZE;
+        for window_index in first_window..=last_window {
+            let window_start = window_index
+                .checked_mul(CHUNK_SIZE)
+                .ok_or_else(|| FluxError::InvalidArg("chunk offset overflow".into()))?;
+            let window_end = window_start
+                .checked_add(CHUNK_SIZE)
+                .ok_or_else(|| FluxError::InvalidArg("chunk end overflow".into()))?
+                .min(new_size);
+            let window_len = window_end - window_start;
+            let old_window_end = window_end.min(old_size);
+            let mut bytes = if window_start < old_window_end {
+                self.read_inode_range(inode, window_start, old_window_end - window_start)?
+            } else {
+                Vec::new()
+            };
+            bytes.resize(window_len as usize, 0);
+
+            let overlay_start = offset.max(window_start);
+            let overlay_end = end.min(window_end);
+            let src_start = (overlay_start - offset) as usize;
+            let dst_start = (overlay_start - window_start) as usize;
+            let overlay_len = (overlay_end - overlay_start) as usize;
+            bytes[dst_start..dst_start + overlay_len]
+                .copy_from_slice(&data[src_start..src_start + overlay_len]);
+
+            // ChunkStore::put is the RF=2 durability boundary. Metadata remains
+            // unreachable until commit_inode_manifest succeeds below.
+            let chunk = self.chunks.put(&bytes)?;
+            manifest = manifest.replace_range(
+                Extent::Local {
+                    offset: window_start,
+                    len: window_len,
+                    chunk,
+                },
+                gen,
+            )?;
+        }
+
+        manifest.size = new_size;
+        let now = now_ms();
+        inode.size = new_size;
+        inode.head_gen = gen;
+        inode.generation = inode.generation.saturating_add(1);
+        inode.locality_fields = Some(LocalityFields {
+            backing_mode: BackingMode::UfsBacked,
+            data_state: DataState::Dirty,
+            op_state: OpState::None,
+            origin: inode
+                .locality_fields
+                .as_ref()
+                .map(|f| f.origin)
+                .unwrap_or(Origin::Imported),
+        });
+        inode.locality = LocalityLabel::derive(
+            inode.locality_fields.as_ref().expect("just assigned"),
+            inode.head_gen,
+            inode.ufs_gen,
+        );
+        inode.mtime_ms = now;
+        inode.ctime_ms = now;
+        self.meta
+            .commit_inode_manifest(expected_generation, inode, &manifest)?;
         Ok(data.len() as u32)
     }
 
@@ -686,5 +780,54 @@ mod tests {
         // One demanded part plus at most two background prefetch parts, never
         // all eight MiB for this 64-byte FUSE read.
         assert!(client.ufs_read_stats().unwrap().backend_fetches <= 3);
+    }
+
+    #[test]
+    fn external_random_write_copies_up_only_touched_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let ufs_root = dir.path().join("ufs");
+        std::fs::create_dir_all(&ufs_root).unwrap();
+        let mut original = vec![0u8; (3 * CHUNK_SIZE + 123) as usize];
+        for (index, byte) in original.iter_mut().enumerate() {
+            *byte = (index % 251) as u8;
+        }
+        std::fs::write(ufs_root.join("large.bin"), &original).unwrap();
+
+        let meta = HeedMetaStore::open(dir.path().join("meta")).unwrap();
+        let chunks = DiskChunkStore::open(dir.path().join("chunks")).unwrap();
+        let client = FluxClient::new(meta, chunks)
+            .with_ufs(Ufs::local(&ufs_root).unwrap())
+            .unwrap();
+        let inode = client.lookup(ROOT_INODE, "large.bin").unwrap();
+
+        let first_offset = CHUNK_SIZE + 17;
+        client
+            .write_at(inode.id, first_offset, b"first-copy-up")
+            .unwrap();
+        let second_offset = CHUNK_SIZE + 101;
+        client
+            .write_at(inode.id, second_offset, b"second-write")
+            .unwrap();
+
+        let mut expected = original.clone();
+        expected[first_offset as usize..first_offset as usize + b"first-copy-up".len()]
+            .copy_from_slice(b"first-copy-up");
+        expected[second_offset as usize..second_offset as usize + b"second-write".len()]
+            .copy_from_slice(b"second-write");
+        assert_eq!(client.read_all(inode.id).unwrap(), expected);
+        assert_eq!(std::fs::read(ufs_root.join("large.bin")).unwrap(), original);
+
+        let dirty = client.get_inode(inode.id).unwrap();
+        assert_eq!(dirty.locality, LocalityLabel::Dirty);
+        assert_eq!(dirty.head_gen, DataGen(2));
+        assert_eq!(dirty.ufs_gen, DataGen(0));
+        let manifest = client
+            .meta
+            .get_manifest(dirty.manifest_id.unwrap())
+            .unwrap();
+        assert_eq!(manifest.extents.len(), 3);
+        assert!(matches!(manifest.extents[0], Extent::UfsRange { .. }));
+        assert!(matches!(manifest.extents[1], Extent::Local { .. }));
+        assert!(matches!(manifest.extents[2], Extent::UfsRange { .. }));
     }
 }

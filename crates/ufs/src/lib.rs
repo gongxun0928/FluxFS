@@ -258,10 +258,10 @@ impl Ufs {
 }
 
 fn map_opendal(e: opendal::Error) -> FluxError {
-    if e.kind() == opendal::ErrorKind::NotFound {
-        FluxError::NotFound
-    } else {
-        FluxError::Ufs(e.to_string())
+    match e.kind() {
+        opendal::ErrorKind::NotFound => FluxError::NotFound,
+        opendal::ErrorKind::ConditionNotMatch => FluxError::DirtyConflict,
+        _ => FluxError::Ufs(e.to_string()),
     }
 }
 
@@ -296,5 +296,12 @@ mod tests {
             [&parts[0][..], &parts[1][..], &parts[2][..]].concat(),
             payload
         );
+    }
+
+    #[test]
+    fn conditional_read_mismatch_is_a_dirty_conflict() {
+        let error =
+            opendal::Error::new(opendal::ErrorKind::ConditionNotMatch, "pinned ETag changed");
+        assert_eq!(map_opendal(error), FluxError::DirtyConflict);
     }
 }

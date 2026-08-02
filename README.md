@@ -10,11 +10,12 @@ The current MVP can mount a local Ephemeral (`--no-ufs`) filesystem. Metadata
 is persisted with heed; authoritative chunks are acknowledged after two local
 replicas durably store and checksum them. UFS I/O is OpenDAL (local FS + S3/MinIO
 via `scripts/dev-minio.sh` / `fluxfs ufs-check`); External objects are lazily
-imported into a read-only FUSE namespace and read with pinned, bounded Range GETs.
-Basic create/read/write, random write,
+imported into FUSE and read with pinned, bounded Range GETs. Random writes copy
+up only touched 4 MiB windows into RF=2 Local extents, keep untouched bytes as
+pinned UFS ranges, then atomically CAS the inode to Dirty. Basic create/read/write, random write,
 truncate, mkdir/readdir, unlink, unmount/remount, process-crash recovery, and
-single-replica read fallback are executable. Dirty copy-up and safe UFS
-write-back remain next-stage work.
+single-replica read fallback are executable. Safe UFS write-back remains
+next-stage work.
 
 The same Ephemeral path also runs as five localhost processes: one MetaMaster,
 three ChunkWorkers, and one FUSE/client. Meta and chunk traffic use tonic/TCP;
@@ -27,6 +28,7 @@ write txn. Snapshots export/import full inode/dentry/manifest state. This is
 durable single-voter recovery, not multi-voter metadata HA.
 
 Design: [`docs/mvp-v0.1.md`](docs/mvp-v0.1.md) · Alpha gates: [`docs/alpha-checklist.md`](docs/alpha-checklist.md)
+· Production gap analysis: [`docs/production-readiness.md`](docs/production-readiness.md)
 
 ## Workspace
 
@@ -56,6 +58,7 @@ cargo run -p fluxfs -- smoke --data-dir /tmp/fluxfs-smoke
 ./scripts/test-local-crash-restart.sh
 ./scripts/test-multiprocess.sh
 ./scripts/test-ufs-minio.sh
+./scripts/test-dirty-copyup-minio.sh
 
 # Ephemeral local mount (no UFS)
 mkdir -p /tmp/fluxfs-data /tmp/fluxfs-mnt
@@ -74,7 +77,7 @@ export FLUXFS_UFS_ACCESS_KEY=minioadmin
 export FLUXFS_UFS_SECRET_KEY=minioadmin
 cargo run -p fluxfs -- ufs-check
 
-# Read-only External mount over the test bucket
+# External mount over the test bucket (existing-object random writes copy up to Dirty)
 cargo run -p fluxfs -- mount --ufs s3://fluxfs --data-dir /tmp/fluxfs-external-data --mountpoint /tmp/fluxfs-mnt
 ```
 

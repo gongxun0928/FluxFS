@@ -6,8 +6,8 @@ use fluxfs_meta::MetaStore;
 use fluxfs_types::{FileType as FluxFileType, FluxError, Inode};
 use fuser::{
     mount, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
-    INodeNo, MountOption, OpenAccMode, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, SessionACL, TimeOrNow,
+    INodeNo, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyOpen, ReplyWrite, Request, SessionACL, TimeOrNow,
 }; // SessionACL used in mount_ephemeral
 use std::ffi::OsStr;
 use std::path::Path;
@@ -157,11 +157,7 @@ impl<M: MetaStore + 'static, C: ChunkStore + 'static> Filesystem for FluxFs<M, C
         }
     }
 
-    fn open(&self, _req: &Request, ino: INodeNo, flags: fuser::OpenFlags, reply: ReplyOpen) {
-        if self.client.has_ufs() && flags.acc_mode() != OpenAccMode::O_RDONLY {
-            reply.error(Errno::EROFS);
-            return;
-        }
+    fn open(&self, _req: &Request, ino: INodeNo, _flags: fuser::OpenFlags, reply: ReplyOpen) {
         match self.client.get_inode(ino.0) {
             Ok(inode) if inode.file_type == FluxFileType::Regular => {
                 reply.opened(FileHandle(0), FopenFlags::empty());
