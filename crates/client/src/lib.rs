@@ -3,8 +3,8 @@
 use fluxfs_chunk::ChunkStore;
 use fluxfs_meta::MetaStore;
 use fluxfs_types::{
-    ChunkId, DataGen, DIRTY_WRITE_CAP_BYTES, Extent, FileType, FluxError, Inode, InodeId, Manifest,
-    Result, ROOT_INODE,
+    ChunkId, DataGen, Extent, FileType, FluxError, Inode, InodeId, Manifest, Result,
+    DIRTY_WRITE_CAP_BYTES, ROOT_INODE,
 };
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,7 +28,14 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         self.meta.root()
     }
 
-    pub fn mkdir(&self, parent: InodeId, name: &str, mode: u32, uid: u32, gid: u32) -> Result<Inode> {
+    pub fn mkdir(
+        &self,
+        parent: InodeId,
+        name: &str,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Inode> {
         self.meta
             .create(parent, name, FileType::Directory, mode, uid, gid)
     }
@@ -95,11 +102,7 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         let mut buf = vec![0u8; inode.size as usize];
         for ext in &manifest.extents {
             match ext {
-                Extent::Local {
-                    offset,
-                    len,
-                    chunk,
-                } => {
+                Extent::Local { offset, len, chunk } => {
                     let data = self.chunks.get(chunk)?;
                     if data.len() as u64 != *len {
                         return Err(FluxError::Io(format!(

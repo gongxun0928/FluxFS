@@ -1,6 +1,6 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use fluxfs_chunk::DiskChunkStore;
+use fluxfs_chunk::{DiskChunkStore, ReplicatedChunkStore};
 use fluxfs_client::FluxClient;
 use fluxfs_meta::HeedMetaStore;
 use fluxfs_types::{FileType, ROOT_INODE};
@@ -115,15 +115,21 @@ fn run_mount(data_dir: PathBuf, mountpoint: PathBuf) -> Result<()> {
     std::fs::create_dir_all(&data_dir)?;
     std::fs::create_dir_all(&mountpoint)?;
     let meta = HeedMetaStore::open(data_dir.join("meta")).context("open meta")?;
-    // Authoritative durable store for Ephemeral (RF=2 multi-worker comes next).
-    let chunks = DiskChunkStore::open(data_dir.join("chunks")).context("open chunks")?;
+    let chunks = ReplicatedChunkStore::open_rf2(
+        data_dir.join("chunks/worker-0"),
+        data_dir.join("chunks/worker-1"),
+    )
+    .context("open RF=2 chunks")?;
     let client = Arc::new(FluxClient::new(meta, chunks));
     println!(
-        "mounting Ephemeral FluxFS data_dir={} mountpoint={}",
+        "mounting Ephemeral FluxFS (RF=2) data_dir={} mountpoint={}",
         data_dir.display(),
         mountpoint.display()
     );
-    println!("basic check: echo hi > {0}/hi.txt && cat {0}/hi.txt", mountpoint.display());
+    println!(
+        "basic check: echo hi > {0}/hi.txt && cat {0}/hi.txt",
+        mountpoint.display()
+    );
     fluxfs_fuse::mount_ephemeral(client, &mountpoint).context("fuse mount")?;
     Ok(())
 }

@@ -60,15 +60,23 @@ start_mount
 printf 'hello fluxfs\n' >"$mount_dir/hello.txt"
 mkdir "$mount_dir/dir"
 printf 'nested\n' >"$mount_dir/dir/nested.txt"
+printf 'remove me\n' >"$mount_dir/remove.txt"
 test "$(cat "$mount_dir/hello.txt")" = "hello fluxfs"
 test "$(cat "$mount_dir/dir/nested.txt")" = "nested"
+printf 'XY' | dd of="$mount_dir/hello.txt" bs=1 seek=6 conv=notrunc status=none
+test "$(cat "$mount_dir/hello.txt")" = "hello XYuxfs"
+truncate -s 8 "$mount_dir/hello.txt"
+test "$(cat "$mount_dir/hello.txt")" = "hello XY"
+rm "$mount_dir/remove.txt"
+test ! -e "$mount_dir/remove.txt"
 stop_mount
 
 # Reopen the same metadata/chunk directories and verify acknowledged data.
 start_mount
-test "$(cat "$mount_dir/hello.txt")" = "hello fluxfs"
+test "$(cat "$mount_dir/hello.txt")" = "hello XY"
 test "$(cat "$mount_dir/dir/nested.txt")" = "nested"
-printf 'restart-ok\n' >>"$mount_dir/hello.txt"
+test ! -e "$mount_dir/remove.txt"
+printf '\nrestart-ok\n' >>"$mount_dir/hello.txt"
 test "$(tail -n 1 "$mount_dir/hello.txt")" = "restart-ok"
 stop_mount
 

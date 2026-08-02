@@ -5,9 +5,9 @@ use fluxfs_client::FluxClient;
 use fluxfs_meta::MetaStore;
 use fluxfs_types::{FileType as FluxFileType, FluxError, Inode};
 use fuser::{
-    Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
-    MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
-    ReplyOpen, ReplyWrite, Request, SessionACL, TimeOrNow, mount,
+    mount, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
+    INodeNo, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyOpen, ReplyWrite, Request, SessionACL, TimeOrNow,
 }; // SessionACL used in mount_ephemeral
 use std::ffi::OsStr;
 use std::path::Path;
@@ -246,17 +246,13 @@ impl<M: MetaStore + 'static, C: ChunkStore + 'static> Filesystem for FluxFs<M, C
         };
 
         // offset cookie: 1='.', 2='..', then children starting at 3
-        if offset < 1 {
-            if reply.add(INodeNo(ino.0), 1, FileType::Directory, ".") {
-                reply.ok();
-                return;
-            }
+        if offset < 1 && reply.add(INodeNo(ino.0), 1, FileType::Directory, ".") {
+            reply.ok();
+            return;
         }
-        if offset < 2 {
-            if reply.add(INodeNo(ino.0), 2, FileType::Directory, "..") {
-                reply.ok();
-                return;
-            }
+        if offset < 2 && reply.add(INodeNo(ino.0), 2, FileType::Directory, "..") {
+            reply.ok();
+            return;
         }
         for (i, d) in entries.into_iter().enumerate() {
             let next = (i as u64) + 3;
