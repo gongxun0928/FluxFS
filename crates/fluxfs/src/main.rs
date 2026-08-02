@@ -4,7 +4,7 @@ use fluxfs_chunk::{ChunkStore, DiskChunkStore, RemoteReplicatedChunkStore, Repli
 use fluxfs_client::FluxClient;
 use fluxfs_meta::{HeedMetaStore, MetaStore, RemoteMetaStore};
 use fluxfs_types::{FileType, ROOT_INODE};
-use fluxfs_ufs::Ufs;
+use fluxfs_ufs::{RangeReq, S3Options, Ufs};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -22,7 +22,7 @@ enum Cmd {
         #[arg(long, default_value = "/tmp/fluxfs-smoke")]
         data_dir: PathBuf,
     },
-    /// Mount Ephemeral FluxFS (`--no-ufs`) at a local path. Blocking.
+    /// Mount FluxFS at a local path. Blocking.
     Mount {
         /// Persistent data directory (local meta if --meta-addr unset; always holds chunks).
         #[arg(long, default_value = "/tmp/fluxfs-data")]
@@ -30,9 +30,13 @@ enum Cmd {
         /// Mount point (must exist and be empty/usable).
         #[arg(long)]
         mountpoint: PathBuf,
-        /// Required for v0.1 mount path (UFS-backed mount lands later).
-        #[arg(long, default_value_t = true)]
+        /// Ephemeral mount (no UFS). Mutually exclusive with `--ufs`.
+        #[arg(long, default_value_t = false)]
         no_ufs: bool,
+        /// UFS URI for backed mount: `s3://bucket[/prefix]` or `file:///abs/path`.
+        /// Requires `FLUXFS_UFS_*` env for S3 credentials/endpoint (see `scripts/dev-minio.sh`).
+        #[arg(long)]
+        ufs: Option<String>,
         /// Optional remote MetaMaster (`host:port` or `http://host:port`).
         #[arg(long)]
         meta_addr: Option<String>,
@@ -45,6 +49,12 @@ enum Cmd {
     MetaPing {
         #[arg(long, default_value = "127.0.0.1:50051")]
         addr: String,
+    },
+    /// OpenDAL/S3 smoke against MinIO (or any S3 endpoint via `FLUXFS_UFS_*`).
+    UfsCheck {
+        /// Object key to write/read (default: fluxfs-ufs-check.bin).
+        #[arg(long, default_value = "fluxfs-ufs-check.bin")]
+        key: String,
     },
     /// Print stack / topology freeze summary.
     Info,
@@ -63,12 +73,13 @@ async fn main() -> Result<()> {
             println!("  repo: https://github.com/gongxun0928/FluxFS");
             println!("  meta: heed MetaStore; remote via fluxfs-metamaster (tonic)");
             println!("  chunk: ReplicatedChunkStore RF=2; Worker RPC next");
-            println!("  ufs: OpenDAL (local FS / S3)");
+            println!("  ufs: OpenDAL (local FS / S3); parallel Range GET via Ufs::read_ranges");
             println!("  fuse_supported: {}", fluxfs_fuse::mount_supported());
             println!("  multi-process: fluxfs-metamaster --listen 127.0.0.1:50051 --data-dir DIR");
             println!(
-                "  mount: fluxfs mount --no-ufs --data-dir DIR --mountpoint MNT [--meta-addr HOST:PORT]"
+                "  mount ephemeral: fluxfs mount --no-ufs --data-dir DIR --mountpoint MNT"
             );
+            println!("  ufs test bed: bash scripts/dev-minio.sh && cargo run -p fluxfs -- ufs-check");
         }
         Cmd::Smoke { data_dir } => {
             run_smoke(data_dir).await?;
@@ -77,18 +88,64 @@ async fn main() -> Result<()> {
             data_dir,
             mountpoint,
             no_ufs,
+            ufs,
             meta_addr,
             chunk_workers,
         } => {
-            if !no_ufs {
-                bail!("v0.1 only supports --no-ufs (Ephemeral); UFS-backed mount is next");
+            match (no_ufs, ufs.as_deref()) {
+                (true, None) => run_mount(data_dir, mountpoint, meta_addr, chunk_workers)?,
+                (false, Some(uri)) => {
+                    bail!(
+                        "UFS-backed mount (`--ufs {uri}`) not wired yet; OpenDAL path is live via `fluxfs ufs-check`. External FUSE vertical is next."
+                    );
+                }
+                (true, Some(_)) => bail!("pass either --no-ufs or --ufs, not both"),
+                (false, None) => {
+                    bail!("mount requires --no-ufs (Ephemeral) or --ufs <uri> (UFS-backed)")
+                }
             }
-            run_mount(data_dir, mountpoint, meta_addr, chunk_workers)?;
         }
         Cmd::MetaPing { addr } => {
             run_meta_ping(&addr)?;
         }
+        Cmd::UfsCheck { key } => {
+            run_ufs_check(&key).await?;
+        }
     }
+    Ok(())
+}
+
+async fn run_ufs_check(key: &str) -> Result<()> {
+    let opts = S3Options::from_env().context("load FLUXFS_UFS_*")?;
+    let ufs = Ufs::s3(&opts).context("open S3 UFS")?;
+    let payload = b"fluxfs-opendal-minio-ok";
+    let written = ufs.write_full(key, payload).await.context("ufs write")?;
+    let head = ufs.head(key).await.context("ufs head")?;
+    assert_eq!(head.size, payload.len() as u64);
+    let ranges = ufs
+        .read_ranges(
+            key,
+            &[
+                RangeReq {
+                    offset: 0,
+                    len: 6,
+                },
+                RangeReq {
+                    offset: 6,
+                    len: (payload.len() as u64).saturating_sub(6),
+                },
+            ],
+        )
+        .await
+        .context("ufs parallel ranges")?;
+    let joined: Vec<u8> = ranges.into_iter().flatten().collect();
+    assert_eq!(joined, payload);
+    let listed = ufs.list("").await.context("ufs list")?;
+    println!("ufs-check ok");
+    println!("  endpoint={}", opts.endpoint);
+    println!("  bucket={}", opts.bucket);
+    println!("  key={} size={} etag={:?}", written.key, written.size, written.etag);
+    println!("  list_entries={}", listed.len());
     Ok(())
 }
 

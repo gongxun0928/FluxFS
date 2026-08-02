@@ -8,7 +8,9 @@ Unified write-cache (JuiceFS-like) + transparent UFS read (Alluxio-like) filesys
 
 The current MVP can mount a local Ephemeral (`--no-ufs`) filesystem. Metadata
 is persisted with heed; authoritative chunks are acknowledged after two local
-replicas durably store and checksum them. Basic create/read/write, random write,
+replicas durably store and checksum them. UFS I/O is OpenDAL (local FS + S3/MinIO
+via `scripts/dev-minio.sh` / `fluxfs ufs-check`); External FUSE mount is next.
+Basic create/read/write, random write,
 truncate, mkdir/readdir, unlink, unmount/remount, process-crash recovery, and
 single-replica read fallback are executable. UFS-backed lazy read/write-back
 remains next-stage work.
@@ -60,6 +62,15 @@ cargo run -p fluxfs -- mount --no-ufs --data-dir /tmp/fluxfs-data --mountpoint /
 #   echo hi > /tmp/fluxfs-mnt/hi.txt && cat /tmp/fluxfs-mnt/hi.txt
 # unmount:
 #   fusermount3 -u /tmp/fluxfs-mnt
+
+# UFS test bed (MinIO) + OpenDAL smoke
+bash scripts/dev-minio.sh   # prints FLUXFS_UFS_* exports
+export FLUXFS_UFS_ENDPOINT=http://127.0.0.1:9000
+export FLUXFS_UFS_BUCKET=fluxfs
+export FLUXFS_UFS_REGION=us-east-1
+export FLUXFS_UFS_ACCESS_KEY=minioadmin
+export FLUXFS_UFS_SECRET_KEY=minioadmin
+cargo run -p fluxfs -- ufs-check
 ```
 
 ## Locked product boundaries (alpha)

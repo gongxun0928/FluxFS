@@ -954,6 +954,7 @@ name = "fluxfs-ufs"
 version = "0.1.0"
 dependencies = [
  "fluxfs-types",
+ "futures",
  "opendal",
  "serde",
  "tempfile",
