@@ -294,32 +294,34 @@ impl RoleCapabilities {
                     Capability::Admin,
                 ],
             },
-            // Worker stages chunk data and runs GC-driven deletes against its
-            // own store; never mutates Meta (it dials Meta as a client for
-            // reservation/commit, which it does under ReadMeta/MutateMeta
-            // granted by its client cert role — see note below).
+            // Worker stages chunk data, runs GC-driven deletes against its
+            // own store, and dials Meta as a client for chunk reservation /
+            // commit / GC ACKs — so it needs both chunk-side caps and the
+            // meta-client caps used during reservations.
             R::Worker => Self {
                 caps: &[
+                    Capability::ReadMeta,
+                    Capability::MutateMeta,
                     Capability::PutChunk,
                     Capability::GetChunk,
                     Capability::DeleteChunk,
                 ],
             },
-            // Admin client: full meta + GC + admin; no direct chunk puts
-            // (admin tooling operates on metadata, not data path).
+            // Admin client / FUSE mount: full meta + GC + admin AND direct
+            // chunk put/get (the mount dials workers for FUSE data path).
+            // DeleteChunk is GC-driven (Meta orchestrates via workers) so it
+            // is intentionally withheld from client-admin.
             R::ClientAdmin => Self {
                 caps: &[
                     Capability::ReadMeta,
                     Capability::MutateMeta,
                     Capability::GcControl,
                     Capability::Admin,
+                    Capability::PutChunk,
+                    Capability::GetChunk,
                 ],
             },
         }
-        // NOTE: a Worker that also needs to dial Meta as a client (reserve/
-        // commit) is expected to present a compound identity in Phase 3, or
-        // the cluster issues a separate client cert to the worker process.
-        // Phase 1 leaves this composition to the Phase 3 interceptor.
     }
 
     pub fn contains(&self, cap: Capability) -> bool {
@@ -513,23 +515,32 @@ mod tests {
     }
 
     #[test]
-    fn worker_role_gets_data_path_caps_only() {
+    fn worker_role_gets_data_path_and_meta_client_caps() {
         let caps = RoleCapabilities::default_for(WorkloadRole::Worker);
+        // Data path on the worker's own store.
         assert!(caps.contains(Capability::PutChunk));
         assert!(caps.contains(Capability::GetChunk));
         assert!(caps.contains(Capability::DeleteChunk));
-        // Workers cannot mutate Meta directly under the worker role.
-        assert!(!caps.contains(Capability::MutateMeta));
+        // Workers dial Meta for reservation/commit/ACK under the same identity
+        // (no separate client cert in Phase 3).
+        assert!(caps.contains(Capability::ReadMeta));
+        assert!(caps.contains(Capability::MutateMeta));
+        // Workers do not drive GC lease control or admin actions.
         assert!(!caps.contains(Capability::Admin));
         assert!(!caps.contains(Capability::GcControl));
     }
 
     #[test]
-    fn client_admin_gets_meta_admin_gc_no_data_path() {
+    fn client_admin_gets_meta_admin_gc_and_data_path_get_put() {
         let caps = RoleCapabilities::default_for(WorkloadRole::ClientAdmin);
         assert!(caps.contains(Capability::MutateMeta));
         assert!(caps.contains(Capability::Admin));
-        assert!(!caps.contains(Capability::PutChunk));
+        // FUSE mount dials workers for data path; admin tooling may stage
+        // chunk content via the same identity.
+        assert!(caps.contains(Capability::PutChunk));
+        assert!(caps.contains(Capability::GetChunk));
+        // DeleteChunk is GC-driven (Meta orchestrates via workers) so it is
+        // withheld from client-admin.
         assert!(!caps.contains(Capability::DeleteChunk));
     }
 
@@ -539,11 +550,12 @@ mod tests {
     fn principal_has_reflects_role_policy() {
         let worker = Principal::new(WorkloadIdentity::worker(WorkerTargetId(1)), "");
         assert!(worker.has(Capability::PutChunk));
-        assert!(!worker.has(Capability::MutateMeta));
+        assert!(worker.has(Capability::MutateMeta));
+        assert!(!worker.has(Capability::Admin));
 
         let admin = Principal::new(WorkloadIdentity::client_admin("ops"), "");
         assert!(admin.has(Capability::Admin));
-        assert!(!admin.has(Capability::PutChunk));
+        assert!(admin.has(Capability::PutChunk));
     }
 
     #[test]
@@ -555,7 +567,7 @@ mod tests {
     #[test]
     fn require_denies_with_structured_reason_when_not_capable() {
         let p = Principal::new(WorkloadIdentity::worker(WorkerTargetId(2)), "");
-        let outcome = require(&p, Capability::MutateMeta);
+        let outcome = require(&p, Capability::GcControl);
         match outcome {
             Err(DenyReason::Unauthorized {
                 role,
@@ -563,7 +575,7 @@ mod tests {
                 detail,
             }) => {
                 assert_eq!(role, WorkloadRole::Worker);
-                assert_eq!(required, Capability::MutateMeta);
+                assert_eq!(required, Capability::GcControl);
                 assert!(detail.contains("lacks required capability"));
             }
             other => panic!("expected Unauthorized, got {other:?}"),

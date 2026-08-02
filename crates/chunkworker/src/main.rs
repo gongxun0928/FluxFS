@@ -150,6 +150,7 @@ impl ChunkWorker for ChunkSvc {
         &self,
         request: Request<PutChunkRequest>,
     ) -> Result<Response<PutChunkResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&request, fluxfs_types::auth::Capability::PutChunk)?;
         FluxMetrics::inc(&self.metrics.chunk_rpc_total);
         let _permit = self.try_enter().inspect_err(|_status| {
             FluxMetrics::inc(&self.metrics.chunk_rpc_error_total);
@@ -179,6 +180,7 @@ impl ChunkWorker for ChunkSvc {
         &self,
         request: Request<GetChunkRequest>,
     ) -> Result<Response<GetChunkResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&request, fluxfs_types::auth::Capability::GetChunk)?;
         FluxMetrics::inc(&self.metrics.chunk_rpc_total);
         let _permit = self.try_enter().inspect_err(|_status| {
             FluxMetrics::inc(&self.metrics.chunk_rpc_error_total);
@@ -209,6 +211,7 @@ impl ChunkWorker for ChunkSvc {
         &self,
         request: Request<ContainsChunkRequest>,
     ) -> Result<Response<ContainsChunkResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&request, fluxfs_types::auth::Capability::GetChunk)?;
         let _permit = self.try_enter()?;
         let chunk = ChunkId::try_from(request.into_inner().chunk_id.as_slice())
             .map_err(status_from_flux)?;
@@ -225,8 +228,12 @@ impl ChunkWorker for ChunkSvc {
 
     async fn health(
         &self,
-        _request: Request<HealthRequest>,
+        request: Request<HealthRequest>,
     ) -> Result<Response<HealthResponse>, Status> {
+        // Health is called by orchestration liveness probes; require any
+        // authenticated principal (ReadMeta is held by both meta and
+        // client-admin, the two roles admitted by for_worker()).
+        fluxfs_tls::require_in_extensions(&request, fluxfs_types::auth::Capability::ReadMeta)?;
         Ok(Response::new(HealthResponse {
             worker_id: self.worker_id,
             ready: true,
@@ -237,6 +244,7 @@ impl ChunkWorker for ChunkSvc {
         &self,
         request: Request<ListChunksRequest>,
     ) -> Result<Response<ListChunksResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&request, fluxfs_types::auth::Capability::GetChunk)?;
         let _permit = self.try_enter_gc()?;
         let request = request.into_inner();
         let limit = usize::try_from(request.limit)
@@ -271,6 +279,7 @@ impl ChunkWorker for ChunkSvc {
         &self,
         request: Request<DeleteChunkRequest>,
     ) -> Result<Response<DeleteChunkResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&request, fluxfs_types::auth::Capability::DeleteChunk)?;
         let _permit = self.try_enter_gc()?;
         let chunk = ChunkId::try_from(request.into_inner().chunk_id.as_slice())
             .map_err(status_from_flux)?;
@@ -296,6 +305,7 @@ fn status_from_flux(error: FluxError) -> Status {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    fluxfs_tls::install_crypto_provider();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -392,13 +402,14 @@ async fn main() -> Result<()> {
             !tls_opts.allow_no_client_cert
         );
         // Phase 3: role-level authz. Worker accepts Meta + ClientAdmin dials.
+        // Per-RPC capability is enforced per-handler via
+        // `require_in_extensions`.
         let authz = std::sync::Arc::new(AuthzInterceptor::for_worker());
         tonic::transport::Server::builder()
             .tls_config(tls)
             .context("tls_config")?
             .layer(tonic::service::InterceptorLayer::new(move |req| {
-                authz.check(&req)?;
-                Ok(req)
+                authz.check_and_attach(req)
             }))
             .add_service(
                 ChunkWorkerServer::new(service)

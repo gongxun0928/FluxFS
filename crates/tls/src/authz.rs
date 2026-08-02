@@ -30,7 +30,7 @@
 //! enrollment into the Meta state machine and adds a per-tenant capability
 //! override layer.
 
-use fluxfs_types::auth::{Principal, WorkloadIdentity, WorkloadRole};
+use fluxfs_types::auth::{Capability, Principal, WorkloadIdentity, WorkloadRole};
 use fluxfs_types::FluxError;
 use tonic::transport::server::TlsConnectInfo;
 use tonic::{Request, Status};
@@ -89,20 +89,38 @@ pub fn extract_spiffe_uri_from_peer_certs(
     None
 }
 
-/// SPIFFE otherName payload is `UTF8String(<uri>)`. x509-parser may give us
-/// the bare bytes of the Any string body or the full tagged form depending
-/// on version. Accept both.
+/// SPIFFE otherName payload is `[0] EXPLICIT UTF8String(<uri>)` per the
+/// OtherName construction in RFC 5280 (`value [0] EXPLICIT ANY DEFINED BY
+/// type-id`). OpenSSL emits the explicit `[0]` wrapper (`0xA0 <len>`) around
+/// the inner UTF8String (`0x0C <len> <bytes>`). x509-parser hands us the
+/// raw otherName value bytes including that wrapper.
+///
+/// Accept all three encodings we've seen:
+///   1. `A0 <len> 0C <len> <utf8>` — full explicit form (openssl, rustls)
+///   2. `0C <len> <utf8>` — pre-peeled UTF8String
+///   3. `<utf8 bytes>` — already-unwrapped string body (some decoders)
 fn decode_spiffe_othername(bytes: &[u8]) -> Option<String> {
-    // If it starts with the UTF8String tag (0x0C) + a short length, peel it.
-    let payload = if bytes.len() >= 2 && bytes[0] == 0x0C {
-        let len = bytes[1] as usize;
-        if 2 + len == bytes.len() {
-            &bytes[2..]
+    let mut cur = bytes;
+    // Peel the `[0] EXPLICIT` context-constructed wrapper if present.
+    if cur.len() >= 2 && (cur[0] & 0xC0) == 0x80 && (cur[0] & 0x1F) == 0 {
+        // context-specific constructed tag class (0x80) + tag number 0.
+        let len = cur[1] as usize;
+        if 2 + len == cur.len() {
+            cur = &cur[2..];
+        } else {
+            return None;
+        }
+    }
+    // Peel the UTF8String tag (0x0C) + short-form length if present.
+    let payload = if cur.len() >= 2 && cur[0] == 0x0C {
+        let len = cur[1] as usize;
+        if 2 + len == cur.len() {
+            &cur[2..]
         } else {
             return None;
         }
     } else {
-        bytes
+        cur
     };
     let s = std::str::from_utf8(payload).ok()?;
     if s.starts_with("spiffe://") {
@@ -354,16 +372,18 @@ impl AuthzInterceptor {
     }
 
     /// Run the authz check for a request. Returns the resolved Principal on
-    /// success (caller may attach it to request extensions for audit).
+    /// success. The interceptor layer (`InterceptorLayer::new(...)`) discards
+    /// the return value — for per-method enforcement, use
+    /// [`require_in_extensions`] inside each service handler.
     pub fn check<T>(&self, req: &Request<T>) -> Result<Principal, Status> {
         use fluxfs_types::auth::DenyReason;
 
         let principal = principal_from_request(req).map_err(deny_to_status)?;
         if !self.allowed.contains(&principal.identity.role) {
-            // Per-RPC capability tables are deferred to the service-handler
-            // follow-up; here we report Admin as the "required" capability
-            // (the strongest in the policy lattice) so the deny message is
-            // honest about how tight this gate actually is.
+            // Per-RPC capability tables are enforced per-handler (see
+            // require_in_extensions); here we report Admin as the "required"
+            // capability (the strongest in the policy lattice) so the deny
+            // message is honest about how tight this gate actually is.
             let deny = DenyReason::unauthorized(
                 principal.identity.role,
                 fluxfs_types::auth::Capability::Admin,
@@ -373,6 +393,48 @@ impl AuthzInterceptor {
         }
         Ok(principal)
     }
+
+    /// And-style: same role check, then stash the resolved Principal into
+    /// the request's extensions so per-handler `require_in_extensions` can
+    /// pull it out for per-method capability enforcement.
+    ///
+    /// Use this as the interceptor closure body: it returns the modified
+    /// `Request<()>` carrying the Principal for downstream handlers.
+    pub fn check_and_attach(&self, mut req: Request<()>) -> Result<Request<()>, Status> {
+        let principal = self.check(&req)?;
+        req.extensions_mut().insert(principal);
+        Ok(req)
+    }
+}
+
+/// Per-handler capability enforcement. Service handlers call this at the top
+/// of each RPC method:
+///
+/// ```ignore
+/// async fn create(&self, req: Request<CreateRequest>) -> Result<...> {
+///     require_in_extensions(&req, Capability::MutateMeta)?;
+///     // ... handler body ...
+/// }
+/// ```
+///
+/// Pulls the [`Principal`] previously injected by
+/// [`AuthzInterceptor::check_and_attach`] out of request extensions and runs
+/// [`fluxfs_types::auth::require`] for the requested capability. Denies map
+/// through the same `FluxError → tonic::Status` wire contract as
+/// interceptor-level denials.
+pub fn require_in_extensions<T>(req: &Request<T>, cap: Capability) -> Result<(), Status> {
+    use fluxfs_types::auth::{require, DenyReason};
+
+    let principal = req
+        .extensions()
+        .get::<Principal>()
+        .cloned()
+        .ok_or_else(|| {
+            deny_to_status(DenyReason::unauthenticated(
+                "authz: no Principal in request extensions (interceptor not installed?)",
+            ))
+        })?;
+    require(&principal, cap).map_err(deny_to_status)
 }
 
 fn deny_to_status(reason: fluxfs_types::auth::DenyReason) -> Status {
@@ -426,10 +488,12 @@ mod tests {
 
     #[test]
     fn decode_spiffe_only_accepts_spiffe_scheme() {
+        // Bare UTF8 bytes.
         assert_eq!(
             decode_spiffe_othername(b"spiffe://fluxfs/meta/g0"),
             Some("spiffe://fluxfs/meta/g0".into())
         );
+        // Tagged UTF8String only (0x0C + length).
         assert_eq!(
             decode_spiffe_othername(&{
                 let payload = b"spiffe://fluxfs/x/y";
@@ -439,8 +503,25 @@ mod tests {
             }),
             Some("spiffe://fluxfs/x/y".into())
         );
+        // Full `[0] EXPLICIT UTF8String` form as emitted by OpenSSL for
+        // otherName. SPIFFE URI = `spiffe://fluxfs/meta/g0` (20 bytes).
+        assert_eq!(
+            decode_spiffe_othername(&{
+                let uri = b"spiffe://fluxfs/meta/g0";
+                // a0 <total_len> 0c <uri_len> <uri>
+                let total = 2 + uri.len();
+                let mut v = vec![0xA0, total as u8, 0x0C, uri.len() as u8];
+                v.extend_from_slice(uri);
+                v
+            }),
+            Some("spiffe://fluxfs/meta/g0".into())
+        );
+        // Wrong scheme.
         assert!(decode_spiffe_othername(b"https://not-spiffe").is_none());
+        // Length-mismatch in inner UTF8String.
         assert!(decode_spiffe_othername(&[0x0C, 99, b'x']).is_none());
+        // Length-mismatch in the outer [0] wrapper.
+        assert!(decode_spiffe_othername(&[0xA0, 99, 0x0C, 5, b'h', b'e', b'l']).is_none());
     }
 
     #[test]

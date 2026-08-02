@@ -20,12 +20,28 @@
 //! `Request::extensions`). See task #30 thread msg `5c77d96b`.
 
 pub mod authz;
-pub use authz::AuthzInterceptor;
+pub use authz::{require_in_extensions, AuthzInterceptor};
 
 use fluxfs_types::FluxError;
 use fluxfs_types::Result as FluxResult;
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 use tonic::transport::{Certificate, ClientTlsConfig, Identity, ServerTlsConfig};
+
+static PROVIDER_INSTALL: Once = Once::new();
+
+/// Install `ring` as the process-default rustls `CryptoProvider`.
+///
+/// tonic 0.14 + `tls-ring` does NOT automatically install a process-level
+/// provider; the first TLS handshake (client OR server) panics with
+/// "Could not automatically determine the process-level CryptoProvider" if no
+/// provider has been installed. Each FluxFS binary that uses TLS must call
+/// this once at startup. Idempotent via `Once`.
+pub fn install_crypto_provider() {
+    PROVIDER_INSTALL.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
 
 /// Load a PEM file from disk into bytes.
 async fn load_pem(path: &Path) -> FluxResult<Vec<u8>> {

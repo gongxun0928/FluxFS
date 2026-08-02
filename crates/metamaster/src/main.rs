@@ -216,7 +216,8 @@ impl MetaService for MetaSvc {
         }))
     }
 
-    async fn ping(&self, _req: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
+    async fn ping(&self, req: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::ReadMeta)?;
         Ok(Response::new(PingResponse {
             version: env!("CARGO_PKG_VERSION").into(),
         }))
@@ -226,6 +227,7 @@ impl MetaService for MetaSvc {
         &self,
         req: Request<GetInodeRequest>,
     ) -> Result<Response<GetInodeResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::ReadMeta)?;
         let id = req.into_inner().id;
         let inode = self.store.get_inode(id).map_err(status_from_flux)?;
         Ok(Response::new(GetInodeResponse {
@@ -237,6 +239,7 @@ impl MetaService for MetaSvc {
         &self,
         req: Request<LookupRequest>,
     ) -> Result<Response<LookupResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::ReadMeta)?;
         let r = req.into_inner();
         let inode = self
             .store
@@ -251,6 +254,7 @@ impl MetaService for MetaSvc {
         &self,
         req: Request<CreateRequest>,
     ) -> Result<Response<CreateResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
         let r = req.into_inner();
         let ft = file_type_from_wire(r.file_type).map_err(status_from_flux)?;
         let request_id = parse_request_op_id(&r.request_id);
@@ -276,6 +280,7 @@ impl MetaService for MetaSvc {
         &self,
         req: Request<ReaddirRequest>,
     ) -> Result<Response<ReaddirResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::ReadMeta)?;
         let dir = req.into_inner().dir;
         let dentries = self.store.readdir(dir).map_err(status_from_flux)?;
         Ok(Response::new(ReaddirResponse {
@@ -287,6 +292,7 @@ impl MetaService for MetaSvc {
         &self,
         req: Request<PutInodeRequest>,
     ) -> Result<Response<PutInodeResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
         let inode = decode_inode(&req.into_inner().inode_json).map_err(status_from_flux)?;
         let resp = self
             .write(MetaRaftRequest::PutInode {
@@ -302,6 +308,7 @@ impl MetaService for MetaSvc {
         &self,
         req: Request<PutManifestRequest>,
     ) -> Result<Response<PutManifestResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
         let manifest =
             decode_manifest(&req.into_inner().manifest_json).map_err(status_from_flux)?;
         let resp = self
@@ -318,6 +325,7 @@ impl MetaService for MetaSvc {
         &self,
         req: Request<CommitInodeManifestRequest>,
     ) -> Result<Response<CommitInodeManifestResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
         let r = req.into_inner();
         let inode = decode_inode(&r.inode_json).map_err(status_from_flux)?;
         let manifest = decode_manifest(&r.manifest_json).map_err(status_from_flux)?;
@@ -345,6 +353,7 @@ impl MetaService for MetaSvc {
         &self,
         req: Request<ReserveChunksRequest>,
     ) -> Result<Response<ReserveChunksResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
         let r = req.into_inner();
         let response = self
             .write(MetaRaftRequest::ReserveChunks {
@@ -364,6 +373,7 @@ impl MetaService for MetaSvc {
         &self,
         req: Request<AbortChunkReservationRequest>,
     ) -> Result<Response<AbortChunkReservationResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
         let r = req.into_inner();
         let response = self
             .write(MetaRaftRequest::AbortChunkReservation {
@@ -379,6 +389,7 @@ impl MetaService for MetaSvc {
         &self,
         req: Request<ExpireChunkReservationsRequest>,
     ) -> Result<Response<ExpireChunkReservationsResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::GcControl)?;
         let r = req.into_inner();
         let response = self
             .write(MetaRaftRequest::ExpireChunkReservations {
@@ -395,6 +406,7 @@ impl MetaService for MetaSvc {
         &self,
         req: Request<CommitInodeManifestReservedRequest>,
     ) -> Result<Response<CommitInodeManifestResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
         let r = req.into_inner();
         let response = self
             .write(MetaRaftRequest::CommitInodeManifestReserved {
@@ -420,6 +432,7 @@ impl MetaService for MetaSvc {
         &self,
         req: Request<TombstoneGcBatchRequest>,
     ) -> Result<Response<TombstoneGcBatchResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::GcControl)?;
         let r = req.into_inner();
         let response = self
             .write(MetaRaftRequest::TombstoneGcBatch {
@@ -435,8 +448,9 @@ impl MetaService for MetaSvc {
 
     async fn list_gc_tombstones(
         &self,
-        _req: Request<ListGcTombstonesRequest>,
+        req: Request<ListGcTombstonesRequest>,
     ) -> Result<Response<ListGcTombstonesResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::ReadMeta)?;
         let tombstones = self.store.list_gc_tombstones().map_err(status_from_flux)?;
         Ok(Response::new(ListGcTombstonesResponse {
             tombstones_json: encode_gc_tombstones(&tombstones).map_err(status_from_flux)?,
@@ -447,6 +461,7 @@ impl MetaService for MetaSvc {
         &self,
         req: Request<InitializeGcDeleteTargetsRequest>,
     ) -> Result<Response<InitializeGcDeleteTargetsResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::GcControl)?;
         let r = req.into_inner();
         let response = self
             .write(MetaRaftRequest::InitializeGcDeleteTargets {
@@ -463,6 +478,7 @@ impl MetaService for MetaSvc {
         &self,
         req: Request<AcknowledgeGcDeletesRequest>,
     ) -> Result<Response<AcknowledgeGcDeletesResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::GcControl)?;
         let r = req.into_inner();
         let response = self
             .write(MetaRaftRequest::AcknowledgeGcDeletes {
@@ -478,6 +494,7 @@ impl MetaService for MetaSvc {
         &self,
         req: Request<FinalizeGcTombstonesRequest>,
     ) -> Result<Response<FinalizeGcTombstonesResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::GcControl)?;
         let r = req.into_inner();
         let response = self
             .write(MetaRaftRequest::FinalizeGcTombstones {
@@ -493,6 +510,7 @@ impl MetaService for MetaSvc {
         &self,
         req: Request<GetManifestRequest>,
     ) -> Result<Response<GetManifestResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::ReadMeta)?;
         let id = ManifestId(req.into_inner().id);
         let manifest = self.store.get_manifest(id).map_err(status_from_flux)?;
         Ok(Response::new(GetManifestResponse {
@@ -504,6 +522,7 @@ impl MetaService for MetaSvc {
         &self,
         req: Request<BeginFlushRequest>,
     ) -> Result<Response<BeginFlushResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
         let r = req.into_inner();
         let intent = decode_flush_intent(&r.intent_json).map_err(status_from_flux)?;
         let response = self
@@ -524,6 +543,7 @@ impl MetaService for MetaSvc {
         &self,
         req: Request<CommitFlushRequest>,
     ) -> Result<Response<CommitFlushResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
         let r = req.into_inner();
         let published_ufs = decode_ufs_object(&r.published_ufs_json).map_err(status_from_flux)?;
         let response = self
@@ -545,6 +565,7 @@ impl MetaService for MetaSvc {
         &self,
         req: Request<FailFlushConflictRequest>,
     ) -> Result<Response<FailFlushConflictResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
         let r = req.into_inner();
         let response = self
             .write(MetaRaftRequest::FailFlushConflict {
@@ -563,8 +584,9 @@ impl MetaService for MetaSvc {
 
     async fn list_flush_intents(
         &self,
-        _req: Request<ListFlushIntentsRequest>,
+        req: Request<ListFlushIntentsRequest>,
     ) -> Result<Response<ListFlushIntentsResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::ReadMeta)?;
         let intents = self.store.list_flush_intents().map_err(status_from_flux)?;
         Ok(Response::new(ListFlushIntentsResponse {
             intents_json: encode_flush_intents(&intents).map_err(status_from_flux)?,
@@ -575,6 +597,7 @@ impl MetaService for MetaSvc {
         &self,
         req: Request<BeginGcRequest>,
     ) -> Result<Response<BeginGcResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::GcControl)?;
         let r = req.into_inner();
         let response = self
             .write(MetaRaftRequest::BeginGc {
@@ -590,8 +613,9 @@ impl MetaService for MetaSvc {
 
     async fn current_gc_plan(
         &self,
-        _req: Request<CurrentGcPlanRequest>,
+        req: Request<CurrentGcPlanRequest>,
     ) -> Result<Response<CurrentGcPlanResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::ReadMeta)?;
         let plan = self.store.current_gc_plan().map_err(status_from_flux)?;
         let (present, plan_json) = match plan {
             Some(plan) => (true, encode_gc_plan(&plan).map_err(status_from_flux)?),
@@ -604,6 +628,7 @@ impl MetaService for MetaSvc {
         &self,
         req: Request<FinishGcRequest>,
     ) -> Result<Response<FinishGcResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::GcControl)?;
         let r = req.into_inner();
         let response = self
             .write(MetaRaftRequest::FinishGc {
@@ -619,6 +644,7 @@ impl MetaService for MetaSvc {
         &self,
         req: Request<ImportExternalRequest>,
     ) -> Result<Response<ImportExternalResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
         let r = req.into_inner();
         let inode = decode_inode(&r.inode_json).map_err(status_from_flux)?;
         let manifest = if r.manifest_json.is_empty() {
@@ -646,6 +672,7 @@ impl MetaService for MetaSvc {
         &self,
         req: Request<UnlinkRequest>,
     ) -> Result<Response<UnlinkResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
         let r = req.into_inner();
         let resp = self
             .write(MetaRaftRequest::Unlink {
@@ -707,6 +734,7 @@ mod hex {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    fluxfs_tls::install_crypto_provider();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -759,14 +787,14 @@ async fn main() -> Result<()> {
             !tls_opts.allow_no_client_cert
         );
         // Phase 3: role-level authz on every RPC. Fail-closed if no peer cert,
-        // unparsable SPIFFE SAN, or role not in the admit set.
+        // unparsable SPIFFE SAN, or role not in the admit set. Per-RPC
+        // capability is enforced per-handler via `require_in_extensions`.
         let authz = std::sync::Arc::new(AuthzInterceptor::for_meta());
         tonic::transport::Server::builder()
             .tls_config(tls)
             .context("tls_config")?
             .layer(tonic::service::InterceptorLayer::new(move |req| {
-                authz.check(&req)?;
-                Ok(req)
+                authz.check_and_attach(req)
             }))
             .add_service(MetaServiceServer::new(svc))
             .serve(cli.listen)
