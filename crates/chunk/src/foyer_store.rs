@@ -6,9 +6,9 @@
 use crate::disk::DiskChunkStore;
 use crate::store::ChunkStore;
 use fluxfs_types::{ChunkId, FluxError, Result};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
-use std::collections::HashMap;
 
 /// Hybrid chunk store: in-process hot cache + disk objects.
 ///

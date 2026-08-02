@@ -4,7 +4,7 @@
 //! are layered on this adapter (patterns inspired by ZeroFS, no full fork).
 
 use fluxfs_types::{FluxError, Result, UfsObject};
-use opendal::{Operator, services};
+use opendal::{services, Operator};
 use std::path::Path;
 
 pub struct Ufs {

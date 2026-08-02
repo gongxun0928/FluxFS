@@ -32,7 +32,9 @@ impl HeedMetaStore {
                 .map_err(|e| FluxError::Meta(e.to_string()))?
         };
 
-        let mut wtxn = env.write_txn().map_err(|e| FluxError::Meta(e.to_string()))?;
+        let mut wtxn = env
+            .write_txn()
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
         let inodes: InodeDb = env
             .create_database(&mut wtxn, Some("inodes"))
             .map_err(|e| FluxError::Meta(e.to_string()))?;
@@ -317,7 +319,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = HeedMetaStore::open(dir.path()).unwrap();
         let f = store
-            .create(ROOT_INODE, "hello.txt", FileType::Regular, 0o644, 1000, 1000)
+            .create(
+                ROOT_INODE,
+                "hello.txt",
+                FileType::Regular,
+                0o644,
+                1000,
+                1000,
+            )
             .unwrap();
         let got = store.lookup(ROOT_INODE, "hello.txt").unwrap();
         assert_eq!(got.id, f.id);

@@ -56,8 +56,8 @@ impl Drop for FailpointGuard {
 /// Production code can call this at an awaitless commit boundary. With the
 /// `failpoints` feature disabled, the upstream crate compiles it to no-op.
 #[inline]
-pub fn hit(name: &'static str) {
-    fail::fail_point!(name);
+pub fn hit(_name: &'static str) {
+    fail::fail_point!(_name);
 }
 
 #[cfg(test)]
