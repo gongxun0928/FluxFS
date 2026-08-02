@@ -1,23 +1,22 @@
 //! Raft state machine: apply meta mutations into [`HeedMetaStore`].
 
+#![allow(clippy::result_large_err)] // openraft StorageError is large by design
+
 use std::io::Cursor;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine, Snapshot};
-use openraft::{Entry, EntryPayload, LogId, SnapshotMeta, StorageError, StoredMembership};
+use openraft::BasicNode;
+use openraft::{
+    Entry, EntryPayload, LogId, SnapshotMeta, StorageError, StorageIOError, StoredMembership,
+};
 use tokio::sync::RwLock;
 
 use crate::heed_store::HeedMetaStore;
+use crate::raft_log_store::{HeedRaftStore, SmAppliedMeta};
 use crate::raft_types::{FluxRaftTypeConfig, MetaRaftRequest, MetaRaftResponse, NodeId};
 use crate::store::MetaStore;
-use openraft::BasicNode;
-
-#[derive(Debug, Default, Clone)]
-struct SmMeta {
-    last_applied_log: Option<LogId<NodeId>>,
-    last_membership: StoredMembership<NodeId, BasicNode>,
-}
 
 #[derive(Debug)]
 struct StoredSnapshot {
@@ -26,20 +25,41 @@ struct StoredSnapshot {
 }
 
 /// State machine backed by durable Heed for inode/dentry/manifest.
+///
+/// Applied log id / membership are persisted in [`HeedRaftStore`] so restart
+/// resumes without re-applying committed entries.
 pub struct MetaStateMachine {
     store: Arc<HeedMetaStore>,
-    meta: RwLock<SmMeta>,
+    raft_store: Arc<HeedRaftStore>,
+    meta: RwLock<SmAppliedMeta>,
     snapshot_idx: AtomicU64,
     current_snapshot: RwLock<Option<StoredSnapshot>>,
 }
 
 impl MetaStateMachine {
-    pub fn new(store: Arc<HeedMetaStore>) -> Arc<Self> {
-        Arc::new(Self {
+    pub fn new(
+        store: Arc<HeedMetaStore>,
+        raft_store: Arc<HeedRaftStore>,
+    ) -> Result<Arc<Self>, StorageError<NodeId>> {
+        let sm_meta = raft_store.load_sm_meta().map_err(|e| {
+            StorageError::from(StorageIOError::<NodeId>::read_state_machine(
+                &std::io::Error::other(e.to_string()),
+            ))
+        })?;
+        Ok(Arc::new(Self {
             store,
-            meta: RwLock::new(SmMeta::default()),
+            raft_store,
+            meta: RwLock::new(sm_meta),
             snapshot_idx: AtomicU64::new(0),
             current_snapshot: RwLock::new(None),
+        }))
+    }
+
+    fn persist_sm_meta(&self, sm: &SmAppliedMeta) -> Result<(), StorageError<NodeId>> {
+        self.raft_store.save_sm_meta(sm).map_err(|e| {
+            StorageError::from(StorageIOError::<NodeId>::write_state_machine(
+                &std::io::Error::other(e.to_string()),
+            ))
         })
     }
 
@@ -146,6 +166,7 @@ impl RaftStateMachine<FluxRaftTypeConfig> for Arc<MetaStateMachine> {
                 }
             }
         }
+        self.persist_sm_meta(&sm)?;
         Ok(res)
     }
 
@@ -160,10 +181,10 @@ impl RaftStateMachine<FluxRaftTypeConfig> for Arc<MetaStateMachine> {
         meta: &SnapshotMeta<NodeId, BasicNode>,
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
-        // App state stays in Heed; only refresh Raft markers for single-voter.
         let mut sm = self.meta.write().await;
         sm.last_applied_log = meta.last_log_id;
         sm.last_membership = meta.last_membership.clone();
+        self.persist_sm_meta(&sm)?;
         drop(sm);
 
         let mut current_snapshot = self.current_snapshot.write().await;

@@ -6,6 +6,7 @@ service ChunkWorker {
   rpc PutChunk(PutChunkRequest) returns (PutChunkResponse);
   rpc GetChunk(GetChunkRequest) returns (GetChunkResponse);
   rpc ContainsChunk(ContainsChunkRequest) returns (ContainsChunkResponse);
+  rpc ListChunks(ListChunksRequest) returns (ListChunksResponse);
   rpc Health(HealthRequest) returns (HealthResponse);
 }
 
@@ -25,6 +26,12 @@ message GetChunkResponse {
 message ContainsChunkRequest { bytes chunk_id = 1; }
 message ContainsChunkResponse {
   bool present = 1;
+  uint64 worker_id = 2;
+}
+
+message ListChunksRequest {}
+message ListChunksResponse {
+  repeated bytes chunk_ids = 1;
   uint64 worker_id = 2;
 }
 

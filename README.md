@@ -15,11 +15,14 @@ remains next-stage work.
 
 The same Ephemeral path also runs as five localhost processes: one MetaMaster,
 three ChunkWorkers, and one FUSE/client. Meta and chunk traffic use tonic/TCP;
-worker-0/1 form the initial fixed RF=2 set and worker-2 is a repair spare.
-Meta writes pass through an OpenRaft single-voter state machine. Its Raft log is
-currently process-local and snapshots contain only a marker; heed persists the
-application state across restart. This validates the write-path wiring, not
-durable Raft recovery, replication, or metadata HA.
+worker-0/1 form the initial RF=2 set and worker-2 is a repair spare. A Worker
+topology change triggers a checksum-valid inventory sweep before the next write;
+missing replicas are copied to healthy Workers until RF=2 is restored.
+Meta writes pass through an OpenRaft single-voter state machine. Vote, Raft log,
+committed index, and SM `last_applied` markers persist in a heed env under
+`meta/raft/`; inode/dentry/manifest data stay in the main heed MetaStore.
+Snapshots are still marker-only (full snapshot export is next). This is durable
+single-voter recovery, not multi-voter metadata HA.
 
 Design: [`docs/mvp-v0.1.md`](docs/mvp-v0.1.md) · Alpha gates: [`docs/alpha-checklist.md`](docs/alpha-checklist.md)
 

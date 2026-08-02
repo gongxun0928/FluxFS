@@ -261,7 +261,7 @@ Per @gongxun: proceed with agent-recommended defaults without blocking.
 
 | Layer | Choice | W1 status |
 |---|---|---|
-| Consensus | openraft | Single-voter writes reach a heed-backed state machine; Raft log/snapshot durability and multi-voter HA remain |
+| Consensus | openraft | Single-voter writes + heed-durable vote/log/`last_applied`; full snapshot export and multi-voter HA remain |
 | Meta engine | heed + `MetaStore` trait | create/lookup/readdir/put_inode working |
 | Chunk cache | foyer + `ChunkStore` trait | Disk durable + hybrid facade (HybridCache async wire-up next) |
 | UFS | OpenDAL | local FS + S3 features; head/range/write_full |

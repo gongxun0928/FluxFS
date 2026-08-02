@@ -3,7 +3,7 @@ use clap::Parser;
 use fluxfs_chunk::{ChunkStore, DiskChunkStore};
 use fluxfs_proto::chunk::v1::{
     ContainsChunkRequest, ContainsChunkResponse, GetChunkRequest, GetChunkResponse, HealthRequest,
-    HealthResponse, PutChunkRequest, PutChunkResponse,
+    HealthResponse, ListChunksRequest, ListChunksResponse, PutChunkRequest, PutChunkResponse,
 };
 use fluxfs_proto::{ChunkWorker, ChunkWorkerServer};
 use fluxfs_types::{ChunkId, FluxError, CHUNK_SIZE};
@@ -90,6 +90,24 @@ impl ChunkWorker for ChunkSvc {
         Ok(Response::new(HealthResponse {
             worker_id: self.worker_id,
             ready: true,
+        }))
+    }
+
+    async fn list_chunks(
+        &self,
+        _request: Request<ListChunksRequest>,
+    ) -> Result<Response<ListChunksResponse>, Status> {
+        let store = Arc::clone(&self.store);
+        let chunks = tokio::task::spawn_blocking(move || store.list_chunks())
+            .await
+            .map_err(|error| Status::internal(format!("chunk inventory task: {error}")))?
+            .map_err(status_from_flux)?;
+        Ok(Response::new(ListChunksResponse {
+            chunk_ids: chunks
+                .into_iter()
+                .map(|chunk| chunk.as_bytes().to_vec())
+                .collect(),
+            worker_id: self.worker_id,
         }))
     }
 }

@@ -210,14 +210,16 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     std::fs::create_dir_all(&cli.data_dir)?;
     let store = Arc::new(HeedMetaStore::open(&cli.data_dir).context("open heed meta")?);
-    let raft = start_single_voter(store.clone(), &cli.listen.to_string())
+    let raft_dir = cli.data_dir.join("raft");
+    let raft = start_single_voter(store.clone(), &raft_dir, &cli.listen.to_string())
         .await
         .context("start openraft single-voter")?;
     let svc = MetaSvc { store, raft };
     println!(
-        "fluxfs-metamaster listening on {} data_dir={} raft=single-voter",
+        "fluxfs-metamaster listening on {} data_dir={} raft=single-voter durable_log={}",
         cli.listen,
-        cli.data_dir.display()
+        cli.data_dir.display(),
+        raft_dir.display()
     );
     tonic::transport::Server::builder()
         .add_service(MetaServiceServer::new(svc))

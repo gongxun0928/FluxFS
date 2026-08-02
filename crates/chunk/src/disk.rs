@@ -32,6 +32,55 @@ impl DiskChunkStore {
             .join(&hex[2..4])
             .join(&hex)
     }
+
+    /// Return every checksum-valid chunk in deterministic order.
+    ///
+    /// This is the MVP scrub/inventory primitive used by cross-process repair.
+    /// Temporary and corrupt files are deliberately omitted.
+    pub fn list_chunks(&self) -> Result<Vec<ChunkId>> {
+        let mut ids = Vec::new();
+        let objects = self.root.join("objects");
+        for first in fs::read_dir(&objects).map_err(|e| FluxError::Io(e.to_string()))? {
+            let first = first.map_err(|e| FluxError::Io(e.to_string()))?;
+            if !first
+                .file_type()
+                .map_err(|e| FluxError::Io(e.to_string()))?
+                .is_dir()
+            {
+                continue;
+            }
+            for second in fs::read_dir(first.path()).map_err(|e| FluxError::Io(e.to_string()))? {
+                let second = second.map_err(|e| FluxError::Io(e.to_string()))?;
+                if !second
+                    .file_type()
+                    .map_err(|e| FluxError::Io(e.to_string()))?
+                    .is_dir()
+                {
+                    continue;
+                }
+                for object in
+                    fs::read_dir(second.path()).map_err(|e| FluxError::Io(e.to_string()))?
+                {
+                    let object = object.map_err(|e| FluxError::Io(e.to_string()))?;
+                    if !object
+                        .file_type()
+                        .map_err(|e| FluxError::Io(e.to_string()))?
+                        .is_file()
+                    {
+                        continue;
+                    }
+                    let data = fs::read(object.path()).map_err(|e| FluxError::Io(e.to_string()))?;
+                    let id = ChunkId::from_bytes(&data);
+                    if self.object_path(&id) == object.path() {
+                        ids.push(id);
+                    }
+                }
+            }
+        }
+        ids.sort_by_key(ChunkId::to_hex);
+        ids.dedup();
+        Ok(ids)
+    }
 }
 
 impl ChunkStore for DiskChunkStore {
@@ -121,5 +170,15 @@ mod tests {
         assert!(store.get(&id).is_err());
         assert_eq!(store.put(b"authoritative").unwrap(), id);
         assert_eq!(store.get(&id).unwrap(), b"authoritative");
+    }
+
+    #[test]
+    fn list_chunks_omits_corrupt_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DiskChunkStore::open(dir.path()).unwrap();
+        let first = store.put(b"first").unwrap();
+        let corrupt = store.put(b"second").unwrap();
+        fs::write(store.object_path(&corrupt), b"corrupt").unwrap();
+        assert_eq!(store.list_chunks().unwrap(), vec![first]);
     }
 }
