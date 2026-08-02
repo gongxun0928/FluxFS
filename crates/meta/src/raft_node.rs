@@ -108,5 +108,21 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+
+        let duplicate = raft
+            .client_write(MetaRaftRequest::Create {
+                parent: ROOT_INODE,
+                name: "via-raft.txt".into(),
+                file_type: FileType::Regular,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            })
+            .await
+            .expect("duplicate reaches state machine");
+        assert!(matches!(
+            duplicate.data,
+            MetaRaftResponse::Err(FluxError::AlreadyExists)
+        ));
     }
 }

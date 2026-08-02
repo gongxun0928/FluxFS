@@ -424,7 +424,7 @@ impl Manifest {
 
 // ===== Errors =====
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Error)]
 pub enum FluxError {
     #[error("not found")]
     NotFound,

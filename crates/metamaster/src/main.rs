@@ -14,7 +14,7 @@ use fluxfs_proto::meta_codec::{
     file_type_from_wire, status_from_flux,
 };
 use fluxfs_proto::{MetaService, MetaServiceServer};
-use fluxfs_types::{FluxError, ManifestId};
+use fluxfs_types::ManifestId;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -52,7 +52,7 @@ impl MetaSvc {
     fn map_resp_inode(resp: MetaRaftResponse) -> std::result::Result<fluxfs_types::Inode, Status> {
         match resp {
             MetaRaftResponse::Inode(inode) => Ok(*inode),
-            MetaRaftResponse::Err { message } => Err(status_from_flux(FluxError::Meta(message))),
+            MetaRaftResponse::Err(err) => Err(status_from_flux(err)),
             other => Err(Status::internal(format!(
                 "unexpected raft response: {other:?}"
             ))),
@@ -62,7 +62,7 @@ impl MetaSvc {
     fn map_resp_empty(resp: MetaRaftResponse) -> std::result::Result<(), Status> {
         match resp {
             MetaRaftResponse::Empty => Ok(()),
-            MetaRaftResponse::Err { message } => Err(status_from_flux(FluxError::Meta(message))),
+            MetaRaftResponse::Err(err) => Err(status_from_flux(err)),
             other => Err(Status::internal(format!(
                 "unexpected raft response: {other:?}"
             ))),
@@ -72,7 +72,7 @@ impl MetaSvc {
     fn map_resp_manifest_id(resp: MetaRaftResponse) -> std::result::Result<u64, Status> {
         match resp {
             MetaRaftResponse::ManifestId(id) => Ok(id),
-            MetaRaftResponse::Err { message } => Err(status_from_flux(FluxError::Meta(message))),
+            MetaRaftResponse::Err(err) => Err(status_from_flux(err)),
             other => Err(Status::internal(format!(
                 "unexpected raft response: {other:?}"
             ))),

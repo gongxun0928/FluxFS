@@ -57,29 +57,21 @@ impl MetaStateMachine {
                 .create(*parent, name, *file_type, *mode, *uid, *gid)
             {
                 Ok(inode) => MetaRaftResponse::Inode(Box::new(inode)),
-                Err(e) => MetaRaftResponse::Err {
-                    message: e.to_string(),
-                },
+                Err(e) => MetaRaftResponse::Err(e),
             },
             MetaRaftRequest::PutInode { inode } => match self.store.put_inode(inode.as_ref()) {
                 Ok(()) => MetaRaftResponse::Empty,
-                Err(e) => MetaRaftResponse::Err {
-                    message: e.to_string(),
-                },
+                Err(e) => MetaRaftResponse::Err(e),
             },
             MetaRaftRequest::PutManifest { manifest } => {
                 match self.store.put_manifest(manifest.as_ref()) {
                     Ok(id) => MetaRaftResponse::ManifestId(id.0),
-                    Err(e) => MetaRaftResponse::Err {
-                        message: e.to_string(),
-                    },
+                    Err(e) => MetaRaftResponse::Err(e),
                 }
             }
             MetaRaftRequest::Unlink { parent, name } => match self.store.unlink(*parent, name) {
                 Ok(()) => MetaRaftResponse::Empty,
-                Err(e) => MetaRaftResponse::Err {
-                    message: e.to_string(),
-                },
+                Err(e) => MetaRaftResponse::Err(e),
             },
         }
     }

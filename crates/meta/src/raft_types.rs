@@ -8,7 +8,7 @@ use openraft::BasicNode;
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 
-use fluxfs_types::{FileType, Inode, Manifest};
+use fluxfs_types::{FileType, FluxError, Inode, Manifest};
 
 pub type NodeId = u64;
 
@@ -41,7 +41,7 @@ pub enum MetaRaftResponse {
     Empty,
     Inode(Box<Inode>),
     ManifestId(u64),
-    Err { message: String },
+    Err(FluxError),
 }
 
 declare_raft_types!(
