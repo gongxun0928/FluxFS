@@ -4,18 +4,20 @@ use fluxfs_meta::{
     start_single_voter, FluxRaft, HeedMetaStore, MetaRaftRequest, MetaRaftResponse, MetaStore,
 };
 use fluxfs_proto::meta::v1::{
+    BeginFlushRequest, BeginFlushResponse, CommitFlushRequest, CommitFlushResponse,
     CommitInodeManifestRequest, CommitInodeManifestResponse, CreateRequest, CreateResponse,
-    GetInodeRequest, GetInodeResponse, GetManifestRequest, GetManifestResponse, LookupRequest,
-    LookupResponse, PingRequest, PingResponse, PutInodeRequest, PutInodeResponse,
-    PutManifestRequest, PutManifestResponse, ReaddirRequest, ReaddirResponse, UnlinkRequest,
-    UnlinkResponse,
+    FailFlushConflictRequest, FailFlushConflictResponse, GetInodeRequest, GetInodeResponse,
+    GetManifestRequest, GetManifestResponse, ImportExternalRequest, ImportExternalResponse,
+    ListFlushIntentsRequest, ListFlushIntentsResponse, LookupRequest, LookupResponse, PingRequest,
+    PingResponse, PutInodeRequest, PutInodeResponse, PutManifestRequest, PutManifestResponse,
+    ReaddirRequest, ReaddirResponse, UnlinkRequest, UnlinkResponse,
 };
 use fluxfs_proto::meta_codec::{
-    decode_inode, decode_manifest, encode_dentries, encode_inode, encode_manifest,
-    file_type_from_wire, status_from_flux,
+    decode_flush_intent, decode_inode, decode_manifest, decode_ufs_object, encode_dentries,
+    encode_flush_intents, encode_inode, encode_manifest, file_type_from_wire, status_from_flux,
 };
 use fluxfs_proto::{MetaService, MetaServiceServer};
-use fluxfs_types::{ManifestId, RequestOpId};
+use fluxfs_types::{FlushId, ManifestId, RequestOpId};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -215,6 +217,103 @@ impl MetaService for MetaSvc {
         let manifest = self.store.get_manifest(id).map_err(status_from_flux)?;
         Ok(Response::new(GetManifestResponse {
             manifest_json: encode_manifest(&manifest).map_err(status_from_flux)?,
+        }))
+    }
+
+    async fn begin_flush(
+        &self,
+        req: Request<BeginFlushRequest>,
+    ) -> Result<Response<BeginFlushResponse>, Status> {
+        let r = req.into_inner();
+        let intent = decode_flush_intent(&r.intent_json).map_err(status_from_flux)?;
+        let response = self
+            .write(MetaRaftRequest::BeginFlush {
+                request_id: parse_request_op_id(&r.request_id),
+                expected_generation: r.expected_generation,
+                inode: r.inode,
+                intent: Box::new(intent),
+            })
+            .await?;
+        let inode = Self::map_resp_inode(response)?;
+        Ok(Response::new(BeginFlushResponse {
+            inode_json: encode_inode(&inode).map_err(status_from_flux)?,
+        }))
+    }
+
+    async fn commit_flush(
+        &self,
+        req: Request<CommitFlushRequest>,
+    ) -> Result<Response<CommitFlushResponse>, Status> {
+        let r = req.into_inner();
+        let published_ufs = decode_ufs_object(&r.published_ufs_json).map_err(status_from_flux)?;
+        let response = self
+            .write(MetaRaftRequest::CommitFlush {
+                request_id: parse_request_op_id(&r.request_id),
+                expected_generation: r.expected_generation,
+                inode: r.inode,
+                flush_id: FlushId(r.flush_id),
+                published_ufs: Box::new(published_ufs),
+            })
+            .await?;
+        let inode = Self::map_resp_inode(response)?;
+        Ok(Response::new(CommitFlushResponse {
+            inode_json: encode_inode(&inode).map_err(status_from_flux)?,
+        }))
+    }
+
+    async fn fail_flush_conflict(
+        &self,
+        req: Request<FailFlushConflictRequest>,
+    ) -> Result<Response<FailFlushConflictResponse>, Status> {
+        let r = req.into_inner();
+        let response = self
+            .write(MetaRaftRequest::FailFlushConflict {
+                request_id: parse_request_op_id(&r.request_id),
+                expected_generation: r.expected_generation,
+                inode: r.inode,
+                flush_id: FlushId(r.flush_id),
+                error: r.error,
+            })
+            .await?;
+        let inode = Self::map_resp_inode(response)?;
+        Ok(Response::new(FailFlushConflictResponse {
+            inode_json: encode_inode(&inode).map_err(status_from_flux)?,
+        }))
+    }
+
+    async fn list_flush_intents(
+        &self,
+        _req: Request<ListFlushIntentsRequest>,
+    ) -> Result<Response<ListFlushIntentsResponse>, Status> {
+        let intents = self.store.list_flush_intents().map_err(status_from_flux)?;
+        Ok(Response::new(ListFlushIntentsResponse {
+            intents_json: encode_flush_intents(&intents).map_err(status_from_flux)?,
+        }))
+    }
+
+    async fn import_external(
+        &self,
+        req: Request<ImportExternalRequest>,
+    ) -> Result<Response<ImportExternalResponse>, Status> {
+        let r = req.into_inner();
+        let inode = decode_inode(&r.inode_json).map_err(status_from_flux)?;
+        let manifest = if r.manifest_json.is_empty() {
+            None
+        } else {
+            Some(decode_manifest(&r.manifest_json).map_err(status_from_flux)?)
+        };
+        let resp = self
+            .write(MetaRaftRequest::ImportExternal {
+                request_id: parse_request_op_id(&r.request_id),
+                parent: r.parent,
+                name: r.name,
+                inode: Box::new(inode),
+                manifest: manifest.map(Box::new),
+            })
+            .await?;
+        let inode = Self::map_resp_inode(resp)?;
+        Ok(Response::new(ImportExternalResponse {
+            inode_json: encode_inode(&inode).map_err(status_from_flux)?,
         }))
     }
 

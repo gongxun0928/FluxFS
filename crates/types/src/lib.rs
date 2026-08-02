@@ -31,6 +31,15 @@ pub struct ManifestId(pub u64);
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FlushId(pub u64);
 
+impl FlushId {
+    pub fn random() -> Self {
+        let bytes = uuid::Uuid::new_v4().into_bytes();
+        Self(u64::from_le_bytes(
+            bytes[..8].try_into().expect("UUID prefix"),
+        ))
+    }
+}
+
 /// In-flight External lazy-load tracking token.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HydrateToken(pub u64);
@@ -548,6 +557,47 @@ impl Manifest {
         };
         m.validate()?;
         Ok(m)
+    }
+
+    /// Stable content digest for durable flush intents. The explicit v1 binary
+    /// encoding avoids coupling recovery identity to JSON field ordering.
+    pub fn root_digest(&self) -> ChunkId {
+        fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+            out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            out.extend_from_slice(bytes);
+        }
+
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(b"fluxfs-manifest-v1\0");
+        encoded.extend_from_slice(&self.inode.to_le_bytes());
+        encoded.extend_from_slice(&self.gen.0.to_le_bytes());
+        encoded.extend_from_slice(&self.size.to_le_bytes());
+        encoded.extend_from_slice(&(self.extents.len() as u64).to_le_bytes());
+        for extent in &self.extents {
+            match extent {
+                Extent::Local { offset, len, chunk } => {
+                    encoded.push(0);
+                    encoded.extend_from_slice(&offset.to_le_bytes());
+                    encoded.extend_from_slice(&len.to_le_bytes());
+                    encoded.extend_from_slice(chunk.as_bytes());
+                }
+                Extent::UfsRange {
+                    offset,
+                    len,
+                    ufs_key,
+                    ufs_version,
+                    offset_in_object,
+                } => {
+                    encoded.push(1);
+                    encoded.extend_from_slice(&offset.to_le_bytes());
+                    encoded.extend_from_slice(&len.to_le_bytes());
+                    push_bytes(&mut encoded, ufs_key.as_bytes());
+                    push_bytes(&mut encoded, ufs_version.0.as_bytes());
+                    encoded.extend_from_slice(&offset_in_object.to_le_bytes());
+                }
+            }
+        }
+        ChunkId::from_bytes(&encoded)
     }
 }
 

@@ -1,8 +1,9 @@
 use crate::raft_types::{MetaRaftRequest, MetaRaftResponse, SmAppliedMeta};
 use crate::store::MetaStore;
 use fluxfs_types::{
-    BackingMode, DataGen, DataState, Dentry, FileType, FluxError, Inode, InodeId, LocalityFields,
-    LocalityLabel, Manifest, ManifestId, OpState, Origin, Result, ROOT_INODE,
+    BackingMode, DataGen, DataState, Dentry, Extent, FileType, FlushId, FlushIntent, FluxError,
+    Inode, InodeId, LocalityFields, LocalityLabel, Manifest, ManifestId, OpState, Origin, Result,
+    UfsObject, UfsVersion, ROOT_INODE,
 };
 use heed::types::{Bytes, Str};
 use heed::{Database, Env, EnvOpenOptions};
@@ -251,6 +252,68 @@ impl HeedMetaStore {
                     Err(e) => MetaRaftResponse::Err(e),
                 }
             }
+            MetaRaftRequest::BeginFlush {
+                expected_generation,
+                inode,
+                intent,
+                ..
+            } => match self.begin_flush_in_txn(
+                &mut wtxn,
+                *expected_generation,
+                *inode,
+                intent.as_ref(),
+            ) {
+                Ok(inode) => MetaRaftResponse::Inode(Box::new(inode)),
+                Err(e) => MetaRaftResponse::Err(e),
+            },
+            MetaRaftRequest::CommitFlush {
+                expected_generation,
+                inode,
+                flush_id,
+                published_ufs,
+                ..
+            } => match self.commit_flush_in_txn(
+                &mut wtxn,
+                *expected_generation,
+                *inode,
+                *flush_id,
+                published_ufs.as_ref(),
+            ) {
+                Ok(inode) => MetaRaftResponse::Inode(Box::new(inode)),
+                Err(e) => MetaRaftResponse::Err(e),
+            },
+            MetaRaftRequest::FailFlushConflict {
+                expected_generation,
+                inode,
+                flush_id,
+                error,
+                ..
+            } => match self.fail_flush_conflict_in_txn(
+                &mut wtxn,
+                *expected_generation,
+                *inode,
+                *flush_id,
+                error,
+            ) {
+                Ok(inode) => MetaRaftResponse::Inode(Box::new(inode)),
+                Err(e) => MetaRaftResponse::Err(e),
+            },
+            MetaRaftRequest::ImportExternal {
+                parent,
+                name,
+                inode,
+                manifest,
+                ..
+            } => match self.import_external_in_txn(
+                &mut wtxn,
+                *parent,
+                name,
+                inode.as_ref(),
+                manifest.as_deref(),
+            ) {
+                Ok(inode) => MetaRaftResponse::Inode(Box::new(inode)),
+                Err(e) => MetaRaftResponse::Err(e),
+            },
             MetaRaftRequest::Unlink { parent, name, .. } => {
                 match self.unlink_in_txn(&mut wtxn, *parent, name) {
                     Ok(()) => MetaRaftResponse::Empty,
@@ -583,6 +646,82 @@ impl HeedMetaStore {
         Ok(id)
     }
 
+    fn import_external_in_txn(
+        &self,
+        wtxn: &mut heed::RwTxn,
+        parent: InodeId,
+        name: &str,
+        template: &Inode,
+        manifest: Option<&Manifest>,
+    ) -> Result<Inode> {
+        if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+            return Err(FluxError::InvalidArg(format!("bad name: {name}")));
+        }
+        if !matches!(template.locality, LocalityLabel::External)
+            && !matches!(
+                template.locality_fields.as_ref().map(|f| f.origin),
+                Some(Origin::Imported)
+            )
+        {
+            return Err(FluxError::InvalidArg(
+                "import_external requires External/Imported locality".into(),
+            ));
+        }
+        let parent_bytes = self
+            .inodes
+            .get(wtxn, &inode_key(parent))
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+            .ok_or(FluxError::NotFound)?
+            .to_vec();
+        let mut parent_ino: Inode =
+            serde_json::from_slice(&parent_bytes).map_err(|e| FluxError::Meta(e.to_string()))?;
+        if parent_ino.file_type != FileType::Directory {
+            return Err(FluxError::NotDirectory);
+        }
+        if self
+            .dentries
+            .get(wtxn, &dentry_key(parent, name))
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+            .is_some()
+        {
+            return Err(FluxError::AlreadyExists);
+        }
+
+        let id = self.alloc_inode(wtxn)?;
+        let mut inode = template.clone();
+        inode.id = id;
+        inode.locality = LocalityLabel::External;
+        if inode.locality_fields.is_none() {
+            inode.locality_fields = Some(LocalityFields {
+                backing_mode: BackingMode::UfsBacked,
+                data_state: DataState::UfsClean,
+                op_state: OpState::None,
+                origin: Origin::Imported,
+            });
+        }
+
+        if let Some(m) = manifest {
+            let mut m = m.clone();
+            m.inode = id;
+            m.validate()?;
+            let mid = self.put_manifest_in_txn(wtxn, &m)?;
+            inode.manifest_id = Some(mid);
+            inode.size = m.size;
+        } else {
+            inode.manifest_id = None;
+        }
+
+        put_inode_raw(&self.inodes, wtxn, &inode)?;
+        self.dentries
+            .put(wtxn, &dentry_key(parent, name), &u64_bytes(id))
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        let now = now_ms();
+        parent_ino.mtime_ms = now;
+        parent_ino.ctime_ms = now;
+        put_inode_raw(&self.inodes, wtxn, &parent_ino)?;
+        Ok(inode)
+    }
+
     fn commit_inode_manifest_in_txn(
         &self,
         wtxn: &mut heed::RwTxn,
@@ -609,11 +748,142 @@ impl HeedMetaStore {
                 actual: current.generation,
             });
         }
+        if current.flush_intent.is_some() {
+            return Err(FluxError::Busy);
+        }
         let mid = self.put_manifest_in_txn(wtxn, manifest)?;
         let mut next = inode.clone();
         next.manifest_id = Some(mid);
         put_inode_raw(&self.inodes, wtxn, &next)?;
         Ok(next)
+    }
+
+    fn begin_flush_in_txn(
+        &self,
+        wtxn: &mut heed::RwTxn,
+        expected_generation: u64,
+        inode_id: InodeId,
+        intent: &FlushIntent,
+    ) -> Result<Inode> {
+        let mut inode = get_inode_raw(&self.inodes, wtxn, inode_id)?;
+        check_generation(&inode, expected_generation)?;
+        if inode.file_type != FileType::Regular {
+            return Err(FluxError::IsDirectory);
+        }
+        let fields = inode
+            .locality_fields
+            .as_mut()
+            .ok_or_else(|| FluxError::Meta("flush inode missing locality fields".into()))?;
+        if fields.backing_mode != BackingMode::UfsBacked || fields.data_state != DataState::Dirty {
+            return Err(FluxError::InvalidArg(
+                "only UFS-backed Dirty files can flush".into(),
+            ));
+        }
+        if inode.head_gen != intent.snapshot_gen {
+            return Err(FluxError::CasFailed {
+                expected: intent.snapshot_gen.0,
+                actual: inode.head_gen.0,
+            });
+        }
+        if inode.flush_intent.is_some() || !matches!(fields.op_state, OpState::None) {
+            return Err(FluxError::Busy);
+        }
+        fields.op_state = OpState::Flushing {
+            intent: intent.clone(),
+        };
+        inode.flush_intent = Some(intent.clone());
+        inode.last_error = None;
+        inode.generation = inode.generation.saturating_add(1);
+        inode.locality = LocalityLabel::derive(fields, inode.head_gen, inode.ufs_gen);
+        put_inode_raw(&self.inodes, wtxn, &inode)?;
+        Ok(inode)
+    }
+
+    fn commit_flush_in_txn(
+        &self,
+        wtxn: &mut heed::RwTxn,
+        expected_generation: u64,
+        inode_id: InodeId,
+        flush_id: FlushId,
+        published_ufs: &UfsObject,
+    ) -> Result<Inode> {
+        let mut inode = get_inode_raw(&self.inodes, wtxn, inode_id)?;
+        check_generation(&inode, expected_generation)?;
+        let intent = matching_flush_intent(&inode, flush_id)?.clone();
+        let fields = inode
+            .locality_fields
+            .as_mut()
+            .ok_or_else(|| FluxError::Meta("flush inode missing locality fields".into()))?;
+
+        inode.generation = inode.generation.saturating_add(1);
+        inode.flush_intent = None;
+        fields.op_state = OpState::None;
+        if inode.head_gen == intent.snapshot_gen {
+            let version = published_ufs
+                .etag
+                .clone()
+                .map(UfsVersion)
+                .unwrap_or_else(|| UfsVersion(format!("digest:{}", intent.target_digest.to_hex())));
+            let clean_manifest = Manifest {
+                inode: inode.id,
+                gen: intent.snapshot_gen,
+                size: inode.size,
+                extents: if inode.size == 0 {
+                    Vec::new()
+                } else {
+                    vec![Extent::UfsRange {
+                        offset: 0,
+                        len: inode.size,
+                        ufs_key: published_ufs.key.clone(),
+                        ufs_version: version.clone(),
+                        offset_in_object: 0,
+                    }]
+                },
+            };
+            inode.manifest_id = if inode.size == 0 {
+                None
+            } else {
+                Some(self.put_manifest_in_txn(wtxn, &clean_manifest)?)
+            };
+            inode.ufs = Some(published_ufs.clone());
+            inode.ufs_gen = intent.snapshot_gen;
+            inode.ufs_base_version = Some(version);
+            fields.data_state = DataState::UfsClean;
+            inode.last_error = None;
+        } else {
+            fields.data_state = DataState::DirtyConflict;
+            inode.last_error = Some(
+                "head advanced during flush; published snapshot not installed as clean".into(),
+            );
+        }
+        inode.locality = LocalityLabel::derive(fields, inode.head_gen, inode.ufs_gen);
+        put_inode_raw(&self.inodes, wtxn, &inode)?;
+        Ok(inode)
+    }
+
+    fn fail_flush_conflict_in_txn(
+        &self,
+        wtxn: &mut heed::RwTxn,
+        expected_generation: u64,
+        inode_id: InodeId,
+        flush_id: FlushId,
+        error: &str,
+    ) -> Result<Inode> {
+        let mut inode = get_inode_raw(&self.inodes, wtxn, inode_id)?;
+        check_generation(&inode, expected_generation)?;
+        matching_flush_intent(&inode, flush_id)?;
+        let fields = inode
+            .locality_fields
+            .as_mut()
+            .ok_or_else(|| FluxError::Meta("flush inode missing locality fields".into()))?;
+        fields.data_state = DataState::DirtyConflict;
+        fields.op_state = OpState::None;
+        inode.flush_intent = None;
+        inode.last_error = Some(error.to_string());
+        inode.generation = inode.generation.saturating_add(1);
+        inode.locality = LocalityLabel::derive(fields, inode.head_gen, inode.ufs_gen);
+        put_inode_raw(&self.inodes, wtxn, &inode)?;
+        Ok(inode)
     }
 
     fn unlink_in_txn(&self, wtxn: &mut heed::RwTxn, parent: InodeId, name: &str) -> Result<()> {
@@ -645,6 +915,23 @@ impl HeedMetaStore {
         parent_ino.ctime_ms = now;
         put_inode_raw(&self.inodes, wtxn, &parent_ino)?;
         Ok(())
+    }
+
+    fn with_write_txn<T>(
+        &self,
+        operation: impl FnOnce(&Self, &mut heed::RwTxn<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| FluxError::Meta("write lock poisoned".into()))?;
+        let mut wtxn = self
+            .env
+            .write_txn()
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        let result = operation(self, &mut wtxn)?;
+        wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
+        Ok(result)
     }
 
     fn alloc_manifest_id(&self, wtxn: &mut heed::RwTxn) -> Result<ManifestId> {
@@ -906,31 +1193,34 @@ impl MetaStore for HeedMetaStore {
                 };
             }
         }
-        let next =
-            match self.commit_inode_manifest_in_txn(&mut wtxn, expected_generation, inode, manifest)
-            {
-                Ok(inode) => {
-                    if !op_id.is_none() {
-                        self.put_client_request_in_txn(
-                            &mut wtxn,
-                            &op_id.to_hex(),
-                            &MetaRaftResponse::Inode(Box::new(inode.clone())),
-                        )?;
-                    }
-                    inode
+        let next = match self.commit_inode_manifest_in_txn(
+            &mut wtxn,
+            expected_generation,
+            inode,
+            manifest,
+        ) {
+            Ok(inode) => {
+                if !op_id.is_none() {
+                    self.put_client_request_in_txn(
+                        &mut wtxn,
+                        &op_id.to_hex(),
+                        &MetaRaftResponse::Inode(Box::new(inode.clone())),
+                    )?;
                 }
-                Err(err) => {
-                    if !op_id.is_none() {
-                        self.put_client_request_in_txn(
-                            &mut wtxn,
-                            &op_id.to_hex(),
-                            &MetaRaftResponse::Err(err.clone()),
-                        )?;
-                    }
-                    wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
-                    return Err(err);
+                inode
+            }
+            Err(err) => {
+                if !op_id.is_none() {
+                    self.put_client_request_in_txn(
+                        &mut wtxn,
+                        &op_id.to_hex(),
+                        &MetaRaftResponse::Err(err.clone()),
+                    )?;
                 }
-            };
+                wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
+                return Err(err);
+            }
+        };
         wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
         Ok(next)
     }
@@ -948,6 +1238,119 @@ impl MetaStore for HeedMetaStore {
             .to_vec();
         drop(rtxn);
         serde_json::from_slice(&bytes).map_err(|e| FluxError::Meta(e.to_string()))
+    }
+
+    fn begin_flush_with_id(
+        &self,
+        _op_id: fluxfs_types::RequestOpId,
+        expected_generation: u64,
+        inode: InodeId,
+        intent: &FlushIntent,
+    ) -> Result<Inode> {
+        self.with_write_txn(|this, txn| {
+            this.begin_flush_in_txn(txn, expected_generation, inode, intent)
+        })
+    }
+
+    fn commit_flush_with_id(
+        &self,
+        _op_id: fluxfs_types::RequestOpId,
+        expected_generation: u64,
+        inode: InodeId,
+        flush_id: FlushId,
+        published_ufs: &UfsObject,
+    ) -> Result<Inode> {
+        self.with_write_txn(|this, txn| {
+            this.commit_flush_in_txn(txn, expected_generation, inode, flush_id, published_ufs)
+        })
+    }
+
+    fn fail_flush_conflict(
+        &self,
+        expected_generation: u64,
+        inode: InodeId,
+        flush_id: FlushId,
+        error: &str,
+    ) -> Result<Inode> {
+        self.with_write_txn(|this, txn| {
+            this.fail_flush_conflict_in_txn(txn, expected_generation, inode, flush_id, error)
+        })
+    }
+
+    fn list_flush_intents(&self) -> Result<Vec<(InodeId, FlushIntent)>> {
+        let rtxn = self
+            .env
+            .read_txn()
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        let mut result = Vec::new();
+        for item in self
+            .inodes
+            .iter(&rtxn)
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+        {
+            let (_, bytes) = item.map_err(|e| FluxError::Meta(e.to_string()))?;
+            let inode: Inode =
+                serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))?;
+            if let Some(intent) = inode.flush_intent {
+                result.push((inode.id, intent));
+            }
+        }
+        result.sort_by_key(|(inode, _)| *inode);
+        Ok(result)
+    }
+
+    fn import_external_with_id(
+        &self,
+        op_id: fluxfs_types::RequestOpId,
+        parent: InodeId,
+        name: &str,
+        inode: &Inode,
+        manifest: Option<&Manifest>,
+    ) -> Result<Inode> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| FluxError::Meta("write lock poisoned".into()))?;
+        let mut wtxn = self
+            .env
+            .write_txn()
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        if !op_id.is_none() {
+            if let Some(cached) = self.get_client_request_in_txn(&wtxn, &op_id.to_hex())? {
+                return match cached {
+                    MetaRaftResponse::Inode(inode) => Ok(*inode),
+                    MetaRaftResponse::Err(err) => Err(err),
+                    other => Err(FluxError::Meta(format!(
+                        "bad retained import response: {other:?}"
+                    ))),
+                };
+            }
+        }
+        let next = match self.import_external_in_txn(&mut wtxn, parent, name, inode, manifest) {
+            Ok(inode) => {
+                if !op_id.is_none() {
+                    self.put_client_request_in_txn(
+                        &mut wtxn,
+                        &op_id.to_hex(),
+                        &MetaRaftResponse::Inode(Box::new(inode.clone())),
+                    )?;
+                }
+                inode
+            }
+            Err(err) => {
+                if !op_id.is_none() {
+                    self.put_client_request_in_txn(
+                        &mut wtxn,
+                        &op_id.to_hex(),
+                        &MetaRaftResponse::Err(err.clone()),
+                    )?;
+                }
+                wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
+                return Err(err);
+            }
+        };
+        wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
+        Ok(next)
     }
 
     fn unlink(&self, parent: InodeId, name: &str) -> Result<()> {
@@ -991,6 +1394,31 @@ impl MetaStore for HeedMetaStore {
     }
 }
 
+fn get_inode_raw(inodes: &InodeDb, txn: &heed::RwTxn<'_>, id: InodeId) -> Result<Inode> {
+    let bytes = inodes
+        .get(txn, &inode_key(id))
+        .map_err(|e| FluxError::Meta(e.to_string()))?
+        .ok_or(FluxError::NotFound)?;
+    serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))
+}
+
+fn check_generation(inode: &Inode, expected: u64) -> Result<()> {
+    if inode.generation != expected {
+        return Err(FluxError::CasFailed {
+            expected,
+            actual: inode.generation,
+        });
+    }
+    Ok(())
+}
+
+fn matching_flush_intent(inode: &Inode, flush_id: FlushId) -> Result<&FlushIntent> {
+    match inode.flush_intent.as_ref() {
+        Some(intent) if intent.flush_id == flush_id => Ok(intent),
+        _ => Err(FluxError::Busy),
+    }
+}
+
 fn put_inode_raw(db: &InodeDb, wtxn: &mut heed::RwTxn, inode: &Inode) -> Result<()> {
     let bytes = serde_json::to_vec(inode).map_err(|e| FluxError::Meta(e.to_string()))?;
     db.put(wtxn, &inode_key(inode.id), &bytes)
@@ -1027,6 +1455,7 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use crate::MetaStore;
+    use fluxfs_types::RequestOpId;
 
     #[test]
     fn create_lookup_roundtrip() {
@@ -1089,5 +1518,232 @@ mod tests {
         // Head must remain the successful commit.
         assert_eq!(store.get_inode(file.id).unwrap().generation, base_gen + 1);
         assert_eq!(store.get_inode(file.id).unwrap().manifest_id, Some(mid));
+    }
+
+    #[test]
+    fn flush_intent_blocks_writes_and_commits_clean_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HeedMetaStore::open(dir.path()).unwrap();
+        let mut file = store
+            .create(ROOT_INODE, "dirty.bin", FileType::Regular, 0o644, 0, 0)
+            .unwrap();
+        file.size = 5;
+        file.head_gen = DataGen(2);
+        file.ufs_gen = DataGen(1);
+        file.locality_fields = Some(LocalityFields {
+            backing_mode: BackingMode::UfsBacked,
+            data_state: DataState::Dirty,
+            op_state: OpState::None,
+            origin: Origin::Imported,
+        });
+        file.locality = LocalityLabel::Dirty;
+        store.put_inode(&file).unwrap();
+
+        let intent = FlushIntent {
+            flush_id: FlushId(7),
+            snapshot_gen: file.head_gen,
+            snapshot_manifest_root: fluxfs_types::ChunkId::from_bytes(b"manifest"),
+            expected_ufs_version: Some(UfsVersion("old-etag".into())),
+            target_digest: fluxfs_types::ChunkId::from_bytes(b"hello"),
+        };
+        let flushing = store
+            .begin_flush(file.generation, file.id, &intent)
+            .unwrap();
+        assert_eq!(flushing.generation, file.generation + 1);
+        assert_eq!(
+            store.list_flush_intents().unwrap(),
+            vec![(file.id, intent.clone())]
+        );
+
+        let mut attempted_write = flushing.clone();
+        attempted_write.generation += 1;
+        let attempted_manifest = Manifest {
+            inode: file.id,
+            gen: DataGen(3),
+            size: 5,
+            extents: Vec::new(),
+        };
+        assert_eq!(
+            store
+                .commit_inode_manifest(flushing.generation, &attempted_write, &attempted_manifest)
+                .unwrap_err(),
+            FluxError::Busy
+        );
+
+        let published = UfsObject {
+            key: "dirty.bin".into(),
+            size: 5,
+            etag: Some("new-etag".into()),
+            mtime_ms: Some(42),
+        };
+        let clean = store
+            .commit_flush(flushing.generation, file.id, intent.flush_id, &published)
+            .unwrap();
+        assert_eq!(clean.locality, LocalityLabel::External);
+        assert_eq!(clean.ufs_gen, clean.head_gen);
+        assert!(clean.flush_intent.is_none());
+        assert!(store.list_flush_intents().unwrap().is_empty());
+        let manifest = store.get_manifest(clean.manifest_id.unwrap()).unwrap();
+        assert!(matches!(
+            manifest.extents.as_slice(),
+            [Extent::UfsRange { ufs_version, .. }] if ufs_version == &UfsVersion("new-etag".into())
+        ));
+    }
+
+    #[test]
+    fn import_external_atomic_file_and_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HeedMetaStore::open(dir.path()).unwrap();
+        let now = now_ms();
+        let version = UfsVersion("etag-1".into());
+        let template = Inode {
+            id: 0,
+            file_type: FileType::Regular,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            size: 12,
+            mtime_ms: now,
+            ctime_ms: now,
+            atime_ms: now,
+            link_count: 1,
+            generation: 1,
+            head_gen: DataGen(0),
+            ufs_gen: DataGen(0),
+            ufs_base_version: Some(version.clone()),
+            locality: LocalityLabel::External,
+            locality_fields: Some(LocalityFields {
+                backing_mode: BackingMode::UfsBacked,
+                data_state: DataState::UfsClean,
+                op_state: OpState::None,
+                origin: Origin::Imported,
+            }),
+            ufs: Some(UfsObject {
+                key: "obj.bin".into(),
+                size: 12,
+                etag: Some("etag-1".into()),
+                mtime_ms: Some(now),
+            }),
+            extent_root: None,
+            manifest_id: None,
+            flush_intent: None,
+            last_error: None,
+        };
+        let manifest = Manifest {
+            inode: 0,
+            gen: DataGen(0),
+            size: 12,
+            extents: vec![Extent::UfsRange {
+                offset: 0,
+                len: 12,
+                ufs_key: "obj.bin".into(),
+                ufs_version: version,
+                offset_in_object: 0,
+            }],
+        };
+        let file = store
+            .import_external(ROOT_INODE, "obj.bin", &template, Some(&manifest))
+            .unwrap();
+        assert_ne!(file.id, 0);
+        assert_eq!(file.locality, LocalityLabel::External);
+        assert_eq!(file.size, 12);
+        let mid = file.manifest_id.expect("manifest");
+        let stored = store.get_manifest(mid).unwrap();
+        assert_eq!(stored.inode, file.id);
+        assert_eq!(store.lookup(ROOT_INODE, "obj.bin").unwrap().id, file.id);
+
+        let dir_template = Inode {
+            id: 0,
+            file_type: FileType::Directory,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            mtime_ms: now,
+            ctime_ms: now,
+            atime_ms: now,
+            link_count: 2,
+            generation: 1,
+            head_gen: DataGen(0),
+            ufs_gen: DataGen(0),
+            ufs_base_version: None,
+            locality: LocalityLabel::External,
+            locality_fields: Some(LocalityFields {
+                backing_mode: BackingMode::UfsBacked,
+                data_state: DataState::UfsClean,
+                op_state: OpState::None,
+                origin: Origin::Imported,
+            }),
+            ufs: Some(UfsObject {
+                key: "subdir/".into(),
+                size: 0,
+                etag: None,
+                mtime_ms: Some(now),
+            }),
+            extent_root: None,
+            manifest_id: None,
+            flush_intent: None,
+            last_error: None,
+        };
+        let d = store
+            .import_external(ROOT_INODE, "subdir", &dir_template, None)
+            .unwrap();
+        assert_eq!(d.file_type, FileType::Directory);
+        assert!(d.manifest_id.is_none());
+        assert!(matches!(
+            store
+                .import_external(ROOT_INODE, "obj.bin", &template, Some(&manifest))
+                .unwrap_err(),
+            FluxError::AlreadyExists
+        ));
+    }
+
+    #[test]
+    fn import_external_request_id_retry_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HeedMetaStore::open(dir.path()).unwrap();
+        let now = now_ms();
+        let op = RequestOpId::random();
+        let template = Inode {
+            id: 0,
+            file_type: FileType::Regular,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            mtime_ms: now,
+            ctime_ms: now,
+            atime_ms: now,
+            link_count: 1,
+            generation: 1,
+            head_gen: DataGen(0),
+            ufs_gen: DataGen(0),
+            ufs_base_version: Some(UfsVersion("empty".into())),
+            locality: LocalityLabel::External,
+            locality_fields: Some(LocalityFields {
+                backing_mode: BackingMode::UfsBacked,
+                data_state: DataState::UfsClean,
+                op_state: OpState::None,
+                origin: Origin::Imported,
+            }),
+            ufs: Some(UfsObject {
+                key: "empty.txt".into(),
+                size: 0,
+                etag: None,
+                mtime_ms: Some(now),
+            }),
+            extent_root: None,
+            manifest_id: None,
+            flush_intent: None,
+            last_error: None,
+        };
+        let first = store
+            .import_external_with_id(op, ROOT_INODE, "empty.txt", &template, None)
+            .unwrap();
+        let second = store
+            .import_external_with_id(op, ROOT_INODE, "empty.txt", &template, None)
+            .unwrap();
+        assert_eq!(first.id, second.id);
+        assert_eq!(store.readdir(ROOT_INODE).unwrap().len(), 1);
     }
 }

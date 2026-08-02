@@ -1,5 +1,6 @@
 use fluxfs_types::{
-    Dentry, FileType, Inode, InodeId, Manifest, ManifestId, RequestOpId, Result, ROOT_INODE,
+    Dentry, FileType, FlushId, FlushIntent, Inode, InodeId, Manifest, ManifestId, RequestOpId,
+    Result, UfsObject, ROOT_INODE,
 };
 
 /// Engine-agnostic metadata API frozen for W1.
@@ -45,7 +46,12 @@ pub trait MetaStore: Send + Sync {
         inode: &Inode,
         manifest: &Manifest,
     ) -> Result<Inode> {
-        self.commit_inode_manifest_with_id(RequestOpId::random(), expected_generation, inode, manifest)
+        self.commit_inode_manifest_with_id(
+            RequestOpId::random(),
+            expected_generation,
+            inode,
+            manifest,
+        )
     }
 
     /// Same as [`Self::commit_inode_manifest`] but with an explicit op id for retries.
@@ -58,6 +64,78 @@ pub trait MetaStore: Send + Sync {
     ) -> Result<Inode>;
 
     fn get_manifest(&self, id: ManifestId) -> Result<Manifest>;
+
+    fn begin_flush(
+        &self,
+        expected_generation: u64,
+        inode: InodeId,
+        intent: &FlushIntent,
+    ) -> Result<Inode> {
+        self.begin_flush_with_id(RequestOpId::random(), expected_generation, inode, intent)
+    }
+
+    fn begin_flush_with_id(
+        &self,
+        op_id: RequestOpId,
+        expected_generation: u64,
+        inode: InodeId,
+        intent: &FlushIntent,
+    ) -> Result<Inode>;
+
+    fn commit_flush(
+        &self,
+        expected_generation: u64,
+        inode: InodeId,
+        flush_id: FlushId,
+        published_ufs: &UfsObject,
+    ) -> Result<Inode> {
+        self.commit_flush_with_id(
+            RequestOpId::random(),
+            expected_generation,
+            inode,
+            flush_id,
+            published_ufs,
+        )
+    }
+
+    fn commit_flush_with_id(
+        &self,
+        op_id: RequestOpId,
+        expected_generation: u64,
+        inode: InodeId,
+        flush_id: FlushId,
+        published_ufs: &UfsObject,
+    ) -> Result<Inode>;
+
+    fn fail_flush_conflict(
+        &self,
+        expected_generation: u64,
+        inode: InodeId,
+        flush_id: FlushId,
+        error: &str,
+    ) -> Result<Inode>;
+
+    fn list_flush_intents(&self) -> Result<Vec<(InodeId, FlushIntent)>>;
+
+    /// Atomically import an External inode (+ optional manifest) under `parent/name`.
+    fn import_external(
+        &self,
+        parent: InodeId,
+        name: &str,
+        inode: &Inode,
+        manifest: Option<&Manifest>,
+    ) -> Result<Inode> {
+        self.import_external_with_id(RequestOpId::random(), parent, name, inode, manifest)
+    }
+
+    fn import_external_with_id(
+        &self,
+        op_id: RequestOpId,
+        parent: InodeId,
+        name: &str,
+        inode: &Inode,
+        manifest: Option<&Manifest>,
+    ) -> Result<Inode>;
 
     /// Unlink name from parent directory (inode/chunk GC deferred).
     fn unlink(&self, parent: InodeId, name: &str) -> Result<()>;

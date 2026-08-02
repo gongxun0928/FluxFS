@@ -15,6 +15,11 @@ service MetaService {
   // Atomically store a new manifest and CAS-update the inode head.
   rpc CommitInodeManifest(CommitInodeManifestRequest) returns (CommitInodeManifestResponse);
   rpc GetManifest(GetManifestRequest) returns (GetManifestResponse);
+  rpc BeginFlush(BeginFlushRequest) returns (BeginFlushResponse);
+  rpc CommitFlush(CommitFlushRequest) returns (CommitFlushResponse);
+  rpc FailFlushConflict(FailFlushConflictRequest) returns (FailFlushConflictResponse);
+  rpc ListFlushIntents(ListFlushIntentsRequest) returns (ListFlushIntentsResponse);
+  rpc ImportExternal(ImportExternalRequest) returns (ImportExternalResponse);
   rpc Unlink(UnlinkRequest) returns (UnlinkResponse);
   rpc Ping(PingRequest) returns (PingResponse);
 }
@@ -65,6 +70,45 @@ message CommitInodeManifestResponse {
 
 message GetManifestRequest { uint64 id = 1; }
 message GetManifestResponse { bytes manifest_json = 1; }
+
+message BeginFlushRequest {
+  uint64 inode = 1;
+  uint64 expected_generation = 2;
+  bytes intent_json = 3;
+  string request_id = 4;
+}
+message BeginFlushResponse { bytes inode_json = 1; }
+
+message CommitFlushRequest {
+  uint64 inode = 1;
+  uint64 expected_generation = 2;
+  uint64 flush_id = 3;
+  bytes published_ufs_json = 4;
+  string request_id = 5;
+}
+message CommitFlushResponse { bytes inode_json = 1; }
+
+message FailFlushConflictRequest {
+  uint64 inode = 1;
+  uint64 expected_generation = 2;
+  uint64 flush_id = 3;
+  string error = 4;
+  string request_id = 5;
+}
+message FailFlushConflictResponse { bytes inode_json = 1; }
+
+message ListFlushIntentsRequest {}
+message ListFlushIntentsResponse { bytes intents_json = 1; }
+
+message ImportExternalRequest {
+  uint64 parent = 1;
+  string name = 2;
+  bytes inode_json = 3;
+  // Empty = no manifest (directory / zero-size file).
+  bytes manifest_json = 4;
+  string request_id = 5;
+}
+message ImportExternalResponse { bytes inode_json = 1; }
 
 message UnlinkRequest {
   uint64 parent = 1;

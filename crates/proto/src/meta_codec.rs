@@ -1,6 +1,7 @@
 use crate::meta::v1;
 use fluxfs_types::{
-    Dentry, FileType, FluxError, Inode, Manifest, ManifestId, Result as FluxResult,
+    Dentry, FileType, FlushIntent, FluxError, Inode, InodeId, Manifest, ManifestId,
+    Result as FluxResult, UfsObject,
 };
 
 pub fn encode_inode(inode: &Inode) -> FluxResult<Vec<u8>> {
@@ -16,6 +17,30 @@ pub fn encode_manifest(m: &Manifest) -> FluxResult<Vec<u8>> {
 }
 
 pub fn decode_manifest(bytes: &[u8]) -> FluxResult<Manifest> {
+    serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))
+}
+
+pub fn encode_flush_intent(intent: &FlushIntent) -> FluxResult<Vec<u8>> {
+    serde_json::to_vec(intent).map_err(|e| FluxError::Meta(e.to_string()))
+}
+
+pub fn decode_flush_intent(bytes: &[u8]) -> FluxResult<FlushIntent> {
+    serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))
+}
+
+pub fn encode_ufs_object(object: &UfsObject) -> FluxResult<Vec<u8>> {
+    serde_json::to_vec(object).map_err(|e| FluxError::Meta(e.to_string()))
+}
+
+pub fn decode_ufs_object(bytes: &[u8]) -> FluxResult<UfsObject> {
+    serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))
+}
+
+pub fn encode_flush_intents(intents: &[(InodeId, FlushIntent)]) -> FluxResult<Vec<u8>> {
+    serde_json::to_vec(intents).map_err(|e| FluxError::Meta(e.to_string()))
+}
+
+pub fn decode_flush_intents(bytes: &[u8]) -> FluxResult<Vec<(InodeId, FlushIntent)>> {
     serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))
 }
 

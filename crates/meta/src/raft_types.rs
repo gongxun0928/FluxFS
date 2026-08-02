@@ -10,7 +10,9 @@ use openraft::StoredMembership;
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 
-use fluxfs_types::{FileType, FluxError, Inode, Manifest, RequestOpId};
+use fluxfs_types::{
+    FileType, FlushId, FlushIntent, FluxError, Inode, Manifest, RequestOpId, UfsObject,
+};
 
 pub type NodeId = u64;
 
@@ -56,6 +58,41 @@ pub enum MetaRaftRequest {
         inode: Box<Inode>,
         manifest: Box<Manifest>,
     },
+    BeginFlush {
+        #[serde(default)]
+        request_id: Option<RequestOpId>,
+        expected_generation: u64,
+        inode: u64,
+        intent: Box<FlushIntent>,
+    },
+    CommitFlush {
+        #[serde(default)]
+        request_id: Option<RequestOpId>,
+        expected_generation: u64,
+        inode: u64,
+        flush_id: FlushId,
+        published_ufs: Box<UfsObject>,
+    },
+    FailFlushConflict {
+        #[serde(default)]
+        request_id: Option<RequestOpId>,
+        expected_generation: u64,
+        inode: u64,
+        flush_id: FlushId,
+        error: String,
+    },
+    /// Atomically allocate inode id, optional manifest, dentry, and External inode.
+    ///
+    /// `inode.id` in the template is ignored (server allocates). Manifest extents
+    /// that reference inode id are rewritten to the allocated id.
+    ImportExternal {
+        #[serde(default)]
+        request_id: Option<RequestOpId>,
+        parent: u64,
+        name: String,
+        inode: Box<Inode>,
+        manifest: Option<Box<Manifest>>,
+    },
     Unlink {
         #[serde(default)]
         request_id: Option<RequestOpId>,
@@ -71,6 +108,10 @@ impl MetaRaftRequest {
             | Self::PutInode { request_id, .. }
             | Self::PutManifest { request_id, .. }
             | Self::CommitInodeManifest { request_id, .. }
+            | Self::BeginFlush { request_id, .. }
+            | Self::CommitFlush { request_id, .. }
+            | Self::FailFlushConflict { request_id, .. }
+            | Self::ImportExternal { request_id, .. }
             | Self::Unlink { request_id, .. } => request_id.as_ref(),
         }
     }
@@ -81,6 +122,10 @@ impl MetaRaftRequest {
             | Self::PutInode { request_id, .. }
             | Self::PutManifest { request_id, .. }
             | Self::CommitInodeManifest { request_id, .. }
+            | Self::BeginFlush { request_id, .. }
+            | Self::CommitFlush { request_id, .. }
+            | Self::FailFlushConflict { request_id, .. }
+            | Self::ImportExternal { request_id, .. }
             | Self::Unlink { request_id, .. } => {
                 *request_id = Some(id);
             }

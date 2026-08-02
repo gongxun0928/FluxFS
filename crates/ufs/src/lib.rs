@@ -309,13 +309,47 @@ impl Ufs {
         }
 
         Ok(UfsObject {
-            key,
+            key: rel.to_string(),
             size: meta.content_length(),
             etag: meta.etag().map(str::to_owned),
             mtime_ms: meta
                 .last_modified()
                 .map(|time| time.into_inner().as_millisecond()),
         })
+    }
+
+    /// Return the published object only when HEAD proves it is exactly the
+    /// intended payload. Used after restart to distinguish "Put succeeded,
+    /// metadata commit lost" from "Put never happened" without downloading it.
+    pub async fn find_verified_publish(
+        &self,
+        rel: &str,
+        expected_size: u64,
+        target_digest: &ChunkId,
+    ) -> Result<Option<UfsObject>> {
+        let key = self.key(rel);
+        let meta = match self.op.stat(&key).await {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == opendal::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(map_opendal(error)),
+        };
+        let digest_hex = target_digest.to_hex();
+        if meta.content_length() != expected_size
+            || meta
+                .user_metadata()
+                .and_then(|metadata| metadata.get(FLUXFS_DIGEST_METADATA))
+                != Some(&digest_hex)
+        {
+            return Ok(None);
+        }
+        Ok(Some(UfsObject {
+            key: rel.to_string(),
+            size: meta.content_length(),
+            etag: meta.etag().map(str::to_owned),
+            mtime_ms: meta
+                .last_modified()
+                .map(|time| time.into_inner().as_millisecond()),
+        }))
     }
 
     /// List one directory level under `rel` (non-recursive). Empty `rel` = prefix root.

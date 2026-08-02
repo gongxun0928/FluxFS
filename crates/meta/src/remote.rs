@@ -2,17 +2,19 @@
 
 use crate::store::MetaStore;
 use fluxfs_proto::meta::v1::{
-    CommitInodeManifestRequest, CreateRequest, GetInodeRequest, GetManifestRequest, LookupRequest,
-    PutInodeRequest, PutManifestRequest, ReaddirRequest, UnlinkRequest,
+    BeginFlushRequest, CommitFlushRequest, CommitInodeManifestRequest, CreateRequest,
+    FailFlushConflictRequest, GetInodeRequest, GetManifestRequest, ImportExternalRequest,
+    ListFlushIntentsRequest, LookupRequest, PutInodeRequest, PutManifestRequest, ReaddirRequest,
+    UnlinkRequest,
 };
 use fluxfs_proto::meta_codec::{
-    decode_dentries, decode_inode, decode_manifest, encode_inode, encode_manifest,
-    file_type_to_wire, flux_from_status,
+    decode_dentries, decode_flush_intents, decode_inode, decode_manifest, encode_flush_intent,
+    encode_inode, encode_manifest, encode_ufs_object, file_type_to_wire, flux_from_status,
 };
 use fluxfs_proto::MetaServiceClient;
 use fluxfs_types::{
-    Dentry, FileType, FluxError, Inode, InodeId, Manifest, ManifestId, RequestOpId, Result,
-    ROOT_INODE,
+    Dentry, FileType, FlushId, FlushIntent, FluxError, Inode, InodeId, Manifest, ManifestId,
+    RequestOpId, Result, UfsObject, ROOT_INODE,
 };
 use std::future::Future;
 use std::sync::Mutex;
@@ -190,6 +192,111 @@ impl MetaStore for RemoteMetaStore {
             .map_err(flux_from_status)?
             .into_inner();
         decode_manifest(&resp.manifest_json)
+    }
+
+    fn begin_flush_with_id(
+        &self,
+        op_id: RequestOpId,
+        expected_generation: u64,
+        inode: InodeId,
+        intent: &FlushIntent,
+    ) -> Result<Inode> {
+        let mut c = self.client()?;
+        let request = BeginFlushRequest {
+            inode,
+            expected_generation,
+            intent_json: encode_flush_intent(intent)?,
+            request_id: op_id.to_hex(),
+        };
+        let response = self
+            .block_on(async { c.begin_flush(request).await })
+            .map_err(flux_from_status)?
+            .into_inner();
+        decode_inode(&response.inode_json)
+    }
+
+    fn commit_flush_with_id(
+        &self,
+        op_id: RequestOpId,
+        expected_generation: u64,
+        inode: InodeId,
+        flush_id: FlushId,
+        published_ufs: &UfsObject,
+    ) -> Result<Inode> {
+        let mut c = self.client()?;
+        let request = CommitFlushRequest {
+            inode,
+            expected_generation,
+            flush_id: flush_id.0,
+            published_ufs_json: encode_ufs_object(published_ufs)?,
+            request_id: op_id.to_hex(),
+        };
+        let response = self
+            .block_on(async { c.commit_flush(request).await })
+            .map_err(flux_from_status)?
+            .into_inner();
+        decode_inode(&response.inode_json)
+    }
+
+    fn fail_flush_conflict(
+        &self,
+        expected_generation: u64,
+        inode: InodeId,
+        flush_id: FlushId,
+        error: &str,
+    ) -> Result<Inode> {
+        let mut c = self.client()?;
+        let request = FailFlushConflictRequest {
+            inode,
+            expected_generation,
+            flush_id: flush_id.0,
+            error: error.to_string(),
+            request_id: RequestOpId::random().to_hex(),
+        };
+        let response = self
+            .block_on(async { c.fail_flush_conflict(request).await })
+            .map_err(flux_from_status)?
+            .into_inner();
+        decode_inode(&response.inode_json)
+    }
+
+    fn list_flush_intents(&self) -> Result<Vec<(InodeId, FlushIntent)>> {
+        let mut c = self.client()?;
+        let response = self
+            .block_on(async { c.list_flush_intents(ListFlushIntentsRequest {}).await })
+            .map_err(flux_from_status)?
+            .into_inner();
+        decode_flush_intents(&response.intents_json)
+    }
+
+    fn import_external_with_id(
+        &self,
+        op_id: RequestOpId,
+        parent: InodeId,
+        name: &str,
+        inode: &Inode,
+        manifest: Option<&Manifest>,
+    ) -> Result<Inode> {
+        let inode_json = encode_inode(inode)?;
+        let manifest_json = match manifest {
+            Some(m) => encode_manifest(m)?,
+            None => Vec::new(),
+        };
+        let mut c = self.client()?;
+        let response = self
+            .block_on(async {
+                c.import_external(ImportExternalRequest {
+                    parent,
+                    name: name.to_string(),
+                    inode_json,
+                    manifest_json,
+                    request_id: op_id.to_hex(),
+                })
+                .await
+            })
+            .map_err(flux_from_status)?
+            .into_inner();
+        decode_inode(&response.inode_json)
     }
 
     fn unlink(&self, parent: InodeId, name: &str) -> Result<()> {

@@ -219,11 +219,7 @@ mod tests {
             .await
             .expect("first write")
             .data;
-        let second = raft
-            .client_write(req)
-            .await
-            .expect("retry write")
-            .data;
+        let second = raft.client_write(req).await.expect("retry write").data;
         let MetaRaftResponse::Inode(a) = first else {
             panic!("expected inode");
         };
@@ -324,7 +320,7 @@ mod tests {
             .await
             .expect("start raft");
         raft.client_write(MetaRaftRequest::Create {
-                request_id: None,
+            request_id: None,
             parent: ROOT_INODE,
             name: "snap.txt".into(),
             file_type: FileType::Regular,

@@ -4,8 +4,8 @@ use crate::heed_store::HeedMetaStore;
 use crate::raft_types::{FluxRaft, MetaRaftRequest, MetaRaftResponse};
 use crate::store::MetaStore;
 use fluxfs_types::{
-    Dentry, FileType, FluxError, Inode, InodeId, Manifest, ManifestId, RequestOpId, Result,
-    ROOT_INODE,
+    Dentry, FileType, FlushId, FlushIntent, FluxError, Inode, InodeId, Manifest, ManifestId,
+    RequestOpId, Result, UfsObject, ROOT_INODE,
 };
 use std::future::Future;
 use std::sync::Arc;
@@ -157,7 +157,12 @@ impl MetaStore for RaftMetaStore {
         inode: &Inode,
         manifest: &Manifest,
     ) -> Result<Inode> {
-        self.commit_inode_manifest_with_id(RequestOpId::random(), expected_generation, inode, manifest)
+        self.commit_inode_manifest_with_id(
+            RequestOpId::random(),
+            expected_generation,
+            inode,
+            manifest,
+        )
     }
 
     fn commit_inode_manifest_with_id(
@@ -178,6 +183,75 @@ impl MetaStore for RaftMetaStore {
 
     fn get_manifest(&self, id: ManifestId) -> Result<Manifest> {
         self.store.get_manifest(id)
+    }
+
+    fn begin_flush_with_id(
+        &self,
+        op_id: RequestOpId,
+        expected_generation: u64,
+        inode: InodeId,
+        intent: &FlushIntent,
+    ) -> Result<Inode> {
+        Self::map_inode(self.write(MetaRaftRequest::BeginFlush {
+            request_id: Some(op_id),
+            expected_generation,
+            inode,
+            intent: Box::new(intent.clone()),
+        })?)
+    }
+
+    fn commit_flush_with_id(
+        &self,
+        op_id: RequestOpId,
+        expected_generation: u64,
+        inode: InodeId,
+        flush_id: FlushId,
+        published_ufs: &UfsObject,
+    ) -> Result<Inode> {
+        Self::map_inode(self.write(MetaRaftRequest::CommitFlush {
+            request_id: Some(op_id),
+            expected_generation,
+            inode,
+            flush_id,
+            published_ufs: Box::new(published_ufs.clone()),
+        })?)
+    }
+
+    fn fail_flush_conflict(
+        &self,
+        expected_generation: u64,
+        inode: InodeId,
+        flush_id: FlushId,
+        error: &str,
+    ) -> Result<Inode> {
+        Self::map_inode(self.write(MetaRaftRequest::FailFlushConflict {
+            request_id: Some(RequestOpId::random()),
+            expected_generation,
+            inode,
+            flush_id,
+            error: error.to_string(),
+        })?)
+    }
+
+    fn list_flush_intents(&self) -> Result<Vec<(InodeId, FlushIntent)>> {
+        self.store.list_flush_intents()
+    }
+
+    fn import_external_with_id(
+        &self,
+        op_id: RequestOpId,
+        parent: InodeId,
+        name: &str,
+        inode: &Inode,
+        manifest: Option<&Manifest>,
+    ) -> Result<Inode> {
+        Self::map_inode(self.write(MetaRaftRequest::ImportExternal {
+            request_id: Some(op_id),
+            parent,
+            name: name.to_string(),
+            inode: Box::new(inode.clone()),
+            manifest: manifest.map(|m| Box::new(m.clone())),
+        })?)
     }
 
     fn unlink(&self, parent: InodeId, name: &str) -> Result<()> {

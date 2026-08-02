@@ -3,9 +3,9 @@
 use fluxfs_chunk::ChunkStore;
 use fluxfs_meta::MetaStore;
 use fluxfs_types::{
-    BackingMode, ChunkId, DataGen, DataState, Extent, FileType, FluxError, Inode, InodeId,
-    LocalityFields, LocalityLabel, Manifest, OpState, Origin, RequestOpId, Result, UfsObject,
-    UfsVersion, CHUNK_SIZE, DIRTY_WRITE_CAP_BYTES, ROOT_INODE,
+    BackingMode, ChunkId, DataGen, DataState, Extent, FileType, FlushId, FlushIntent, FluxError,
+    Inode, InodeId, LocalityFields, LocalityLabel, Manifest, OpState, Origin, RequestOpId, Result,
+    UfsObject, UfsVersion, CHUNK_SIZE, DIRTY_WRITE_CAP_BYTES, ROOT_INODE,
 };
 use fluxfs_ufs::{ReadPathConfig, ReadPathStats, Ufs, UfsEntryMode, UfsProbe, UfsReadPath};
 use std::collections::HashMap;
@@ -61,6 +61,13 @@ pub struct FluxClient<M: MetaStore, C: ChunkStore> {
     ufs: Option<UfsRuntime>,
     /// Relative UFS path for imported/local namespace nodes (`""` = UFS root).
     ufs_paths: Mutex<HashMap<InodeId, String>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FlushRecoveryReport {
+    pub completed: usize,
+    pub conflicts: usize,
+    pub pending: usize,
 }
 
 impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
@@ -171,6 +178,185 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
 
     pub fn get_chunk(&self, id: &ChunkId) -> Result<Vec<u8>> {
         self.chunks.get(id)
+    }
+
+    /// Flush one Dirty UFS-backed inode through the durable intent protocol.
+    /// Ephemeral and already-clean files are already durable at their declared tier.
+    pub fn flush_inode(&self, ino: InodeId) -> Result<Inode> {
+        let _guard = self
+            .io_lock
+            .lock()
+            .map_err(|_| FluxError::Io("io lock poisoned".into()))?;
+        let inode = self.meta.get_inode(ino)?;
+        if inode.file_type != FileType::Regular {
+            return Err(FluxError::IsDirectory);
+        }
+        let Some(fields) = inode.locality_fields.as_ref() else {
+            return Err(FluxError::Meta(
+                "flush inode missing locality fields".into(),
+            ));
+        };
+        if fields.backing_mode == BackingMode::Ephemeral || fields.data_state == DataState::UfsClean
+        {
+            return Ok(inode);
+        }
+        if fields.data_state == DataState::DirtyConflict {
+            return Err(FluxError::DirtyConflict);
+        }
+        if let Some(intent) = inode.flush_intent.clone() {
+            return self.complete_flush_intent(inode.id, &intent);
+        }
+        if fields.data_state != DataState::Dirty {
+            return Err(FluxError::Busy);
+        }
+
+        let manifest_id = inode
+            .manifest_id
+            .ok_or_else(|| FluxError::Meta("Dirty inode missing manifest".into()))?;
+        let manifest = self.meta.get_manifest(manifest_id)?;
+        if manifest.gen != inode.head_gen || manifest.size != inode.size {
+            return Err(FluxError::Meta(
+                "Dirty inode head does not match manifest snapshot".into(),
+            ));
+        }
+        let bytes = self.read_inode_range(&inode, 0, inode.size)?;
+        let target_digest = ChunkId::from_bytes(&bytes);
+        let expected_etag = inode
+            .ufs
+            .as_ref()
+            .and_then(|object| object.etag.clone())
+            .ok_or_else(|| {
+                FluxError::Capability(
+                    "safe flush requires a UFS ETag for conditional overwrite".into(),
+                )
+            })?;
+        let intent = FlushIntent {
+            flush_id: FlushId::random(),
+            snapshot_gen: inode.head_gen,
+            snapshot_manifest_root: manifest.root_digest(),
+            expected_ufs_version: Some(UfsVersion(expected_etag)),
+            target_digest,
+        };
+        self.meta.begin_flush(inode.generation, inode.id, &intent)?;
+        self.complete_flush_intent(inode.id, &intent)
+    }
+
+    /// Reconcile durable intents after process restart. Transient failures stay
+    /// pending for the next pass; detected external conflicts are durably marked.
+    pub fn reconcile_flushes(&self) -> Result<FlushRecoveryReport> {
+        let mut report = FlushRecoveryReport::default();
+        for (inode, intent) in self.meta.list_flush_intents()? {
+            match self.complete_flush_intent(inode, &intent) {
+                Ok(_) => report.completed += 1,
+                Err(FluxError::DirtyConflict) => report.conflicts += 1,
+                Err(_) => report.pending += 1,
+            }
+        }
+        Ok(report)
+    }
+
+    fn complete_flush_intent(&self, ino: InodeId, intent: &FlushIntent) -> Result<Inode> {
+        let ufs = self
+            .ufs
+            .as_ref()
+            .ok_or_else(|| FluxError::Capability("flush requires a UFS mount".into()))?;
+        let inode = self.meta.get_inode(ino)?;
+        if inode.flush_intent.as_ref().map(|i| i.flush_id) != Some(intent.flush_id) {
+            return Err(FluxError::Busy);
+        }
+        let object = inode
+            .ufs
+            .as_ref()
+            .ok_or_else(|| FluxError::Meta("Dirty inode missing UFS target".into()))?;
+        let manifest = self.meta.get_manifest(
+            inode
+                .manifest_id
+                .ok_or_else(|| FluxError::Meta("flushing inode missing manifest".into()))?,
+        )?;
+        if manifest.root_digest() != intent.snapshot_manifest_root {
+            return self.record_flush_conflict(
+                ino,
+                intent.flush_id,
+                "flush snapshot manifest changed",
+            );
+        }
+
+        let published = match ufs.block_on(ufs.ufs.find_verified_publish(
+            &object.key,
+            inode.size,
+            &intent.target_digest,
+        ))? {
+            Some(published) => published,
+            None => {
+                let bytes = self.read_inode_range(&inode, 0, inode.size)?;
+                if ChunkId::from_bytes(&bytes) != intent.target_digest {
+                    return self.record_flush_conflict(
+                        ino,
+                        intent.flush_id,
+                        "flush reconstructed bytes do not match target digest",
+                    );
+                }
+                let expected = intent.expected_ufs_version.as_ref().ok_or_else(|| {
+                    FluxError::Capability("flush intent missing expected UFS version".into())
+                })?;
+                match ufs.block_on(ufs.ufs.publish_full_verified(
+                    &object.key,
+                    &bytes,
+                    Some(&expected.0),
+                    &intent.target_digest,
+                )) {
+                    Ok(published) => published,
+                    Err(FluxError::DirtyConflict) => {
+                        return self.record_flush_conflict(
+                            ino,
+                            intent.flush_id,
+                            "conditional UFS publish detected external version drift",
+                        );
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        };
+        self.commit_flush_retry(ino, intent.flush_id, &published)
+    }
+
+    fn commit_flush_retry(
+        &self,
+        ino: InodeId,
+        flush_id: FlushId,
+        published: &UfsObject,
+    ) -> Result<Inode> {
+        for _ in 0..4 {
+            let current = self.meta.get_inode(ino)?;
+            match self
+                .meta
+                .commit_flush(current.generation, ino, flush_id, published)
+            {
+                Err(FluxError::CasFailed { .. }) => continue,
+                result => return result,
+            }
+        }
+        Err(FluxError::Busy)
+    }
+
+    fn record_flush_conflict(
+        &self,
+        ino: InodeId,
+        flush_id: FlushId,
+        message: &str,
+    ) -> Result<Inode> {
+        for _ in 0..4 {
+            let current = self.meta.get_inode(ino)?;
+            match self
+                .meta
+                .fail_flush_conflict(current.generation, ino, flush_id, message)
+            {
+                Err(FluxError::CasFailed { .. }) => continue,
+                Ok(_) => return Err(FluxError::DirtyConflict),
+                Err(error) => return Err(error),
+            }
+        }
+        Err(FluxError::Busy)
     }
 
     /// Assemble full file bytes from the inode's current manifest.
@@ -325,12 +511,8 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         inode.mtime_ms = now;
         inode.ctime_ms = now;
         let op_id = RequestOpId::random();
-        self.meta.commit_inode_manifest_with_id(
-            op_id,
-            expected_generation,
-            inode,
-            &manifest,
-        )?;
+        self.meta
+            .commit_inode_manifest_with_id(op_id, expected_generation, inode, &manifest)?;
         Ok(data.len() as u32)
     }
 
@@ -566,91 +748,113 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         rel: &str,
         obj: UfsObject,
     ) -> Result<Inode> {
-        // create() currently stamps Ephemeral; convert via put_inode.
-        let mut inode = match self
-            .meta
-            .create(parent, name, FileType::Regular, 0o644, 0, 0)
-        {
-            Ok(i) => i,
-            Err(FluxError::AlreadyExists) => return self.meta.lookup(parent, name),
-            Err(e) => return Err(e),
-        };
         let version = UfsVersion(
             obj.etag
                 .clone()
                 .unwrap_or_else(|| format!("size:{}", obj.size)),
         );
-        let mid = if obj.size == 0 {
+        let now = now_ms();
+        let template = Inode {
+            id: 0,
+            file_type: FileType::Regular,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            size: obj.size,
+            mtime_ms: obj.mtime_ms.unwrap_or(now),
+            ctime_ms: now,
+            atime_ms: now,
+            link_count: 1,
+            generation: 1,
+            head_gen: DataGen(0),
+            ufs_gen: DataGen(0),
+            ufs_base_version: Some(version.clone()),
+            locality: LocalityLabel::External,
+            locality_fields: Some(LocalityFields {
+                backing_mode: BackingMode::UfsBacked,
+                data_state: DataState::UfsClean,
+                op_state: OpState::None,
+                origin: Origin::Imported,
+            }),
+            ufs: Some(UfsObject {
+                key: rel.to_string(),
+                size: obj.size,
+                etag: obj.etag,
+                mtime_ms: obj.mtime_ms,
+            }),
+            extent_root: None,
+            manifest_id: None,
+            flush_intent: None,
+            last_error: None,
+        };
+        let manifest = if obj.size == 0 {
             None
         } else {
-            let manifest = Manifest {
-                inode: inode.id,
+            Some(Manifest {
+                inode: 0,
                 gen: DataGen(0),
                 size: obj.size,
                 extents: vec![Extent::UfsRange {
                     offset: 0,
                     len: obj.size,
                     ufs_key: rel.to_string(),
-                    ufs_version: version.clone(),
+                    ufs_version: version,
                     offset_in_object: 0,
                 }],
-            };
-            Some(self.meta.put_manifest(&manifest)?)
+            })
         };
-        let now = now_ms();
-        inode.size = obj.size;
-        inode.head_gen = DataGen(0);
-        inode.ufs_gen = DataGen(0);
-        inode.ufs_base_version = Some(version);
-        inode.ufs = Some(UfsObject {
-            key: rel.to_string(),
-            size: obj.size,
-            etag: obj.etag,
-            mtime_ms: obj.mtime_ms,
-        });
-        inode.manifest_id = mid;
-        inode.locality_fields = Some(LocalityFields {
-            backing_mode: BackingMode::UfsBacked,
-            data_state: DataState::UfsClean,
-            op_state: OpState::None,
-            origin: Origin::Imported,
-        });
-        inode.locality = LocalityLabel::External;
-        inode.mtime_ms = obj.mtime_ms.unwrap_or(now);
-        inode.ctime_ms = now;
-        inode.atime_ms = now;
-        self.meta.put_inode(&inode)?;
-        self.remember_ufs_path(inode.id, rel.to_string());
-        Ok(inode)
-    }
-
-    fn commit_external_dir(&self, parent: InodeId, name: &str, rel: &str) -> Result<Inode> {
-        let mut inode = match self
+        let inode = match self
             .meta
-            .create(parent, name, FileType::Directory, 0o755, 0, 0)
+            .import_external(parent, name, &template, manifest.as_ref())
         {
             Ok(i) => i,
             Err(FluxError::AlreadyExists) => return self.meta.lookup(parent, name),
             Err(e) => return Err(e),
         };
+        self.remember_ufs_path(inode.id, rel.to_string());
+        Ok(inode)
+    }
+
+    fn commit_external_dir(&self, parent: InodeId, name: &str, rel: &str) -> Result<Inode> {
         let now = now_ms();
-        inode.locality_fields = Some(LocalityFields {
-            backing_mode: BackingMode::UfsBacked,
-            data_state: DataState::UfsClean,
-            op_state: OpState::None,
-            origin: Origin::Imported,
-        });
-        inode.locality = LocalityLabel::External;
-        inode.ufs = Some(UfsObject {
-            key: format!("{}/", rel.trim_end_matches('/')),
+        let template = Inode {
+            id: 0,
+            file_type: FileType::Directory,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
             size: 0,
-            etag: None,
-            mtime_ms: Some(now),
-        });
-        inode.ctime_ms = now;
-        inode.mtime_ms = now;
-        inode.atime_ms = now;
-        self.meta.put_inode(&inode)?;
+            mtime_ms: now,
+            ctime_ms: now,
+            atime_ms: now,
+            link_count: 2,
+            generation: 1,
+            head_gen: DataGen(0),
+            ufs_gen: DataGen(0),
+            ufs_base_version: None,
+            locality: LocalityLabel::External,
+            locality_fields: Some(LocalityFields {
+                backing_mode: BackingMode::UfsBacked,
+                data_state: DataState::UfsClean,
+                op_state: OpState::None,
+                origin: Origin::Imported,
+            }),
+            ufs: Some(UfsObject {
+                key: format!("{}/", rel.trim_end_matches('/')),
+                size: 0,
+                etag: None,
+                mtime_ms: Some(now),
+            }),
+            extent_root: None,
+            manifest_id: None,
+            flush_intent: None,
+            last_error: None,
+        };
+        let inode = match self.meta.import_external(parent, name, &template, None) {
+            Ok(i) => i,
+            Err(FluxError::AlreadyExists) => return self.meta.lookup(parent, name),
+            Err(e) => return Err(e),
+        };
         self.remember_ufs_path(inode.id, rel.to_string());
         Ok(inode)
     }
