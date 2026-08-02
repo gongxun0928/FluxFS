@@ -92,17 +92,14 @@ fn registration(cli: &Cli) -> Result<WorkerRegistration> {
         .context("--lease-secs overflow")?;
     let registration = WorkerRegistration {
         id: WorkerTargetId(cli.worker_id),
-        endpoint: cli
-            .advertise_endpoint
-            .clone()
-            .unwrap_or_else(|| {
-                let scheme = if cli.tls_server_cert.is_some() {
-                    "https"
-                } else {
-                    "http"
-                };
-                format!("{scheme}://{}", cli.listen)
-            }),
+        endpoint: cli.advertise_endpoint.clone().unwrap_or_else(|| {
+            let scheme = if cli.tls_server_cert.is_some() {
+                "https"
+            } else {
+                "http"
+            };
+            format!("{scheme}://{}", cli.listen)
+        }),
         failure_domain: cli.failure_domain.clone(),
         capacity_bytes: cli.capacity_bytes,
         available_bytes: cli.available_bytes.unwrap_or(cli.capacity_bytes),

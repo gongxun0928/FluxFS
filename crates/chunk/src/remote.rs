@@ -156,7 +156,15 @@ impl RemoteReplicatedChunkStore {
             .active_at(now_ms)
             .map(|worker| (worker.id, worker.endpoint.clone()))
             .collect();
-        Self::new_with_targets(targets, required, max_pending, Some(membership), None, None, true)
+        Self::new_with_targets(
+            targets,
+            required,
+            max_pending,
+            Some(membership),
+            None,
+            None,
+            true,
+        )
     }
 
     pub fn new_with_membership_discovery(
@@ -190,15 +198,14 @@ impl RemoteReplicatedChunkStore {
             .active_at(now_ms)
             .map(|worker| (worker.id, worker.endpoint.clone()))
             .collect();
-        let endpoint = if meta_endpoint.starts_with("http://")
-            || meta_endpoint.starts_with("https://")
-        {
-            meta_endpoint
-        } else if tls.is_some() {
-            format!("https://{meta_endpoint}")
-        } else {
-            format!("http://{meta_endpoint}")
-        };
+        let endpoint =
+            if meta_endpoint.starts_with("http://") || meta_endpoint.starts_with("https://") {
+                meta_endpoint
+            } else if tls.is_some() {
+                format!("https://{meta_endpoint}")
+            } else {
+                format!("http://{meta_endpoint}")
+            };
         Self::new_with_targets(
             targets,
             required,
@@ -251,7 +258,17 @@ impl RemoteReplicatedChunkStore {
                 let membership = membership.clone();
                 let meta_endpoint = meta_endpoint.clone();
                 let tls_cfg = tls_cfg.clone();
-                move || rpc_loop(channels, membership, meta_endpoint, tls_cfg, insecure_dev, required, receiver)
+                move || {
+                    rpc_loop(
+                        channels,
+                        membership,
+                        meta_endpoint,
+                        tls_cfg,
+                        insecure_dev,
+                        required,
+                        receiver,
+                    )
+                }
             })
             .map_err(|error| FluxError::Io(format!("spawn chunk RPC thread: {error}")))?;
         let gc_thread = thread::Builder::new()

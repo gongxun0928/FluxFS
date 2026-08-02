@@ -39,7 +39,7 @@ wait_port() {
 
 start_meta() {
     "$repo_dir/target/debug/fluxfs-metamaster" --listen "127.0.0.1:$meta_port" \
-        --data-dir "$test_root/meta" >"$test_root/meta.log" 2>&1 &
+        --data-dir "$test_root/meta" --allow-insecure-dev >"$test_root/meta.log" 2>&1 &
     meta_pid=$!
     wait_port "$meta_port"
 }
@@ -50,7 +50,8 @@ start_worker() {
         --listen "127.0.0.1:$port" --advertise-endpoint "http://127.0.0.1:$port" \
         --failure-domain "$domain" --capacity-bytes 1073741824 \
         --heartbeat-interval-secs 1 --lease-secs 4 \
-        --meta-addr "http://127.0.0.1:$meta_port" --data-dir "$dir" >"$log" 2>&1 &
+        --meta-addr "http://127.0.0.1:$meta_port" --data-dir "$dir" \
+        --allow-insecure-dev >"$log" 2>&1 &
     LAST_PID=$!
     wait_port "$port"
 }
@@ -58,6 +59,7 @@ start_worker() {
 start_mount() {
     "$repo_dir/target/debug/fluxfs" mount --no-ufs --data-dir "$test_root/client" \
         --mountpoint "$mount_dir" --meta-addr "http://127.0.0.1:$meta_port" \
+        --allow-insecure-dev \
         >"$test_root/mount.log" 2>&1 &
     mount_pid=$!
     for _ in $(seq 1 100); do
