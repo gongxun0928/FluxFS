@@ -420,6 +420,127 @@ impl Manifest {
             extents: Vec::new(),
         }
     }
+
+    /// Iterate extents overlapping `[offset, offset+len)`, in sorted order.
+    ///
+    /// Read-merge path uses this to dispatch per-extent IO: covered `Local`
+    /// extents read from ChunkStore, covered `UfsRange` extents do pinned-version
+    /// OpenDAL range GETs.
+    pub fn extents_in_range(&self, offset: u64, len: u64) -> impl Iterator<Item = &Extent> {
+        let end = offset.saturating_add(len);
+        self.extents.iter().filter(move |e| {
+            let e_end = e.offset().saturating_add(e.len());
+            e.offset() < end && offset < e_end
+        })
+    }
+
+    /// Build a new `Manifest` (gen = `new_gen`) by inserting `new_extent` over
+    /// `[new_extent.offset(), new_extent.offset() + new_extent.len())`.
+    ///
+    /// Splitting rules (designed for Dirty copy-up where new_extent is Local):
+    ///
+    /// * Existing **UfsRange** partial overlap → split into head/tail, both keep
+    ///   the pinned `ufs_version` and adjust `offset_in_object` for the tail.
+    /// * Existing **UfsRange** fully covered → dropped.
+    /// * Existing **Local** fully covered by `new_extent` → dropped.
+    /// * Existing **Local** partially overlapped → `Err`. The caller must RMW
+    ///   (read old chunk, overwrite bytes, put new chunk) before calling.
+    ///   Sub-chunk-granularity references inside a Local chunk are not modeled
+    ///   in W1 (no `internal_offset` field); see production audit.
+    ///
+    /// The new manifest's `size` grows to `max(old.size, new_end)` if the new
+    /// extent extends beyond the current end. The result is validated before
+    /// return.
+    pub fn replace_range(&self, new_extent: Extent, new_gen: DataGen) -> Result<Manifest> {
+        if new_extent.is_empty() {
+            return Err(FluxError::InvalidArg(
+                "replace_range: new_extent has len=0".into(),
+            ));
+        }
+        let new_start = new_extent.offset();
+        let new_end = new_start
+            .checked_add(new_extent.len())
+            .ok_or_else(|| FluxError::InvalidArg("new_extent len overflow".into()))?;
+
+        let mut result: Vec<Extent> = Vec::with_capacity(self.extents.len() + 2);
+
+        for existing in &self.extents {
+            let ex_start = existing.offset();
+            let ex_end = ex_start
+                .checked_add(existing.len())
+                .ok_or_else(|| FluxError::InvalidArg("existing extent len overflow".into()))?;
+
+            // No overlap: existing entirely before or after new range.
+            if ex_end <= new_start || ex_start >= new_end {
+                result.push(existing.clone());
+                continue;
+            }
+
+            match existing {
+                Extent::UfsRange {
+                    ufs_key,
+                    ufs_version,
+                    offset_in_object,
+                    ..
+                } => {
+                    let obj_base = *offset_in_object;
+                    // Head: [ex_start, min(ex_end, new_start)).
+                    if ex_start < new_start {
+                        let head_len = new_start - ex_start;
+                        result.push(Extent::UfsRange {
+                            offset: ex_start,
+                            len: head_len,
+                            ufs_key: ufs_key.clone(),
+                            ufs_version: ufs_version.clone(),
+                            offset_in_object: obj_base,
+                        });
+                    }
+                    // Tail: [max(ex_start, new_end), ex_end).
+                    if ex_end > new_end {
+                        let tail_len = ex_end - new_end;
+                        let tail_obj_offset = obj_base + (new_end - ex_start);
+                        result.push(Extent::UfsRange {
+                            offset: new_end,
+                            len: tail_len,
+                            ufs_key: ufs_key.clone(),
+                            ufs_version: ufs_version.clone(),
+                            offset_in_object: tail_obj_offset,
+                        });
+                    }
+                    // Middle consumed by new_extent.
+                }
+                Extent::Local { .. } => {
+                    if new_start <= ex_start && new_end >= ex_end {
+                        // Fully covered by new; drop.
+                    } else {
+                        return Err(FluxError::InvalidArg(format!(
+                            "Local extent [{ex_start},{ex_end}) partially overlapped by new \
+                             [{new_start},{new_end}); caller must RMW to produce a fresh chunk"
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Insert new_extent in sorted position. binary_search_by_key on offset
+        // gives Ok(existing_pos) only when an extent starts exactly at new_start;
+        // in that case we replace (drop the old fully-covered one already handled
+        // above and re-insert here). Err(insert_pos) is the normal path.
+        let insert_pos = result
+            .binary_search_by_key(&new_start, Extent::offset)
+            .unwrap_or_else(|p| p);
+        result.insert(insert_pos, new_extent);
+
+        let new_size = std::cmp::max(self.size, new_end);
+        let m = Manifest {
+            inode: self.inode,
+            gen: new_gen,
+            size: new_size,
+            extents: result,
+        };
+        m.validate()?;
+        Ok(m)
+    }
 }
 
 // ===== Errors =====
@@ -647,5 +768,189 @@ mod tests {
         assert_eq!(parsed.ufs_gen, DataGen(0));
         assert!(parsed.locality_fields.is_none());
         assert!(parsed.manifest_id.is_none());
+    }
+
+    fn ufs_range(offset: u64, len: u64) -> Extent {
+        Extent::UfsRange {
+            offset,
+            len,
+            ufs_key: "obj".into(),
+            ufs_version: UfsVersion("etag-1".into()),
+            offset_in_object: offset,
+        }
+    }
+
+    fn local(offset: u64, len: u64, byte: u8) -> Extent {
+        Extent::Local {
+            offset,
+            len,
+            chunk: ChunkId([byte; 32]),
+        }
+    }
+
+    #[test]
+    fn extents_in_range_returns_only_overlapping() {
+        let m = Manifest {
+            inode: 1,
+            gen: DataGen(1),
+            size: 200,
+            extents: vec![ufs_range(0, 50), local(50, 50, 1), ufs_range(100, 100)],
+        };
+        // [40, 90) overlaps extents at 0 and 50, not 100.
+        let hits: Vec<&Extent> = m.extents_in_range(40, 50).collect();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].offset(), 0);
+        assert_eq!(hits[1].offset(), 50);
+
+        // Adjacent-only range (touching boundary) does not overlap.
+        let touches: Vec<&Extent> = m.extents_in_range(50, 0).collect();
+        // len=0 → end == start, no extent can strictly overlap a zero-wide window.
+        assert_eq!(touches.len(), 0);
+
+        // Range entirely after last extent.
+        let after: Vec<&Extent> = m.extents_in_range(300, 10).collect();
+        assert_eq!(after.len(), 0);
+    }
+
+    #[test]
+    fn replace_range_splits_ufs_range_head_and_tail() {
+        let m = Manifest {
+            inode: 1,
+            gen: DataGen(1),
+            size: 100,
+            extents: vec![ufs_range(0, 100)],
+        };
+        let new = local(10, 50, 9);
+        let m2 = m.replace_range(new, DataGen(2)).expect("split ok");
+        assert_eq!(m2.gen, DataGen(2));
+        assert_eq!(m2.size, 100);
+        assert_eq!(m2.extents.len(), 3, "{:?}", m2.extents);
+        // head [0,10)
+        assert_eq!(m2.extents[0].offset(), 0);
+        assert_eq!(m2.extents[0].len(), 10);
+        // inserted Local [10,60)
+        assert_eq!(m2.extents[1].offset(), 10);
+        assert_eq!(m2.extents[1].len(), 50);
+        // tail [60,100) — ufs_version preserved, offset_in_object adjusted.
+        match &m2.extents[2] {
+            Extent::UfsRange {
+                offset,
+                len,
+                ufs_version,
+                offset_in_object,
+                ..
+            } => {
+                assert_eq!(*offset, 60);
+                assert_eq!(*len, 40);
+                assert_eq!(ufs_version.0, "etag-1");
+                assert_eq!(*offset_in_object, 60);
+            }
+            _ => panic!("expected UfsRange tail"),
+        }
+    }
+
+    #[test]
+    fn replace_range_drops_fully_covered_ufs_range() {
+        let m = Manifest {
+            inode: 1,
+            gen: DataGen(1),
+            size: 100,
+            extents: vec![ufs_range(0, 100)],
+        };
+        // New covers the entire UfsRange.
+        let m2 = m
+            .replace_range(local(0, 100, 9), DataGen(2))
+            .expect("full cover ok");
+        assert_eq!(m2.extents.len(), 1);
+        assert!(matches!(m2.extents[0], Extent::Local { .. }));
+    }
+
+    #[test]
+    fn replace_range_drops_fully_covered_local() {
+        let m = Manifest {
+            inode: 1,
+            gen: DataGen(1),
+            size: 100,
+            extents: vec![local(0, 100, 1)],
+        };
+        let m2 = m
+            .replace_range(local(0, 100, 9), DataGen(2))
+            .expect("full cover local ok");
+        assert_eq!(m2.extents.len(), 1);
+        match m2.extents[0] {
+            Extent::Local { chunk, .. } => assert_eq!(chunk, ChunkId([9; 32])),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn replace_range_rejects_partial_local_overlap() {
+        let m = Manifest {
+            inode: 1,
+            gen: DataGen(1),
+            size: 100,
+            extents: vec![local(0, 100, 1)],
+        };
+        // Partial overlap on the right side.
+        let err = m.replace_range(local(50, 100, 9), DataGen(2));
+        assert!(err.is_err());
+        // Partial overlap on the left side.
+        let err = m.replace_range(local(0, 50, 9), DataGen(2));
+        assert!(err.is_err());
+        // Inner island.
+        let err = m.replace_range(local(25, 50, 9), DataGen(2));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn replace_range_keeps_adjacent_extents_without_misjudging_overlap() {
+        // Two UfsRanges adjacent: [0,50) and [50,100). Insert Local at [50,100)
+        // must NOT split the first one (it's merely adjacent, not overlapping).
+        let m = Manifest {
+            inode: 1,
+            gen: DataGen(1),
+            size: 100,
+            extents: vec![ufs_range(0, 50), ufs_range(50, 50)],
+        };
+        let m2 = m
+            .replace_range(local(50, 50, 9), DataGen(2))
+            .expect("adjacent not overlap");
+        assert_eq!(m2.extents.len(), 2);
+        assert_eq!(m2.extents[0].offset(), 0);
+        assert_eq!(m2.extents[0].len(), 50);
+        assert!(matches!(m2.extents[1], Extent::Local { .. }));
+    }
+
+    #[test]
+    fn replace_range_extends_size_when_beyond_eof() {
+        let m = Manifest {
+            inode: 1,
+            gen: DataGen(1),
+            size: 100,
+            extents: vec![ufs_range(0, 100)],
+        };
+        let m2 = m
+            .replace_range(local(50, 200, 9), DataGen(2))
+            .expect("extend ok");
+        assert_eq!(m2.size, 250);
+        // Head [0,50), new Local [50,250).
+        assert_eq!(m2.extents.len(), 2);
+    }
+
+    #[test]
+    fn replace_range_into_empty_manifest_inserts() {
+        let m = Manifest::empty(1, DataGen(1));
+        let m2 = m
+            .replace_range(local(0, 100, 9), DataGen(2))
+            .expect("insert ok");
+        assert_eq!(m2.extents.len(), 1);
+        assert_eq!(m2.size, 100);
+    }
+
+    #[test]
+    fn replace_range_rejects_zero_len() {
+        let m = Manifest::empty(1, DataGen(1));
+        let err = m.replace_range(local(0, 0, 9), DataGen(2));
+        assert!(err.is_err());
     }
 }
