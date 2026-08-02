@@ -2,8 +2,8 @@
 
 use crate::store::MetaStore;
 use fluxfs_proto::meta::v1::{
-    CreateRequest, GetInodeRequest, GetManifestRequest, LookupRequest, PutInodeRequest,
-    PutManifestRequest, ReaddirRequest, UnlinkRequest,
+    CommitInodeManifestRequest, CreateRequest, GetInodeRequest, GetManifestRequest, LookupRequest,
+    PutInodeRequest, PutManifestRequest, ReaddirRequest, UnlinkRequest,
 };
 use fluxfs_proto::meta_codec::{
     decode_dentries, decode_inode, decode_manifest, encode_inode, encode_manifest,
@@ -154,6 +154,29 @@ impl MetaStore for RemoteMetaStore {
             .map_err(flux_from_status)?
             .into_inner();
         Ok(ManifestId(resp.manifest_id))
+    }
+
+    fn commit_inode_manifest(
+        &self,
+        expected_generation: u64,
+        inode: &Inode,
+        manifest: &Manifest,
+    ) -> Result<Inode> {
+        let inode_json = encode_inode(inode)?;
+        let manifest_json = encode_manifest(manifest)?;
+        let mut c = self.client()?;
+        let resp = self
+            .block_on(async {
+                c.commit_inode_manifest(CommitInodeManifestRequest {
+                    expected_generation,
+                    inode_json,
+                    manifest_json,
+                })
+                .await
+            })
+            .map_err(flux_from_status)?
+            .into_inner();
+        decode_inode(&resp.inode_json)
     }
 
     fn get_manifest(&self, id: ManifestId) -> Result<Manifest> {

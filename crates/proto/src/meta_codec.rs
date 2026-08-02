@@ -67,8 +67,27 @@ pub fn flux_from_status(status: tonic::Status) -> FluxError {
         tonic::Code::InvalidArgument => FluxError::InvalidArg(status.message().to_string()),
         tonic::Code::ResourceExhausted => FluxError::Capability(status.message().to_string()),
         tonic::Code::Unavailable => FluxError::Busy,
+        tonic::Code::FailedPrecondition => parse_failed_precondition(status.message()),
         _ => FluxError::Meta(status.to_string()),
     }
+}
+
+fn parse_failed_precondition(msg: &str) -> FluxError {
+    // Matches `FluxError::CasFailed` Display: "CAS failed: expected=X actual=Y"
+    if let Some(rest) = msg.strip_prefix("CAS failed: expected=") {
+        if let Some((e, a)) = rest.split_once(" actual=") {
+            if let (Ok(expected), Ok(actual)) = (e.parse::<u64>(), a.parse::<u64>()) {
+                return FluxError::CasFailed { expected, actual };
+            }
+        }
+    }
+    if msg.contains("dirty conflict") {
+        return FluxError::DirtyConflict;
+    }
+    if msg.contains("read-only") {
+        return FluxError::ReadOnly;
+    }
+    FluxError::Meta(msg.to_string())
 }
 
 pub fn inode_response(inode: &Inode) -> FluxResult<v1::GetInodeResponse> {

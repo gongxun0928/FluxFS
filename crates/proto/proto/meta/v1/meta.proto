@@ -12,6 +12,8 @@ service MetaService {
   rpc Readdir(ReaddirRequest) returns (ReaddirResponse);
   rpc PutInode(PutInodeRequest) returns (PutInodeResponse);
   rpc PutManifest(PutManifestRequest) returns (PutManifestResponse);
+  // Atomically store a new manifest and CAS-update the inode head.
+  rpc CommitInodeManifest(CommitInodeManifestRequest) returns (CommitInodeManifestResponse);
   rpc GetManifest(GetManifestRequest) returns (GetManifestResponse);
   rpc Unlink(UnlinkRequest) returns (UnlinkResponse);
   rpc Ping(PingRequest) returns (PingResponse);
@@ -47,6 +49,16 @@ message PutInodeResponse {}
 
 message PutManifestRequest { bytes manifest_json = 1; }
 message PutManifestResponse { uint64 manifest_id = 1; }
+
+message CommitInodeManifestRequest {
+  uint64 expected_generation = 1;
+  bytes inode_json = 2;
+  bytes manifest_json = 3;
+}
+message CommitInodeManifestResponse {
+  bytes inode_json = 1;
+  uint64 manifest_id = 2;
+}
 
 message GetManifestRequest { uint64 id = 1; }
 message GetManifestResponse { bytes manifest_json = 1; }

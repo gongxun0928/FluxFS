@@ -191,6 +191,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commit_inode_manifest_via_raft_cas() {
+        use fluxfs_types::{DataGen, Manifest};
+
+        let dir = tempdir().unwrap();
+        let store = Arc::new(HeedMetaStore::open(dir.path().join("meta")).unwrap());
+        let raft = start_single_voter(store.clone(), dir.path().join("raft"), "127.0.0.1:0")
+            .await
+            .expect("start raft");
+
+        let created = match raft
+            .client_write(MetaRaftRequest::Create {
+                parent: ROOT_INODE,
+                name: "cas.bin".into(),
+                file_type: FileType::Regular,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            })
+            .await
+            .expect("create")
+            .data
+        {
+            MetaRaftResponse::Inode(inode) => *inode,
+            other => panic!("unexpected create: {other:?}"),
+        };
+
+        let base_gen = created.generation;
+        let mut next = created.clone();
+        next.generation = base_gen.saturating_add(1);
+        next.size = 8;
+        next.head_gen = DataGen(1);
+        let manifest = Manifest {
+            inode: created.id,
+            gen: DataGen(1),
+            size: 8,
+            extents: Vec::new(),
+        };
+        let committed = match raft
+            .client_write(MetaRaftRequest::CommitInodeManifest {
+                expected_generation: base_gen,
+                inode: Box::new(next.clone()),
+                manifest: Box::new(manifest.clone()),
+            })
+            .await
+            .expect("commit")
+            .data
+        {
+            MetaRaftResponse::Inode(inode) => *inode,
+            other => panic!("unexpected commit: {other:?}"),
+        };
+        assert_eq!(committed.generation, base_gen + 1);
+        assert!(committed.manifest_id.is_some());
+
+        let cas_fail = raft
+            .client_write(MetaRaftRequest::CommitInodeManifest {
+                expected_generation: base_gen,
+                inode: Box::new(next),
+                manifest: Box::new(manifest),
+            })
+            .await
+            .expect("cas reaches sm");
+        match cas_fail.data {
+            MetaRaftResponse::Err(FluxError::CasFailed { expected, actual }) => {
+                assert_eq!(expected, base_gen);
+                assert_eq!(actual, base_gen + 1);
+            }
+            other => panic!("expected CasFailed, got {other:?}"),
+        }
+        assert_eq!(
+            store.get_inode(created.id).unwrap().generation,
+            base_gen + 1
+        );
+    }
+
+    #[tokio::test]
     async fn snapshot_roundtrip_restores_inodes() {
         let dir = tempdir().unwrap();
         let store = Arc::new(HeedMetaStore::open(dir.path().join("meta")).unwrap());

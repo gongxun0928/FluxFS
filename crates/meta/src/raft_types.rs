@@ -38,6 +38,13 @@ pub enum MetaRaftRequest {
     PutManifest {
         manifest: Box<Manifest>,
     },
+    /// Store `manifest`, CAS `inode.generation == expected_generation`, then
+    /// publish the updated inode head in the same SM apply / heed write txn.
+    CommitInodeManifest {
+        expected_generation: u64,
+        inode: Box<Inode>,
+        manifest: Box<Manifest>,
+    },
     Unlink {
         parent: u64,
         name: String,

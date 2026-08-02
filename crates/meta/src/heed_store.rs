@@ -215,6 +215,21 @@ impl HeedMetaStore {
                     Err(e) => MetaRaftResponse::Err(e),
                 }
             }
+            MetaRaftRequest::CommitInodeManifest {
+                expected_generation,
+                inode,
+                manifest,
+            } => {
+                match self.commit_inode_manifest_in_txn(
+                    &mut wtxn,
+                    *expected_generation,
+                    inode.as_ref(),
+                    manifest.as_ref(),
+                ) {
+                    Ok(inode) => MetaRaftResponse::Inode(Box::new(inode)),
+                    Err(e) => MetaRaftResponse::Err(e),
+                }
+            }
             MetaRaftRequest::Unlink { parent, name } => {
                 match self.unlink_in_txn(&mut wtxn, *parent, name) {
                     Ok(()) => MetaRaftResponse::Empty,
@@ -484,6 +499,39 @@ impl HeedMetaStore {
         Ok(id)
     }
 
+    fn commit_inode_manifest_in_txn(
+        &self,
+        wtxn: &mut heed::RwTxn,
+        expected_generation: u64,
+        inode: &Inode,
+        manifest: &Manifest,
+    ) -> Result<Inode> {
+        if manifest.inode != inode.id {
+            return Err(FluxError::InvalidArg(
+                "manifest.inode must match inode.id".into(),
+            ));
+        }
+        let current_bytes = self
+            .inodes
+            .get(wtxn, &inode_key(inode.id))
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+            .ok_or(FluxError::NotFound)?
+            .to_vec();
+        let current: Inode =
+            serde_json::from_slice(&current_bytes).map_err(|e| FluxError::Meta(e.to_string()))?;
+        if current.generation != expected_generation {
+            return Err(FluxError::CasFailed {
+                expected: expected_generation,
+                actual: current.generation,
+            });
+        }
+        let mid = self.put_manifest_in_txn(wtxn, manifest)?;
+        let mut next = inode.clone();
+        next.manifest_id = Some(mid);
+        put_inode_raw(&self.inodes, wtxn, &next)?;
+        Ok(next)
+    }
+
     fn unlink_in_txn(&self, wtxn: &mut heed::RwTxn, parent: InodeId, name: &str) -> Result<()> {
         let parent_bytes = self
             .inodes
@@ -743,13 +791,29 @@ impl MetaStore for HeedMetaStore {
             .env
             .write_txn()
             .map_err(|e| FluxError::Meta(e.to_string()))?;
-        let id = self.alloc_manifest_id(&mut wtxn)?;
-        let bytes = serde_json::to_vec(manifest).map_err(|e| FluxError::Meta(e.to_string()))?;
-        self.manifests
-            .put(&mut wtxn, &inode_key(id.0), &bytes)
-            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        let id = self.put_manifest_in_txn(&mut wtxn, manifest)?;
         wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
         Ok(id)
+    }
+
+    fn commit_inode_manifest(
+        &self,
+        expected_generation: u64,
+        inode: &Inode,
+        manifest: &Manifest,
+    ) -> Result<Inode> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| FluxError::Meta("write lock poisoned".into()))?;
+        let mut wtxn = self
+            .env
+            .write_txn()
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        let next =
+            self.commit_inode_manifest_in_txn(&mut wtxn, expected_generation, inode, manifest)?;
+        wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
+        Ok(next)
     }
 
     fn get_manifest(&self, id: ManifestId) -> Result<Manifest> {
@@ -865,5 +929,46 @@ mod tests {
         let entries = store.readdir(ROOT_INODE).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "hello.txt");
+    }
+
+    #[test]
+    fn commit_inode_manifest_cas_and_atomicity() {
+        use fluxfs_types::{DataGen, Manifest};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = HeedMetaStore::open(dir.path()).unwrap();
+        let file = store
+            .create(ROOT_INODE, "a.bin", FileType::Regular, 0o644, 0, 0)
+            .unwrap();
+        let base_gen = file.generation;
+
+        let mut next = file.clone();
+        next.size = 4;
+        next.generation = base_gen.saturating_add(1);
+        next.head_gen = DataGen(1);
+        let manifest = Manifest {
+            inode: file.id,
+            gen: DataGen(1),
+            size: 4,
+            extents: Vec::new(),
+        };
+        let committed = store
+            .commit_inode_manifest(base_gen, &next, &manifest)
+            .expect("first commit");
+        assert_eq!(committed.generation, base_gen + 1);
+        let mid = committed.manifest_id.expect("manifest id");
+        assert_eq!(store.get_manifest(mid).unwrap().size, 4);
+
+        let stale = store.commit_inode_manifest(base_gen, &next, &manifest);
+        assert_eq!(
+            stale.unwrap_err(),
+            FluxError::CasFailed {
+                expected: base_gen,
+                actual: base_gen + 1
+            }
+        );
+        // Head must remain the successful commit.
+        assert_eq!(store.get_inode(file.id).unwrap().generation, base_gen + 1);
+        assert_eq!(store.get_inode(file.id).unwrap().manifest_id, Some(mid));
     }
 }

@@ -31,6 +31,19 @@ pub trait MetaStore: Send + Sync {
     /// Persist an immutable manifest snapshot; returns its allocated id.
     fn put_manifest(&self, manifest: &Manifest) -> Result<ManifestId>;
 
+    /// Atomically allocate+store `manifest` and CAS-update `inode` head.
+    ///
+    /// Succeeds only when the durable inode's `generation` equals
+    /// `expected_generation`. On success the returned inode has `manifest_id`
+    /// filled; on CAS failure returns [`fluxfs_types::FluxError::CasFailed`]
+    /// and leaves the previous head untouched.
+    fn commit_inode_manifest(
+        &self,
+        expected_generation: u64,
+        inode: &Inode,
+        manifest: &Manifest,
+    ) -> Result<Inode>;
+
     fn get_manifest(&self, id: ManifestId) -> Result<Manifest>;
 
     /// Unlink name from parent directory (inode/chunk GC deferred).

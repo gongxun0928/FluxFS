@@ -4,10 +4,11 @@ use fluxfs_meta::{
     start_single_voter, FluxRaft, HeedMetaStore, MetaRaftRequest, MetaRaftResponse, MetaStore,
 };
 use fluxfs_proto::meta::v1::{
-    CreateRequest, CreateResponse, GetInodeRequest, GetInodeResponse, GetManifestRequest,
-    GetManifestResponse, LookupRequest, LookupResponse, PingRequest, PingResponse, PutInodeRequest,
-    PutInodeResponse, PutManifestRequest, PutManifestResponse, ReaddirRequest, ReaddirResponse,
-    UnlinkRequest, UnlinkResponse,
+    CommitInodeManifestRequest, CommitInodeManifestResponse, CreateRequest, CreateResponse,
+    GetInodeRequest, GetInodeResponse, GetManifestRequest, GetManifestResponse, LookupRequest,
+    LookupResponse, PingRequest, PingResponse, PutInodeRequest, PutInodeResponse,
+    PutManifestRequest, PutManifestResponse, ReaddirRequest, ReaddirResponse, UnlinkRequest,
+    UnlinkResponse,
 };
 use fluxfs_proto::meta_codec::{
     decode_inode, decode_manifest, encode_dentries, encode_inode, encode_manifest,
@@ -173,6 +174,31 @@ impl MetaService for MetaSvc {
             .await?;
         let id = Self::map_resp_manifest_id(resp)?;
         Ok(Response::new(PutManifestResponse { manifest_id: id }))
+    }
+
+    async fn commit_inode_manifest(
+        &self,
+        req: Request<CommitInodeManifestRequest>,
+    ) -> Result<Response<CommitInodeManifestResponse>, Status> {
+        let r = req.into_inner();
+        let inode = decode_inode(&r.inode_json).map_err(status_from_flux)?;
+        let manifest = decode_manifest(&r.manifest_json).map_err(status_from_flux)?;
+        let resp = self
+            .write(MetaRaftRequest::CommitInodeManifest {
+                expected_generation: r.expected_generation,
+                inode: Box::new(inode),
+                manifest: Box::new(manifest),
+            })
+            .await?;
+        let inode = Self::map_resp_inode(resp)?;
+        let manifest_id = inode
+            .manifest_id
+            .ok_or_else(|| Status::internal("commit missing manifest_id"))?
+            .0;
+        Ok(Response::new(CommitInodeManifestResponse {
+            inode_json: encode_inode(&inode).map_err(status_from_flux)?,
+            manifest_id,
+        }))
     }
 
     async fn get_manifest(
