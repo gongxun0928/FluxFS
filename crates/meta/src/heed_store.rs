@@ -12,6 +12,7 @@ use openraft::BasicNode;
 use openraft::StoredMembership;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::io::{Read, Seek, Write};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -55,6 +56,8 @@ pub struct MetaSnapshotData {
 }
 
 pub struct HeedMetaStore {
+    /// On-disk MetaStore directory (also hosts `raft-snapshots/`).
+    path: std::path::PathBuf,
     env: Env,
     inodes: InodeDb,
     dentries: DentryDb,
@@ -187,6 +190,7 @@ impl HeedMetaStore {
         wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
 
         Ok(Self {
+            path: path.as_ref().to_path_buf(),
             env,
             inodes,
             dentries,
@@ -567,6 +571,14 @@ impl HeedMetaStore {
         Ok(())
     }
 
+    pub fn data_dir(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn snapshot_dir(&self) -> std::path::PathBuf {
+        self.path.join("raft-snapshots")
+    }
+
     pub fn export_snapshot(&self, sm: &SmAppliedMeta) -> Result<MetaSnapshotData> {
         let rtxn = self
             .env
@@ -779,6 +791,287 @@ impl HeedMetaStore {
         self.put_sm_meta_raw(&mut wtxn, &snap.sm)?;
         wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
         Ok(())
+    }
+
+    /// Stream SM state into a seekable file (no full in-memory `MetaSnapshotData`).
+    pub fn export_snapshot_to_path(&self, sm: &SmAppliedMeta, path: &Path) -> Result<()> {
+        use crate::snapshot_stream::{write_magic_and_version, write_record, SnapshotRecord};
+
+        let mut file = std::fs::File::create(path).map_err(|e| FluxError::Io(e.to_string()))?;
+        write_magic_and_version(&mut file)?;
+
+        let rtxn = self
+            .env
+            .read_txn()
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        let next_inode = u64_from_bytes(
+            self.meta
+                .get(&rtxn, "next_inode")
+                .map_err(|e| FluxError::Meta(e.to_string()))?
+                .ok_or_else(|| FluxError::Meta("missing next_inode".into()))?,
+        )?;
+        let next_manifest = u64_from_bytes(
+            self.meta
+                .get(&rtxn, "next_manifest")
+                .map_err(|e| FluxError::Meta(e.to_string()))?
+                .ok_or_else(|| FluxError::Meta("missing next_manifest".into()))?,
+        )?;
+        let gc_lease = self.gc_lease_in_txn(&rtxn)?;
+        write_record(
+            &mut file,
+            &SnapshotRecord::Header {
+                next_inode,
+                next_manifest,
+                sm: sm.clone(),
+                gc_lease,
+            },
+        )?;
+
+        let iter = self
+            .inodes
+            .iter(&rtxn)
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        for item in iter {
+            let (_k, v) = item.map_err(|e| FluxError::Meta(e.to_string()))?;
+            let inode: Inode =
+                serde_json::from_slice(v).map_err(|e| FluxError::Meta(e.to_string()))?;
+            write_record(&mut file, &SnapshotRecord::Inode(Box::new(inode)))?;
+        }
+
+        let diter = self
+            .dentries
+            .iter(&rtxn)
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        for item in diter {
+            let (key, val) = item.map_err(|e| FluxError::Meta(e.to_string()))?;
+            let (parent_hex, name) = key
+                .split_once('\0')
+                .ok_or_else(|| FluxError::Meta("bad dentry key".into()))?;
+            let parent =
+                u64::from_str_radix(parent_hex, 16).map_err(|e| FluxError::Meta(e.to_string()))?;
+            write_record(
+                &mut file,
+                &SnapshotRecord::Dentry(Dentry {
+                    parent,
+                    name: name.to_string(),
+                    child: u64_from_bytes(val)?,
+                }),
+            )?;
+        }
+
+        let miter = self
+            .manifests
+            .iter(&rtxn)
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        for item in miter {
+            let (k, v) = item.map_err(|e| FluxError::Meta(e.to_string()))?;
+            let id = u64_from_bytes(k)?;
+            let manifest: Manifest =
+                serde_json::from_slice(v).map_err(|e| FluxError::Meta(e.to_string()))?;
+            write_record(
+                &mut file,
+                &SnapshotRecord::Manifest {
+                    id,
+                    manifest: Box::new(manifest),
+                },
+            )?;
+        }
+
+        let riter = self
+            .client_requests
+            .iter(&rtxn)
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        for item in riter {
+            let (k, v) = item.map_err(|e| FluxError::Meta(e.to_string()))?;
+            let resp: MetaRaftResponse =
+                serde_json::from_slice(v).map_err(|e| FluxError::Meta(e.to_string()))?;
+            write_record(
+                &mut file,
+                &SnapshotRecord::ClientRequest {
+                    id: k.to_string(),
+                    resp,
+                },
+            )?;
+        }
+
+        for reservation in self.list_reservations_in_txn(&rtxn)? {
+            write_record(&mut file, &SnapshotRecord::Reservation(reservation))?;
+        }
+        for tombstone in self.list_tombstones_in_txn(&rtxn)? {
+            write_record(&mut file, &SnapshotRecord::DeleteTombstone(tombstone))?;
+        }
+        drop(rtxn);
+
+        write_record(&mut file, &SnapshotRecord::End)?;
+        file.flush().map_err(|e| FluxError::Io(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Install from a seekable snapshot file (streaming v1 or legacy JSON).
+    ///
+    /// Returns the SM markers embedded in the snapshot payload.
+    pub fn install_snapshot_from_reader(
+        &self,
+        reader: &mut (impl Read + Seek),
+    ) -> Result<SmAppliedMeta> {
+        use crate::snapshot_stream::{detect_format, SnapshotFormat};
+
+        match detect_format(reader)? {
+            SnapshotFormat::LegacyJson => {
+                let mut data = Vec::new();
+                reader
+                    .read_to_end(&mut data)
+                    .map_err(|e| FluxError::Io(e.to_string()))?;
+                let snap: MetaSnapshotData =
+                    serde_json::from_slice(&data).map_err(|e| FluxError::Meta(e.to_string()))?;
+                let sm = snap.sm.clone();
+                self.install_snapshot_data(&snap)?;
+                Ok(sm)
+            }
+            SnapshotFormat::StreamingV1 => self.install_streaming_snapshot(reader),
+        }
+    }
+
+    fn install_streaming_snapshot(&self, reader: &mut (impl Read + Seek)) -> Result<SmAppliedMeta> {
+        use crate::snapshot_stream::{read_record, SnapshotRecord};
+
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| FluxError::Meta("write lock poisoned".into()))?;
+        let mut wtxn = self
+            .env
+            .write_txn()
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+
+        // Clear existing app DBs (same as install_snapshot_data).
+        {
+            let keys: Vec<Vec<u8>> = self
+                .inodes
+                .iter(&wtxn)
+                .map_err(|e| FluxError::Meta(e.to_string()))?
+                .map(|i| i.map(|(k, _)| k.to_vec()))
+                .collect::<std::result::Result<_, _>>()
+                .map_err(|e| FluxError::Meta(e.to_string()))?;
+            for k in keys {
+                self.inodes
+                    .delete(&mut wtxn, &k)
+                    .map_err(|e| FluxError::Meta(e.to_string()))?;
+            }
+        }
+        {
+            let keys: Vec<String> = self
+                .dentries
+                .iter(&wtxn)
+                .map_err(|e| FluxError::Meta(e.to_string()))?
+                .map(|i| i.map(|(k, _)| k.to_string()))
+                .collect::<std::result::Result<_, _>>()
+                .map_err(|e| FluxError::Meta(e.to_string()))?;
+            for k in keys {
+                self.dentries
+                    .delete(&mut wtxn, &k)
+                    .map_err(|e| FluxError::Meta(e.to_string()))?;
+            }
+        }
+        {
+            let keys: Vec<Vec<u8>> = self
+                .manifests
+                .iter(&wtxn)
+                .map_err(|e| FluxError::Meta(e.to_string()))?
+                .map(|i| i.map(|(k, _)| k.to_vec()))
+                .collect::<std::result::Result<_, _>>()
+                .map_err(|e| FluxError::Meta(e.to_string()))?;
+            for k in keys {
+                self.manifests
+                    .delete(&mut wtxn, &k)
+                    .map_err(|e| FluxError::Meta(e.to_string()))?;
+            }
+        }
+        {
+            let keys: Vec<String> = self
+                .client_requests
+                .iter(&wtxn)
+                .map_err(|e| FluxError::Meta(e.to_string()))?
+                .map(|i| i.map(|(k, _)| k.to_string()))
+                .collect::<std::result::Result<_, _>>()
+                .map_err(|e| FluxError::Meta(e.to_string()))?;
+            for k in keys {
+                self.client_requests
+                    .delete(&mut wtxn, &k)
+                    .map_err(|e| FluxError::Meta(e.to_string()))?;
+            }
+        }
+        self.clear_meta_prefix_in_txn(&mut wtxn, RESERVATION_PREFIX)?;
+        self.clear_meta_prefix_in_txn(&mut wtxn, TOMBSTONE_PREFIX)?;
+
+        let mut header_sm = None;
+        let mut saw_end = false;
+        while let Some(record) = read_record(reader)? {
+            match record {
+                SnapshotRecord::Header {
+                    next_inode,
+                    next_manifest,
+                    sm,
+                    gc_lease,
+                } => {
+                    self.meta
+                        .put(&mut wtxn, "next_inode", &u64_bytes(next_inode))
+                        .map_err(|e| FluxError::Meta(e.to_string()))?;
+                    self.meta
+                        .put(&mut wtxn, "next_manifest", &u64_bytes(next_manifest))
+                        .map_err(|e| FluxError::Meta(e.to_string()))?;
+                    match gc_lease {
+                        Some(lease) => self
+                            .meta
+                            .put(&mut wtxn, KEY_GC_LEASE, &u64_bytes(lease.0))
+                            .map_err(|e| FluxError::Meta(e.to_string()))?,
+                        None => {
+                            let _ = self.meta.delete(&mut wtxn, KEY_GC_LEASE);
+                        }
+                    }
+                    self.put_sm_meta_raw(&mut wtxn, &sm)?;
+                    header_sm = Some(sm);
+                }
+                SnapshotRecord::Inode(inode) => {
+                    put_inode_raw(&self.inodes, &mut wtxn, &inode)?;
+                }
+                SnapshotRecord::Dentry(d) => {
+                    self.dentries
+                        .put(
+                            &mut wtxn,
+                            &dentry_key(d.parent, &d.name),
+                            &u64_bytes(d.child),
+                        )
+                        .map_err(|e| FluxError::Meta(e.to_string()))?;
+                }
+                SnapshotRecord::Manifest { id, manifest } => {
+                    let bytes = serde_json::to_vec(&manifest)
+                        .map_err(|e| FluxError::Meta(e.to_string()))?;
+                    self.manifests
+                        .put(&mut wtxn, &inode_key(id), &bytes)
+                        .map_err(|e| FluxError::Meta(e.to_string()))?;
+                }
+                SnapshotRecord::ClientRequest { id, resp } => {
+                    self.put_client_request_in_txn(&mut wtxn, &id, &resp)?;
+                }
+                SnapshotRecord::Reservation(reservation) => {
+                    self.put_reservation_in_txn(&mut wtxn, &reservation)?;
+                }
+                SnapshotRecord::DeleteTombstone(tombstone) => {
+                    self.put_tombstone_in_txn(&mut wtxn, &tombstone)?;
+                }
+                SnapshotRecord::End => {
+                    saw_end = true;
+                    break;
+                }
+            }
+        }
+        if !saw_end {
+            return Err(FluxError::Meta("snapshot missing End record".into()));
+        }
+        let sm = header_sm.ok_or_else(|| FluxError::Meta("snapshot missing Header".into()))?;
+        wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
+        Ok(sm)
     }
 
     /// Load parent directory, optional generation CAS, then bump generation/mtime.
@@ -3050,5 +3343,59 @@ mod tests {
         assert!(batch.removed_manifests >= 1);
         assert_eq!(batch.tombstoned_chunks, vec![chunk]);
         assert_eq!(store.get_manifest(mid), Err(FluxError::NotFound));
+    }
+
+    #[test]
+    fn streaming_snapshot_round_trip() {
+        use crate::snapshot_stream::SNAPSHOT_MAGIC;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = HeedMetaStore::open(dir.path()).unwrap();
+        for i in 0..48 {
+            store
+                .create(
+                    ROOT_INODE,
+                    &format!("stream-{i}.bin"),
+                    FileType::Regular,
+                    0o644,
+                    0,
+                    0,
+                )
+                .unwrap();
+        }
+        let snap_path = dir.path().join("stream.snap");
+        store
+            .export_snapshot_to_path(&SmAppliedMeta::default(), &snap_path)
+            .unwrap();
+        let bytes = std::fs::read(&snap_path).unwrap();
+        assert!(bytes.starts_with(SNAPSHOT_MAGIC));
+
+        let restored_dir = tempfile::tempdir().unwrap();
+        let restored = HeedMetaStore::open(restored_dir.path()).unwrap();
+        let mut file = std::fs::File::open(&snap_path).unwrap();
+        restored.install_snapshot_from_reader(&mut file).unwrap();
+        for i in 0..48 {
+            restored
+                .lookup(ROOT_INODE, &format!("stream-{i}.bin"))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn legacy_json_snapshot_still_installs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HeedMetaStore::open(dir.path()).unwrap();
+        store
+            .create(ROOT_INODE, "legacy.txt", FileType::Regular, 0o644, 0, 0)
+            .unwrap();
+        let snap = store.export_snapshot(&SmAppliedMeta::default()).unwrap();
+        let path = dir.path().join("legacy.json");
+        std::fs::write(&path, serde_json::to_vec(&snap).unwrap()).unwrap();
+
+        let restored_dir = tempfile::tempdir().unwrap();
+        let restored = HeedMetaStore::open(restored_dir.path()).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        restored.install_snapshot_from_reader(&mut file).unwrap();
+        restored.lookup(ROOT_INODE, "legacy.txt").unwrap();
     }
 }

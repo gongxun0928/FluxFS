@@ -12,6 +12,7 @@ mod raft_sm;
 mod raft_types;
 mod remote;
 mod schema;
+mod snapshot_stream;
 mod store;
 
 #[cfg(test)]

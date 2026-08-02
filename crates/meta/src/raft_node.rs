@@ -339,16 +339,28 @@ mod tests {
         .expect("create");
 
         let sm = MetaStateMachine::new(store.clone()).expect("sm");
-        let snapshot = {
+        let mut snapshot = {
             use openraft::storage::RaftSnapshotBuilder;
             let mut builder = sm.clone();
             builder.build_snapshot().await.expect("build snapshot")
         };
-        assert!(snapshot.snapshot.get_ref().len() > 20);
-        assert!(!snapshot
+        use tokio::io::AsyncReadExt;
+        let expected = crate::snapshot_stream::SNAPSHOT_MAGIC;
+        let mut magic = vec![0u8; expected.len()];
+        snapshot
             .snapshot
-            .get_ref()
-            .starts_with(b"fluxfs-meta-snapshot"));
+            .read_exact(&mut magic)
+            .await
+            .expect("read snapshot magic");
+        assert_eq!(magic.as_slice(), expected);
+        // Rewind for install_snapshot.
+        use std::io::SeekFrom;
+        use tokio::io::AsyncSeekExt;
+        snapshot
+            .snapshot
+            .seek(SeekFrom::Start(0))
+            .await
+            .expect("rewind snapshot");
 
         // Wipe app state then install snapshot.
         let empty = Arc::new(HeedMetaStore::open(dir.path().join("meta2")).unwrap());

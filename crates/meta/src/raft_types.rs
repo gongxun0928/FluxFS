@@ -3,17 +3,15 @@
 //! Single-voter bring-up: mutating MetaStore ops are logged as [`MetaRaftRequest`]
 //! and applied into [`crate::HeedMetaStore`]. Reads stay on Heed directly.
 
+use fluxfs_types::{
+    ChunkId, FileType, FlushId, FlushIntent, FluxError, GcBatch, GcLeaseId, GcPlan, Inode,
+    Manifest, RequestOpId, UfsObject, WorkerTargetId, WriteTicketId,
+};
 use openraft::declare_raft_types;
 use openraft::BasicNode;
 use openraft::LogId;
 use openraft::StoredMembership;
 use serde::{Deserialize, Serialize};
-use std::io::Cursor;
-
-use fluxfs_types::{
-    ChunkId, FileType, FlushId, FlushIntent, FluxError, GcBatch, GcLeaseId, GcPlan, Inode,
-    Manifest, RequestOpId, UfsObject, WorkerTargetId, WriteTicketId,
-};
 
 pub type NodeId = u64;
 
@@ -240,7 +238,7 @@ declare_raft_types!(
         NodeId = NodeId,
         Node = BasicNode,
         Entry = openraft::Entry<FluxRaftTypeConfig>,
-        SnapshotData = Cursor<Vec<u8>>,
+        SnapshotData = tokio::fs::File,
         AsyncRuntime = openraft::TokioRuntime,
 );
 
