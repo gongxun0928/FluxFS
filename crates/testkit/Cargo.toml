@@ -1,0 +1,18 @@
+[package]
+name = "fluxfs-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Deterministic fault, model, and benchmark scaffolding for FluxFS"
+
+[features]
+default = []
+failpoints = ["fail/failpoints"]
+
+[dependencies]
+fail = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+

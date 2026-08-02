@@ -1,0 +1,18 @@
+[package]
+name = "fluxfs-ufs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "UFS adapter over OpenDAL (prefetch / parallel Range later)"
+
+[dependencies]
+fluxfs-types = { workspace = true }
+opendal = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

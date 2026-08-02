@@ -1,0 +1,12 @@
+[package]
+name = "fluxfs-fuse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "FUSE mount skeleton (W1: types + placeholder filesystem)"
+
+[dependencies]
+fluxfs-types = { workspace = true }
+fluxfs-client = { workspace = true }
+fuser = { workspace = true }
+tracing = { workspace = true }

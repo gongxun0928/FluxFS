@@ -1,0 +1,23 @@
+[package]
+name = "fluxfs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "FluxFS co-located binary (MetaMaster + ChunkWorker + CLI)"
+
+[[bin]]
+name = "fluxfs"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+fluxfs-chunk = { workspace = true }
+fluxfs-client = { workspace = true }
+fluxfs-fuse = { workspace = true }
+fluxfs-meta = { workspace = true }
+fluxfs-types = { workspace = true }
+fluxfs-ufs = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

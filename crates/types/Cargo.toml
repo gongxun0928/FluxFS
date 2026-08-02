@@ -1,0 +1,11 @@
+[package]
+name = "fluxfs-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared FluxFS types (inode, dentry, locality, chunk ids)"
+
+[dependencies]
+blake3 = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }

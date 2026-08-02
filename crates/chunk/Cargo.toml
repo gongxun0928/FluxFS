@@ -1,0 +1,19 @@
+[package]
+name = "fluxfs-chunk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ChunkWorker: ChunkStore trait + disk/foyer backends"
+
+[dependencies]
+fluxfs-types = { workspace = true }
+blake3 = { workspace = true }
+foyer = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
