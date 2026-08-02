@@ -216,6 +216,7 @@ impl MetaStore for RaftMetaStore {
             inode,
             expected_generation,
             chunks: chunks.to_vec(),
+            expires_at_unix_ms: crate::write_reservation_deadline(),
         })?)
     }
 
@@ -223,6 +224,14 @@ impl MetaStore for RaftMetaStore {
         Self::map_empty(self.write(MetaRaftRequest::AbortChunkReservation {
             request_id: Some(RequestOpId::random()),
             ticket,
+        })?)
+    }
+
+    fn expire_chunk_reservations(&self, max_to_expire: usize) -> Result<()> {
+        Self::map_empty(self.write(MetaRaftRequest::ExpireChunkReservations {
+            request_id: None,
+            cutoff_unix_ms: crate::unix_time_millis(),
+            max_to_expire: max_to_expire.try_into().unwrap_or(u64::MAX),
         })?)
     }
 

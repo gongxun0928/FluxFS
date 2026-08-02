@@ -16,6 +16,7 @@ service MetaService {
   rpc CommitInodeManifest(CommitInodeManifestRequest) returns (CommitInodeManifestResponse);
   rpc ReserveChunks(ReserveChunksRequest) returns (ReserveChunksResponse);
   rpc AbortChunkReservation(AbortChunkReservationRequest) returns (AbortChunkReservationResponse);
+  rpc ExpireChunkReservations(ExpireChunkReservationsRequest) returns (ExpireChunkReservationsResponse);
   rpc CommitInodeManifestReserved(CommitInodeManifestReservedRequest) returns (CommitInodeManifestResponse);
   rpc TombstoneGcBatch(TombstoneGcBatchRequest) returns (TombstoneGcBatchResponse);
   rpc ListGcTombstones(ListGcTombstonesRequest) returns (ListGcTombstonesResponse);
@@ -89,6 +90,8 @@ message ReserveChunksRequest {
 message ReserveChunksResponse {}
 message AbortChunkReservationRequest { uint64 ticket = 1; string request_id = 2; }
 message AbortChunkReservationResponse {}
+message ExpireChunkReservationsRequest { uint64 max_to_expire = 1; }
+message ExpireChunkReservationsResponse {}
 message CommitInodeManifestReservedRequest {
   uint64 ticket = 1;
   uint64 expected_generation = 2;

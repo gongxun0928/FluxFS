@@ -293,6 +293,7 @@ impl HeedMetaStore {
                     inode,
                     expected_generation,
                     chunks,
+                    expires_at_unix_ms,
                     ..
                 } => match self.reserve_chunks_in_txn(
                     &mut wtxn,
@@ -300,6 +301,7 @@ impl HeedMetaStore {
                     *inode,
                     *expected_generation,
                     chunks,
+                    *expires_at_unix_ms,
                 ) {
                     Ok(()) => MetaRaftResponse::Empty,
                     Err(e) => MetaRaftResponse::Err(e),
@@ -310,6 +312,18 @@ impl HeedMetaStore {
                         Err(e) => MetaRaftResponse::Err(e),
                     }
                 }
+                MetaRaftRequest::ExpireChunkReservations {
+                    cutoff_unix_ms,
+                    max_to_expire,
+                    ..
+                } => match self.expire_reservations_in_txn(
+                    &mut wtxn,
+                    *cutoff_unix_ms,
+                    usize::try_from(*max_to_expire).unwrap_or(usize::MAX),
+                ) {
+                    Ok(_) => MetaRaftResponse::Empty,
+                    Err(e) => MetaRaftResponse::Err(e),
+                },
                 MetaRaftRequest::CommitInodeManifestReserved {
                     ticket,
                     expected_generation,
@@ -1156,6 +1170,7 @@ impl HeedMetaStore {
         inode: InodeId,
         expected_generation: u64,
         chunks: &[ChunkId],
+        expires_at_unix_ms: u64,
     ) -> Result<()> {
         let current = get_inode_raw(&self.inodes, txn, inode)?;
         check_generation(&current, expected_generation)?;
@@ -1177,6 +1192,7 @@ impl HeedMetaStore {
             inode,
             expected_generation,
             chunks,
+            expires_at_unix_ms,
         };
         if let Some(existing) = self.reservation_in_txn(txn, ticket)? {
             return if existing == reservation {
@@ -1197,6 +1213,28 @@ impl HeedMetaStore {
             .delete(txn, &reservation_key(ticket))
             .map_err(|e| FluxError::Meta(e.to_string()))?;
         Ok(())
+    }
+
+    fn expire_reservations_in_txn(
+        &self,
+        txn: &mut heed::RwTxn<'_>,
+        cutoff_unix_ms: u64,
+        max_to_expire: usize,
+    ) -> Result<usize> {
+        if max_to_expire == 0 {
+            return Ok(0);
+        }
+        let mut expired = self
+            .list_reservations_in_txn(txn)?
+            .into_iter()
+            .filter(|reservation| reservation.expires_at_unix_ms <= cutoff_unix_ms)
+            .collect::<Vec<_>>();
+        expired.sort_by_key(|reservation| (reservation.expires_at_unix_ms, reservation.ticket.0));
+        expired.truncate(max_to_expire);
+        for reservation in &expired {
+            self.abort_reservation_in_txn(txn, reservation.ticket)?;
+        }
+        Ok(expired.len())
     }
 
     fn commit_reserved_in_txn(
@@ -1691,12 +1729,27 @@ impl MetaStore for HeedMetaStore {
         chunks: &[ChunkId],
     ) -> Result<()> {
         self.with_write_txn(|store, txn| {
-            store.reserve_chunks_in_txn(txn, ticket, inode, expected_generation, chunks)
+            store.reserve_chunks_in_txn(
+                txn,
+                ticket,
+                inode,
+                expected_generation,
+                chunks,
+                crate::write_reservation_deadline(),
+            )
         })
     }
 
     fn abort_chunk_reservation(&self, ticket: WriteTicketId) -> Result<()> {
         self.with_write_txn(|store, txn| store.abort_reservation_in_txn(txn, ticket))
+    }
+
+    fn expire_chunk_reservations(&self, max_to_expire: usize) -> Result<()> {
+        self.with_write_txn(|store, txn| {
+            store
+                .expire_reservations_in_txn(txn, crate::unix_time_millis(), max_to_expire)
+                .map(|_| ())
+        })
     }
 
     fn commit_inode_manifest_reserved_with_id(
@@ -2296,6 +2349,108 @@ mod tests {
     }
 
     #[test]
+    fn abandoned_reservations_expire_deterministically_and_fence_late_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HeedMetaStore::open(dir.path()).unwrap();
+        let file = store
+            .create(ROOT_INODE, "expiry", FileType::Regular, 0o644, 0, 0)
+            .unwrap();
+        let first = ChunkId::from_bytes(b"expires-first");
+        let second = ChunkId::from_bytes(b"expires-second");
+        let first_ticket = WriteTicketId(200);
+        let second_ticket = WriteTicketId(201);
+        for (ticket, chunk) in [(first_ticket, first), (second_ticket, second)] {
+            store
+                .with_write_txn(|store, txn| {
+                    store.reserve_chunks_in_txn(txn, ticket, file.id, file.generation, &[chunk], 10)
+                })
+                .unwrap();
+        }
+
+        store
+            .with_write_txn(|store, txn| {
+                assert_eq!(store.expire_reservations_in_txn(txn, 9, 10)?, 0);
+                Ok(())
+            })
+            .unwrap();
+        assert!(store
+            .tombstone_gc_batch(&[first, second])
+            .unwrap()
+            .tombstoned_chunks
+            .is_empty());
+
+        store
+            .with_write_txn(|store, txn| {
+                assert_eq!(store.expire_reservations_in_txn(txn, 10, 1)?, 1);
+                Ok(())
+            })
+            .unwrap();
+        assert!(store
+            .reservation_in_txn(&store.env.read_txn().unwrap(), first_ticket)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .reservation_in_txn(&store.env.read_txn().unwrap(), second_ticket)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            store
+                .tombstone_gc_batch(&[first, second])
+                .unwrap()
+                .tombstoned_chunks,
+            vec![first]
+        );
+
+        let snapshot = store.export_snapshot(&SmAppliedMeta::default()).unwrap();
+        let restored_dir = tempfile::tempdir().unwrap();
+        let restored = HeedMetaStore::open(restored_dir.path()).unwrap();
+        restored.install_snapshot_data(&snapshot).unwrap();
+        let restored_reservation = restored
+            .reservation_in_txn(&restored.env.read_txn().unwrap(), second_ticket)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored_reservation.expires_at_unix_ms, 10);
+        restored
+            .with_write_txn(|store, txn| {
+                assert_eq!(store.expire_reservations_in_txn(txn, 10, 10)?, 1);
+                Ok(())
+            })
+            .unwrap();
+
+        let mut next = file.clone();
+        next.generation += 1;
+        next.head_gen = DataGen(2);
+        next.size = 1;
+        let manifest = Manifest {
+            inode: file.id,
+            gen: DataGen(2),
+            size: 1,
+            extents: vec![Extent::Local {
+                offset: 0,
+                len: 1,
+                chunk: second,
+            }],
+        };
+        assert!(matches!(
+            restored.commit_inode_manifest_reserved_with_id(
+                RequestOpId::random(),
+                second_ticket,
+                file.generation,
+                &next,
+                &manifest,
+            ),
+            Err(FluxError::Busy)
+        ));
+        assert_eq!(
+            restored
+                .tombstone_gc_batch(&[second])
+                .unwrap()
+                .tombstoned_chunks,
+            vec![second]
+        );
+    }
+
+    #[test]
     fn import_external_atomic_file_and_dir() {
         let dir = tempfile::tempdir().unwrap();
         let store = HeedMetaStore::open(dir.path()).unwrap();
@@ -2570,10 +2725,7 @@ mod tests {
         let mid = committed.manifest_id.expect("manifest");
 
         store.unlink(ROOT_INODE, "victim.bin").unwrap();
-        assert!(matches!(
-            store.get_inode(file.id),
-            Err(FluxError::NotFound)
-        ));
+        assert!(matches!(store.get_inode(file.id), Err(FluxError::NotFound)));
         assert!(matches!(
             store.lookup(ROOT_INODE, "victim.bin"),
             Err(FluxError::NotFound)

@@ -3,26 +3,27 @@ use clap::Parser;
 use fluxfs_meta::{
     start_single_voter, FluxRaft, HeedMetaStore, MetaRaftRequest, MetaRaftResponse, MetaStore,
 };
+use fluxfs_metrics::{spawn_prometheus, FluxMetrics};
 use fluxfs_proto::meta::v1::{
     AbortChunkReservationRequest, AbortChunkReservationResponse, BeginFlushRequest,
     BeginFlushResponse, BeginGcRequest, BeginGcResponse, CommitFlushRequest, CommitFlushResponse,
     CommitInodeManifestRequest, CommitInodeManifestReservedRequest, CommitInodeManifestResponse,
     CreateRequest, CreateResponse, CurrentGcPlanRequest, CurrentGcPlanResponse,
-    FailFlushConflictRequest, FailFlushConflictResponse, FinalizeGcTombstonesRequest,
-    FinalizeGcTombstonesResponse, FinishGcRequest, FinishGcResponse, GetInodeRequest,
-    GetInodeResponse, GetManifestRequest, GetManifestResponse, ImportExternalRequest,
-    ImportExternalResponse, ListFlushIntentsRequest, ListFlushIntentsResponse,
-    ListGcTombstonesRequest, ListGcTombstonesResponse, LookupRequest, LookupResponse, PingRequest,
-    PingResponse, PutInodeRequest, PutInodeResponse, PutManifestRequest, PutManifestResponse,
-    ReaddirRequest, ReaddirResponse, ReserveChunksRequest, ReserveChunksResponse,
-    TombstoneGcBatchRequest, TombstoneGcBatchResponse, UnlinkRequest, UnlinkResponse,
+    ExpireChunkReservationsRequest, ExpireChunkReservationsResponse, FailFlushConflictRequest,
+    FailFlushConflictResponse, FinalizeGcTombstonesRequest, FinalizeGcTombstonesResponse,
+    FinishGcRequest, FinishGcResponse, GetInodeRequest, GetInodeResponse, GetManifestRequest,
+    GetManifestResponse, ImportExternalRequest, ImportExternalResponse, ListFlushIntentsRequest,
+    ListFlushIntentsResponse, ListGcTombstonesRequest, ListGcTombstonesResponse, LookupRequest,
+    LookupResponse, PingRequest, PingResponse, PutInodeRequest, PutInodeResponse,
+    PutManifestRequest, PutManifestResponse, ReaddirRequest, ReaddirResponse, ReserveChunksRequest,
+    ReserveChunksResponse, TombstoneGcBatchRequest, TombstoneGcBatchResponse, UnlinkRequest,
+    UnlinkResponse,
 };
 use fluxfs_proto::meta_codec::{
     decode_chunk_ids, decode_flush_intent, decode_inode, decode_manifest, decode_ufs_object,
     encode_chunk_ids, encode_dentries, encode_flush_intents, encode_gc_batch, encode_gc_plan,
     encode_inode, encode_manifest, file_type_from_wire, status_from_flux,
 };
-use fluxfs_metrics::{spawn_prometheus, FluxMetrics};
 use fluxfs_proto::{MetaService, MetaServiceServer};
 use fluxfs_types::{FlushId, FluxError, GcLeaseId, ManifestId, RequestOpId, WriteTicketId};
 use std::net::SocketAddr;
@@ -72,7 +73,10 @@ impl MetaSvc {
         Ok(resp.data)
     }
 
-    fn map_resp_inode(&self, resp: MetaRaftResponse) -> std::result::Result<fluxfs_types::Inode, Status> {
+    fn map_resp_inode(
+        &self,
+        resp: MetaRaftResponse,
+    ) -> std::result::Result<fluxfs_types::Inode, Status> {
         match resp {
             MetaRaftResponse::Inode(inode) => Ok(*inode),
             MetaRaftResponse::Err(err) => {
@@ -283,6 +287,7 @@ impl MetaService for MetaSvc {
                 inode: r.inode,
                 expected_generation: r.expected_generation,
                 chunks: decode_chunk_ids(&r.chunks_json).map_err(status_from_flux)?,
+                expires_at_unix_ms: fluxfs_meta::write_reservation_deadline(),
             })
             .await?;
         self.map_resp_empty(response)?;
@@ -302,6 +307,22 @@ impl MetaService for MetaSvc {
             .await?;
         self.map_resp_empty(response)?;
         Ok(Response::new(AbortChunkReservationResponse {}))
+    }
+
+    async fn expire_chunk_reservations(
+        &self,
+        req: Request<ExpireChunkReservationsRequest>,
+    ) -> Result<Response<ExpireChunkReservationsResponse>, Status> {
+        let r = req.into_inner();
+        let response = self
+            .write(MetaRaftRequest::ExpireChunkReservations {
+                request_id: None,
+                cutoff_unix_ms: fluxfs_meta::unix_time_millis(),
+                max_to_expire: r.max_to_expire,
+            })
+            .await?;
+        self.map_resp_empty(response)?;
+        Ok(Response::new(ExpireChunkReservationsResponse {}))
     }
 
     async fn commit_inode_manifest_reserved(

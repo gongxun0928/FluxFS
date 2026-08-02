@@ -92,6 +92,10 @@ pub trait MetaStore: Send + Sync {
 
     fn abort_chunk_reservation(&self, ticket: WriteTicketId) -> Result<()>;
 
+    /// Expire a bounded number of abandoned tickets. The implementation must
+    /// embed its sampled cutoff in the replicated command.
+    fn expire_chunk_reservations(&self, max_to_expire: usize) -> Result<()>;
+
     fn commit_inode_manifest_reserved_with_id(
         &self,
         op_id: RequestOpId,

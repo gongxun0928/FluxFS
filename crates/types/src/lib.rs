@@ -81,6 +81,11 @@ pub struct ChunkReservation {
     pub inode: InodeId,
     pub expected_generation: u64,
     pub chunks: Vec<ChunkId>,
+    /// Leader-selected Unix deadline carried in the replicated command.
+    /// State-machine apply never reads a local clock. Zero safely expires
+    /// reservations restored from snapshots written before this field existed.
+    #[serde(default)]
+    pub expires_at_unix_ms: u64,
 }
 
 /// One bounded concurrent-GC batch. Tombstones fence new reservations while

@@ -4,10 +4,11 @@ use crate::store::MetaStore;
 use fluxfs_proto::meta::v1::{
     AbortChunkReservationRequest, BeginFlushRequest, BeginGcRequest, CommitFlushRequest,
     CommitInodeManifestRequest, CommitInodeManifestReservedRequest, CreateRequest,
-    CurrentGcPlanRequest, FailFlushConflictRequest, FinalizeGcTombstonesRequest, FinishGcRequest,
-    GetInodeRequest, GetManifestRequest, ImportExternalRequest, ListFlushIntentsRequest,
-    ListGcTombstonesRequest, LookupRequest, PutInodeRequest, PutManifestRequest, ReaddirRequest,
-    ReserveChunksRequest, TombstoneGcBatchRequest, UnlinkRequest,
+    CurrentGcPlanRequest, ExpireChunkReservationsRequest, FailFlushConflictRequest,
+    FinalizeGcTombstonesRequest, FinishGcRequest, GetInodeRequest, GetManifestRequest,
+    ImportExternalRequest, ListFlushIntentsRequest, ListGcTombstonesRequest, LookupRequest,
+    PutInodeRequest, PutManifestRequest, ReaddirRequest, ReserveChunksRequest,
+    TombstoneGcBatchRequest, UnlinkRequest,
 };
 use fluxfs_proto::meta_codec::{
     decode_chunk_ids, decode_dentries, decode_flush_intents, decode_gc_batch, decode_gc_plan,
@@ -219,6 +220,18 @@ impl MetaStore for RemoteMetaStore {
             c.abort_chunk_reservation(AbortChunkReservationRequest {
                 ticket: ticket.0,
                 request_id: RequestOpId::random().to_hex(),
+            })
+            .await
+        })
+        .map_err(flux_from_status)?;
+        Ok(())
+    }
+
+    fn expire_chunk_reservations(&self, max_to_expire: usize) -> Result<()> {
+        let mut c = self.client()?;
+        self.block_on(async {
+            c.expire_chunk_reservations(ExpireChunkReservationsRequest {
+                max_to_expire: max_to_expire.try_into().unwrap_or(u64::MAX),
             })
             .await
         })

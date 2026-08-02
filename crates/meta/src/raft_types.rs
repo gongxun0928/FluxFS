@@ -69,11 +69,19 @@ pub enum MetaRaftRequest {
         inode: u64,
         expected_generation: u64,
         chunks: Vec<ChunkId>,
+        #[serde(default)]
+        expires_at_unix_ms: u64,
     },
     AbortChunkReservation {
         #[serde(default)]
         request_id: Option<RequestOpId>,
         ticket: WriteTicketId,
+    },
+    ExpireChunkReservations {
+        #[serde(default)]
+        request_id: Option<RequestOpId>,
+        cutoff_unix_ms: u64,
+        max_to_expire: u64,
     },
     CommitInodeManifestReserved {
         #[serde(default)]
@@ -159,6 +167,7 @@ impl MetaRaftRequest {
             | Self::CommitInodeManifest { request_id, .. }
             | Self::ReserveChunks { request_id, .. }
             | Self::AbortChunkReservation { request_id, .. }
+            | Self::ExpireChunkReservations { request_id, .. }
             | Self::CommitInodeManifestReserved { request_id, .. }
             | Self::TombstoneGcBatch { request_id, .. }
             | Self::FinalizeGcTombstones { request_id, .. }
@@ -180,6 +189,7 @@ impl MetaRaftRequest {
             | Self::CommitInodeManifest { request_id, .. }
             | Self::ReserveChunks { request_id, .. }
             | Self::AbortChunkReservation { request_id, .. }
+            | Self::ExpireChunkReservations { request_id, .. }
             | Self::CommitInodeManifestReserved { request_id, .. }
             | Self::TombstoneGcBatch { request_id, .. }
             | Self::FinalizeGcTombstones { request_id, .. }

@@ -305,6 +305,9 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
             ));
         }
         let mut report = OrphanGcReport::default();
+        // Expiration is bounded by the same scheduler budget. Late writers are
+        // fenced because reserved commit requires the ticket to still exist.
+        self.meta.expire_chunk_reservations(batch_size)?;
         let pending = self.meta.list_gc_tombstones()?;
         if !pending.is_empty() {
             let batch = &pending[..pending.len().min(batch_size)];
