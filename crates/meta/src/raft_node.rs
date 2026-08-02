@@ -88,7 +88,7 @@ mod tests {
     use super::*;
     use crate::raft_types::{MetaRaftRequest, MetaRaftResponse};
     use crate::store::MetaStore;
-    use fluxfs_types::{FileType, ROOT_INODE};
+    use fluxfs_types::{FileType, WorkerRegistration, WorkerTargetId, ROOT_INODE};
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -374,5 +374,37 @@ mod tests {
             .expect("restored from snapshot");
         let _ = sm; // keep first sm alive until after build
         raft.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn worker_registration_is_replicated_and_deduplicated() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(HeedMetaStore::open(dir.path().join("meta")).unwrap());
+        let raft = start_single_voter(store.clone(), dir.path().join("raft"), "127.0.0.1:0")
+            .await
+            .expect("start raft");
+        let registration = WorkerRegistration {
+            id: WorkerTargetId(71),
+            endpoint: "http://127.0.0.1:5071".into(),
+            failure_domain: "rack-7".into(),
+            capacity_bytes: 10_000,
+            available_bytes: 9_000,
+            lease_deadline_ms: 1_000,
+        };
+        let request = MetaRaftRequest::RegisterWorker {
+            request_id: Some(fluxfs_types::RequestOpId::random()),
+            registration,
+        };
+        let first = raft.client_write(request.clone()).await.unwrap().data;
+        let replay = raft.client_write(request).await.unwrap().data;
+        let MetaRaftResponse::WorkerMembership(first) = first else {
+            panic!("expected membership response");
+        };
+        let MetaRaftResponse::WorkerMembership(replay) = replay else {
+            panic!("expected replayed membership response");
+        };
+        assert_eq!(first, replay);
+        assert_eq!(store.worker_membership().unwrap(), *first);
+        raft.shutdown().await.unwrap();
     }
 }

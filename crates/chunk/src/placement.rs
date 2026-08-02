@@ -54,8 +54,10 @@ fn placement_score(chunk: &ChunkId, worker: &WorkerRegistration) -> u128 {
     input.extend_from_slice(&worker.id.0.to_be_bytes());
     let digest = blake3::hash(&input);
     let raw = u64::from_be_bytes(digest.as_bytes()[..8].try_into().expect("eight bytes"));
-    u128::from(raw) * u128::from(worker.available_bytes.saturating_add(1))
-        / u128::from(worker.capacity_bytes)
+    // Absolute available bytes are the weight. Using only free percentage
+    // would make a 1 TiB and a 1 GiB Worker equally likely at the same fill
+    // ratio and would not actually be capacity-aware.
+    u128::from(raw) * u128::from(worker.available_bytes)
 }
 
 #[cfg(test)]
@@ -112,5 +114,28 @@ mod tests {
             select_worker_targets(&membership, &chunk, 2, 10),
             Err(FluxError::Busy)
         );
+    }
+
+    #[test]
+    fn placement_biases_toward_absolute_available_capacity() {
+        let membership = WorkerMembership {
+            epoch: 1,
+            workers: vec![
+                WorkerRegistration {
+                    capacity_bytes: 1_000 * CHUNK_SIZE,
+                    available_bytes: 900 * CHUNK_SIZE,
+                    ..worker(1, "large", 90 * CHUNK_SIZE, 100)
+                },
+                worker(2, "small", 90 * CHUNK_SIZE, 100),
+            ],
+        };
+        let large = (0..1_000u64)
+            .filter(|seed| {
+                let chunk = ChunkId::from_bytes(&seed.to_be_bytes());
+                select_worker_targets(&membership, &chunk, 1, 10).unwrap()[0].id
+                    == WorkerTargetId(1)
+            })
+            .count();
+        assert!(large > 800, "large Worker selected only {large}/1000");
     }
 }

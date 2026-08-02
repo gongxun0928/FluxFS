@@ -190,7 +190,9 @@ impl RemoteReplicatedChunkStore {
             .active_at(now_ms)
             .map(|worker| (worker.id, worker.endpoint.clone()))
             .collect();
-        let endpoint = if meta_endpoint.starts_with("http://") || meta_endpoint.starts_with("https://") {
+        let endpoint = if meta_endpoint.starts_with("http://")
+            || meta_endpoint.starts_with("https://")
+        {
             meta_endpoint
         } else if tls.is_some() {
             format!("https://{meta_endpoint}")
@@ -254,7 +256,17 @@ impl RemoteReplicatedChunkStore {
             .map_err(|error| FluxError::Io(format!("spawn chunk RPC thread: {error}")))?;
         let gc_thread = thread::Builder::new()
             .name("fluxfs-chunk-gc-rpc".into())
-            .spawn(move || rpc_loop(gc_channels, membership, meta_endpoint, tls_cfg, insecure_dev, required, gc_receiver))
+            .spawn(move || {
+                rpc_loop(
+                    gc_channels,
+                    membership,
+                    meta_endpoint,
+                    tls_cfg,
+                    insecure_dev,
+                    required,
+                    gc_receiver,
+                )
+            })
             .map_err(|error| FluxError::Io(format!("spawn chunk GC RPC thread: {error}")))?;
 
         let scrub_stop = Arc::new(AtomicBool::new(false));
@@ -466,18 +478,29 @@ fn rpc_loop(
                         })
                 });
                 if let Ok(refreshed) = refreshed {
-                    if membership.as_ref() != Some(&refreshed) {
+                    let desired = refreshed
+                        .active_at(unix_time_millis())
+                        .map(|worker| worker.id)
+                        .collect::<BTreeSet<_>>();
+                    let current = clients.iter().map(|client| client.id).collect();
+                    let routing_changed = membership
+                        .as_ref()
+                        .is_none_or(|old| old.epoch != refreshed.epoch)
+                        || desired != current;
+                    if routing_changed {
                         if let Ok(next_clients) = worker_clients_from_membership(
                             &refreshed,
                             tls_cfg.as_ref(),
                             insecure_dev,
                         ) {
                             clients = next_clients;
-                            membership = Some(refreshed);
                             last_healthy.clear();
                             repair_cursor = None;
                         }
                     }
+                    // Lease-only heartbeats extend liveness without forcing
+                    // channel rebuilds or topology-wide repair.
+                    membership = Some(refreshed);
                 }
             }
         }
@@ -806,9 +829,7 @@ async fn all_chunks_page(
     })
 }
 
-async fn healthy_workers(
-    clients: &mut [WorkerRpcClient],
-) -> Result<BTreeMap<u64, usize>> {
+async fn healthy_workers(clients: &mut [WorkerRpcClient]) -> Result<BTreeMap<u64, usize>> {
     let mut healthy = BTreeMap::new();
     for (index, client) in clients.iter_mut().enumerate() {
         if let Ok(response) = client.client.health(HealthRequest {}).await {

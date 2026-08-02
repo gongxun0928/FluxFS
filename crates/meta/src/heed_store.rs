@@ -267,8 +267,7 @@ impl HeedMetaStore {
         txn: &mut heed::RwTxn<'_>,
         membership: &WorkerMembership,
     ) -> Result<()> {
-        let bytes =
-            serde_json::to_vec(membership).map_err(|e| FluxError::Meta(e.to_string()))?;
+        let bytes = serde_json::to_vec(membership).map_err(|e| FluxError::Meta(e.to_string()))?;
         self.meta
             .put(txn, KEY_WORKER_MEMBERSHIP, &bytes)
             .map_err(|e| FluxError::Meta(e.to_string()))
@@ -281,9 +280,11 @@ impl HeedMetaStore {
     ) -> Result<WorkerMembership> {
         registration.validate()?;
         let mut membership = self.worker_membership_in_txn(txn)?;
-        if membership.workers.iter().any(|worker| {
-            worker.id != registration.id && worker.endpoint == registration.endpoint
-        }) {
+        if membership
+            .workers
+            .iter()
+            .any(|worker| worker.id != registration.id && worker.endpoint == registration.endpoint)
+        {
             return Err(FluxError::InvalidArg(format!(
                 "worker endpoint {} is already registered to another id",
                 registration.endpoint
@@ -372,9 +373,7 @@ impl HeedMetaStore {
             match req {
                 MetaRaftRequest::RegisterWorker { registration, .. } => {
                     match self.register_worker_in_txn(&mut wtxn, registration) {
-                        Ok(membership) => {
-                            MetaRaftResponse::WorkerMembership(Box::new(membership))
-                        }
+                        Ok(membership) => MetaRaftResponse::WorkerMembership(Box::new(membership)),
                         Err(e) => MetaRaftResponse::Err(e),
                     }
                 }
@@ -3509,7 +3508,10 @@ mod tests {
 
         worker.lease_deadline_ms = 200;
         let heartbeat = store.register_worker(&worker).unwrap();
-        assert_eq!(heartbeat.epoch, 1, "lease-only heartbeat must not churn placement");
+        assert_eq!(
+            heartbeat.epoch, 1,
+            "lease-only heartbeat must not churn placement"
+        );
         worker.failure_domain = "rack-b".into();
         worker.lease_deadline_ms = 300;
         let moved = store.register_worker(&worker).unwrap();

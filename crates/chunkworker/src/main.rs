@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use fluxfs_chunk::{ChunkStore, DiskChunkStore};
-use fluxfs_metrics::{spawn_prometheus, FluxMetrics};
 use fluxfs_meta::{MetaStore, RemoteMetaStore};
+use fluxfs_metrics::{spawn_prometheus, FluxMetrics};
 use fluxfs_proto::chunk::v1::{
     ContainsChunkRequest, ContainsChunkResponse, DeleteChunkRequest, DeleteChunkResponse,
     GetChunkRequest, GetChunkResponse, HealthRequest, HealthResponse, ListChunksRequest,

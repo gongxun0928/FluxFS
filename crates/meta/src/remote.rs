@@ -7,9 +7,9 @@ use fluxfs_proto::meta::v1::{
     CreateRequest, CurrentGcPlanRequest, ExpireChunkReservationsRequest, FailFlushConflictRequest,
     FinalizeGcTombstonesRequest, FinishGcRequest, GetInodeRequest, GetManifestRequest,
     GetWorkerMembershipRequest, ImportExternalRequest, InitializeGcDeleteTargetsRequest,
-    ListFlushIntentsRequest,
-    ListGcTombstonesRequest, LookupRequest, PutInodeRequest, PutManifestRequest, ReaddirRequest,
-    RegisterWorkerRequest, ReserveChunksRequest, TombstoneGcBatchRequest, UnlinkRequest,
+    ListFlushIntentsRequest, ListGcTombstonesRequest, LookupRequest, PutInodeRequest,
+    PutManifestRequest, ReaddirRequest, RegisterWorkerRequest, ReserveChunksRequest,
+    TombstoneGcBatchRequest, UnlinkRequest,
 };
 use fluxfs_proto::meta_codec::{
     decode_dentries, decode_flush_intents, decode_gc_batch, decode_gc_plan, decode_gc_tombstones,
