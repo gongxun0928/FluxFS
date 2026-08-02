@@ -56,6 +56,14 @@ start_worker0() {
     wait_port "$worker0_port"
 }
 
+start_meta() {
+    "$repo_dir/target/debug/fluxfs-metamaster" \
+        --listen "127.0.0.1:$meta_port" --data-dir "$test_root/meta" \
+        >"$test_root/meta.log" 2>&1 &
+    meta_pid=$!
+    wait_port "$meta_port"
+}
+
 start_mount() {
     "$repo_dir/target/debug/fluxfs" mount --no-ufs \
         --data-dir "$test_root/client" --mountpoint "$mount_dir" \
@@ -84,11 +92,7 @@ mkdir -p "$mount_dir"
 cargo build --manifest-path "$repo_dir/Cargo.toml" \
     -p fluxfs -p fluxfs-metamaster -p fluxfs-chunkworker
 
-"$repo_dir/target/debug/fluxfs-metamaster" \
-    --listen "127.0.0.1:$meta_port" --data-dir "$test_root/meta" \
-    >"$test_root/meta.log" 2>&1 &
-meta_pid=$!
-
+start_meta
 start_worker0
 "$repo_dir/target/debug/fluxfs-chunkworker" \
     --worker-id 1 --listen "127.0.0.1:$worker1_port" \
@@ -99,7 +103,6 @@ worker1_pid=$!
     --data-dir "$test_root/worker-2" >"$test_root/worker-2.log" 2>&1 &
 worker2_pid=$!
 
-wait_port "$meta_port"
 wait_port "$worker1_port"
 wait_port "$worker2_port"
 start_mount
@@ -124,6 +127,19 @@ test "$(cat "$mount_dir/durable.txt")" = "multiprocess durable"
 
 start_worker0
 printf 'repaired-service\n' >>"$mount_dir/durable.txt"
+test "$(tail -n 1 "$mount_dir/durable.txt")" = "repaired-service"
+
+# MetaMaster is a separate process too. Before OpenRaft HA lands, killing it
+# makes metadata-dependent reads unavailable; reopening the same heed state
+# restores service through tonic channel reconnection without remounting.
+kill "$meta_pid"
+wait "$meta_pid" 2>/dev/null || true
+meta_pid=""
+if cat "$mount_dir/durable.txt" >/dev/null 2>&1; then
+    echo "read unexpectedly succeeded with MetaMaster down" >&2
+    exit 1
+fi
+start_meta
 test "$(tail -n 1 "$mount_dir/durable.txt")" = "repaired-service"
 
 fusermount3 -u "$mount_dir"
