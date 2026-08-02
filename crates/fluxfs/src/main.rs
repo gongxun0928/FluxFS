@@ -102,9 +102,17 @@ enum Cmd {
     /// authz interceptor: a worker cert dialing a worker server hits
     /// for_worker() (admits {Meta, ClientAdmin}) and must be rejected with
     /// PermissionDenied — a real RPC, not Unimplemented from a wrong service.
+    ///
+    /// `--mode put` switches to a PutChunk probe. Combined with a Meta cert
+    /// (admitted by for_worker but lacking the PutChunk capability), this
+    /// verifies the per-handler `require(cap)` table fires after the role-
+    /// level interceptor passes — gpt56 msg ac8ef471 #2.
     ChunkProbe {
         #[arg(long, default_value = "127.0.0.1:50061")]
         addr: String,
+        /// Which RPC to drive: `health` (default) or `put`.
+        #[arg(long, default_value = "health")]
+        mode: String,
         #[command(flatten)]
         tls: TlsClientArgs,
     },
@@ -218,8 +226,8 @@ async fn main() -> Result<()> {
         Cmd::MetaPing { addr, tls } => {
             run_meta_ping(&addr, &tls)?;
         }
-        Cmd::ChunkProbe { addr, tls } => {
-            run_chunk_probe(&addr, &tls).await?;
+        Cmd::ChunkProbe { addr, mode, tls } => {
+            run_chunk_probe(&addr, &mode, &tls).await?;
         }
         Cmd::UfsCheck { key } => {
             run_ufs_check(&key).await?;
@@ -718,7 +726,7 @@ fn run_meta_ping(addr: &str, tls: &TlsClientArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_chunk_probe(addr: &str, tls: &TlsClientArgs) -> Result<()> {
+async fn run_chunk_probe(addr: &str, mode: &str, tls: &TlsClientArgs) -> Result<()> {
     use fluxfs_proto::ChunkWorkerClient;
     use tonic::transport::Endpoint;
 
@@ -746,19 +754,43 @@ async fn run_chunk_probe(addr: &str, tls: &TlsClientArgs) -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("tls_config: {e}"))?;
         }
     }
-    // Connection is lazy; the Health RPC drives the TLS handshake + Phase 3
-    // authz interceptor evaluation.
+    // Connection is lazy; the chosen RPC drives the TLS handshake + Phase 3
+    // authz interceptor + per-handler capability evaluation.
     let mut client = ChunkWorkerClient::new(endpoint.connect_lazy());
-    let resp = client
-        .health(tonic::Request::new(
-            fluxfs_proto::chunk::v1::HealthRequest::default(),
-        ))
-        .await
-        .context("chunk Health RPC")?;
-    let body = resp.into_inner();
-    println!(
-        "chunk-probe ok addr={addr} worker_id={} ready={}",
-        body.worker_id, body.ready
-    );
+    match mode {
+        "health" => {
+            let resp = client
+                .health(tonic::Request::new(
+                    fluxfs_proto::chunk::v1::HealthRequest::default(),
+                ))
+                .await
+                .context("chunk Health RPC")?;
+            let body = resp.into_inner();
+            println!(
+                "chunk-probe ok mode=health addr={addr} worker_id={} ready={}",
+                body.worker_id, body.ready
+            );
+        }
+        "put" => {
+            // 1-byte payload whose ChunkId is derived from the data. We do NOT
+            // expect this to succeed against a real worker when probing a
+            // principal that lacks PutChunk; we surface the RPC error so the
+            // caller (test-mtls-acceptance.sh) can assert on the status code.
+            let payload = vec![0x42u8; 1];
+            let resp = client
+                .put_chunk(tonic::Request::new(
+                    fluxfs_proto::chunk::v1::PutChunkRequest { data: payload },
+                ))
+                .await
+                .context("chunk PutChunk RPC")?;
+            let body = resp.into_inner();
+            println!(
+                "chunk-probe ok mode=put addr={addr} chunk_id_len={} worker_id={}",
+                body.chunk_id.len(),
+                body.worker_id
+            );
+        }
+        other => bail!("--mode must be health|put, got {other:?}"),
+    }
     Ok(())
 }

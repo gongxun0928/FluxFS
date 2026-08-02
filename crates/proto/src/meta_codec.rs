@@ -215,7 +215,22 @@ pub fn flux_from_status(status: tonic::Status) -> FluxError {
         tonic::Code::AlreadyExists => FluxError::AlreadyExists,
         tonic::Code::InvalidArgument => FluxError::InvalidArg(status.message().to_string()),
         tonic::Code::ResourceExhausted => FluxError::Capability(status.message().to_string()),
-        tonic::Code::Unavailable => FluxError::Busy,
+        // Distinguish server-side Busy (round-trip of `Status::unavailable(
+        // "chunk worker busy")` emitted by the chunkworker handler) from
+        // transport-layer Unavailable (TLS handshake failure, connection
+        // reset, etc.). The transport case must preserve the underlying
+        // message — otherwise mTLS rejection at the handshake surfaces as a
+        // misleading "inode busy: op in flight" and acceptance tests cannot
+        // distinguish TLS rejection from server overload (task #30 C1
+        // acceptance hardening, gpt56 ac8ef471).
+        tonic::Code::Unavailable => {
+            let msg = status.message();
+            if msg.contains("chunk worker busy") {
+                FluxError::Busy
+            } else {
+                FluxError::Meta(format!("unavailable: {msg}"))
+            }
+        }
         tonic::Code::FailedPrecondition => FluxError::Meta(status.message().to_string()),
         tonic::Code::Unauthenticated => FluxError::Unauthenticated(status.message().to_string()),
         tonic::Code::PermissionDenied => FluxError::Unauthorized(status.message().to_string()),

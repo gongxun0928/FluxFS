@@ -247,16 +247,19 @@ if "$repo_dir/target/debug/fluxfs" meta-ping \
 fi
 # Sanity-check that the failure is a TLS handshake error, not some unrelated
 # transport issue (port down, wrong CA, etc.). gRPC surfaces handshake
-# failures with one of these substrings.
-if ! grep -qiE "tls|handshake|certificate|alert" "$test_root/no-cert-ping.log"; then
-    echo "    WARN: no-client-cert dial failed but log lacks TLS error marker:" >&2
+# failures with one of these substrings. Hard-fail on absence so a clap
+# parse error or wrong-port failure can't pass as green.
+if ! grep -qiE "tls|handshake|certificate|alert|transport|canceled|cancelled|connection closed" \
+        "$test_root/no-cert-ping.log"; then
+    echo "    FAIL: no-client-cert dial failed but log lacks TLS/transport error marker:" >&2
     cat "$test_root/no-cert-ping.log" >&2
+    exit 1
 fi
 echo "    PASS (no-client-cert rejected at TLS)"
 
 echo "==> [4/5] reject: rogue-CA-signed client cert"
 if "$repo_dir/target/debug/fluxfs" meta-ping \
-        --meta-addr "https://127.0.0.1:$meta_port" \
+        --addr "https://127.0.0.1:$meta_port" \
         --tls-ca-cert "$rogue_dir/rogue-ca.crt" \
         --tls-client-cert "$rogue_dir/rogue-client.crt" \
         --tls-client-key  "$rogue_dir/rogue-client.key" \
@@ -265,12 +268,20 @@ if "$repo_dir/target/debug/fluxfs" meta-ping \
     cat "$test_root/rogue-ping.log" >&2
     exit 1
 fi
+# The failure must surface from TLS trust validation (UnknownIssuer /
+# certificate verification), not from a clap parse error or wrong port.
+if ! grep -qiE "tls|handshake|certificate|alert|transport|canceled|cancelled|connection closed" \
+        "$test_root/rogue-ping.log"; then
+    echo "    FAIL: rogue-CA dial failed without TLS/transport error marker:" >&2
+    cat "$test_root/rogue-ping.log" >&2
+    exit 1
+fi
 echo "    PASS (rogue-CA client rejected at TLS)"
 
 echo "==> [5/5] reject: role-not-admitted (worker-1 cert dialing worker server)"
 # Worker server for_worker() admits only {Meta, ClientAdmin}. A worker-1
 # cert (spiffe://fluxfs/worker/1) is rejected with Code::PermissionDenied
-# AFTER TLS succeeds — this is the Phase 3 authz gate, not TLS.
+# AFTER TLS succeeds — this is the Phase 3 role-level authz gate, not TLS.
 #
 # Real RPC: ChunkWorker.Health via the new `chunk-probe` subcommand. The
 # for_worker() interceptor runs as a Layer over the service, BEFORE method
@@ -297,19 +308,46 @@ if ! grep -qiE "does not have permission|not admitted|lacks|permission denied" \
     cat "$test_root/role-reject.log" >&2
     exit 1
 fi
-echo "    PASS (cross-role dial rejected at Phase 3 authz with PermissionDenied)"
+echo "    PASS (cross-role dial rejected at Phase 3 role-level authz)"
+
+echo "==> [5b/5] reject: role-admitted but per-handler capability denied (Meta cert → Worker PutChunk)"
+# Per gpt56 ac8ef471 #2 / cursor 6e9860c2 #2: role-level admission alone
+# doesn't prove the per-handler `require(cap)` table fires. Drive a real
+# PutChunk RPC with a Meta cert: for_worker() ADMITS Meta (role gate passes),
+# but the put_chunk handler requires Capability::PutChunk, which Meta does
+# NOT hold. The handler-layer require must reject with PermissionDenied.
+if "$repo_dir/target/debug/fluxfs" chunk-probe --mode put \
+        --addr "https://127.0.0.1:$worker1_port" \
+        --tls-ca-cert "$cert_dir/ca.crt" \
+        --tls-client-cert "$cert_dir/meta.crt" \
+        --tls-client-key  "$cert_dir/meta.key" \
+        >"$test_root/cap-reject.log" 2>&1; then
+    echo "    FAIL: Meta cert PutChunk was accepted by worker (capability table not enforced)" >&2
+    cat "$test_root/cap-reject.log" >&2
+    exit 1
+fi
+# Role gate passes; rejection must come from the handler-layer cap check.
+# authz.rs require() emits "lacks <Capability>" in the Status message.
+if ! grep -qiE "lacks putchunk|does not have permission|permission denied" \
+        "$test_root/cap-reject.log"; then
+    echo "    FAIL: Meta PutChunk rejected without per-handler cap marker:" >&2
+    cat "$test_root/cap-reject.log" >&2
+    exit 1
+fi
+echo "    PASS (Meta role admitted, PutChunk capability denied at handler)"
 
 echo "==> [bonus 1] tombstone/delete/finalize: ClientAdmin drives GC under mTLS"
 # gpt56 aa9e8122: ClientAdmin directly dials Worker.delete_chunk during GC
 # sweep and orphan-GC. Without DeleteChunk in ClientAdmin's caps, every GC
 # delete_chunk under mTLS would return PermissionDenied. This exercises the
-# real path: remount client cert (ClientAdmin caps), write+delete a file,
-# then run fluxfs orphan-gc against the live cluster under mTLS and assert
-# it returns success (no PermissionDenied on delete_chunk).
+# real path: remount client cert (ClientAdmin caps), write a chunk-sized
+# file (so it actually allocates chunks), delete it, then run fluxfs
+# orphan-gc against the live cluster under mTLS and assert chunks>=1 were
+# reclaimed via Worker.delete_chunk.
 start_mount_with "$cert_dir/client.crt" "$cert_dir/client.key"
-printf 'gc-target\n' >"$mount_dir/gc-target.txt"
-test "$(cat "$mount_dir/gc-target.txt")" = "gc-target"
-rm -f "$mount_dir/gc-target.txt"
+dd if=/dev/zero of="$mount_dir/gc-target.bin" bs=1M count=2 status=none
+test "$(stat -c %s "$mount_dir/gc-target.bin")" = "2097152"
+rm -f "$mount_dir/gc-target.bin"
 fusermount3 -u "$mount_dir"
 wait "$mount_pid" 2>/dev/null || true
 mount_pid=""
@@ -332,7 +370,19 @@ if grep -qiE "permission denied|unauthenticated" "$test_root/orphan-gc.log"; the
     cat "$test_root/orphan-gc.log" >&2
     exit 1
 fi
-echo "    PASS (ClientAdmin DeleteChunk cap drives GC sweep under mTLS)"
+# Per gpt56 ac8ef471 #3 / cursor 6e9860c2 #3: exit 0 alone is insufficient —
+# if no chunks were swept, DeleteChunk was never exercised and the cap
+# claim is hollow. The CLI prints `orphan-gc ok: manifests=N chunks=M`;
+# require M >= 1 so the test only passes when DeleteChunk actually fired
+# against a worker under mTLS.
+gc_chunks=$(grep -oE 'chunks=[0-9]+' "$test_root/orphan-gc.log" | head -1 | cut -d= -f2)
+gc_chunks=${gc_chunks:-0}
+if (( gc_chunks < 1 )); then
+    echo "    FAIL: orphan-gc swept 0 chunks; DeleteChunk cap not exercised" >&2
+    cat "$test_root/orphan-gc.log" >&2
+    exit 1
+fi
+echo "    PASS (ClientAdmin DeleteChunk cap drove ${gc_chunks} GC delete_chunk(s) under mTLS)"
 
 echo "==> [bonus 2] cert rotation: regenerate client cert under same CA, reconnect"
 # Revoke the client cert by issuing a new one with a different serial. Since
