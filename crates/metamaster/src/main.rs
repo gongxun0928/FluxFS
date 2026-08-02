@@ -247,7 +247,7 @@ fn parse_request_op_id(s: &str) -> Option<RequestOpId> {
 // Minimal hex decode for request ids (lowercase/uppercase).
 mod hex {
     pub fn decode(s: &str) -> Result<Vec<u8>, ()> {
-        if s.len() % 2 != 0 {
+        if !s.len().is_multiple_of(2) {
             return Err(());
         }
         let mut out = Vec::with_capacity(s.len() / 2);

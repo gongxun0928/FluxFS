@@ -5,8 +5,9 @@ use fluxfs_proto::chunk::v1::{
     ContainsChunkRequest, ContainsChunkResponse, GetChunkRequest, GetChunkResponse, HealthRequest,
     HealthResponse, ListChunksRequest, ListChunksResponse, PutChunkRequest, PutChunkResponse,
 };
+use fluxfs_proto::meta_codec::status_from_flux;
 use fluxfs_proto::{ChunkWorker, ChunkWorkerServer};
-use fluxfs_types::{ChunkId, FluxError, CHUNK_SIZE};
+use fluxfs_types::{ChunkId, CHUNK_SIZE};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -109,15 +110,6 @@ impl ChunkWorker for ChunkSvc {
                 .collect(),
             worker_id: self.worker_id,
         }))
-    }
-}
-
-fn status_from_flux(error: FluxError) -> Status {
-    match error {
-        FluxError::NotFound => Status::not_found("chunk not found"),
-        FluxError::InvalidArg(message) => Status::invalid_argument(message),
-        FluxError::Busy => Status::unavailable("chunk worker busy"),
-        other => Status::internal(other.to_string()),
     }
 }
 
