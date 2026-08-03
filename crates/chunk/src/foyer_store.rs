@@ -184,9 +184,8 @@ impl ChunkStore for FoyerChunkStore {
     }
 
     fn contains(&self, id: &ChunkId) -> Result<bool> {
-        if self.cache_contains(id) {
-            return Ok(true);
-        }
+        // Authoritative durability for RF/repair/inventory — foyer is never a
+        // replica source of truth (Clean cache-only entries must not count).
         self.disk.contains(id)
     }
 
@@ -208,6 +207,8 @@ impl ChunkStore for FoyerChunkStore {
     }
 
     fn delete_from_target(&self, id: &ChunkId, target: WorkerTargetId) -> Result<()> {
+        // GC uses this entry point; keep the same dual-clear as delete().
+        self.cache_remove(id);
         self.disk.delete_from_target(id, target)
     }
 }
@@ -296,34 +297,77 @@ mod tests {
         let pack = dir.path().join("pack");
         let foyer_dir = dir.path().join("foyer");
         let cfg = FoyerCacheConfig::new(&foyer_dir, 1024 * 1024, 16 * 1024 * 1024);
+        let payload = vec![7u8; 3 * 1024];
+        let id = ChunkId::from_bytes(&payload);
 
-        let id = {
+        {
             let store = FoyerChunkStore::open(&pack, cfg.clone()).await.unwrap();
-            let payload = vec![7u8; 3 * 1024];
-            let id = ChunkId::from_bytes(&payload);
+            // Cache-only Clean entry — never written to packfile, so a reopen
+            // hit cannot be explained by DiskChunkStore fallback.
             store.cache_clean(&id, &payload);
-            // Also durable so Worker inventory stays consistent.
+            assert!(store.cache_contains(&id));
             let s = Arc::new(store);
             let s2 = Arc::clone(&s);
-            let durable = tokio::task::spawn_blocking(move || s2.put(&payload))
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(durable, id);
+            assert!(
+                !tokio::task::spawn_blocking(move || s2.contains(&id))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                "cache-only Clean must not count as durable contains"
+            );
             s.close_cache().await.unwrap();
-            id
-        };
+        }
 
         let store = FoyerChunkStore::open(&pack, cfg).await.unwrap();
-        // SSD tier recover: cache hit without needing read-through warm first.
-        // (If recover is slow/noop in Quiet mode for tiny devices, disk still works.)
+        assert!(
+            store.cache_contains(&id),
+            "SSD tier must recover Clean entry without packfile"
+        );
         let s = Arc::new(store);
         let s2 = Arc::clone(&s);
         let got = tokio::task::spawn_blocking(move || s2.get(&id))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(got, vec![7u8; 3 * 1024]);
+        assert_eq!(got, payload);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn contains_ignores_cache_only_and_gc_delete_clears_cache() {
+        let (_dir, store) = open_store(0).await;
+        let store = Arc::new(store);
+        let s = Arc::clone(&store);
+        let id = tokio::task::spawn_blocking(move || s.put(b"gc-me"))
+            .await
+            .unwrap()
+            .unwrap();
+        store.cache_clean(&id, b"gc-me");
+        assert!(store.cache_contains(&id));
+        let s = Arc::clone(&store);
+        assert!(tokio::task::spawn_blocking(move || s.contains(&id))
+            .await
+            .unwrap()
+            .unwrap());
+
+        let s = Arc::clone(&store);
+        tokio::task::spawn_blocking(move || {
+            s.delete_from_target(&id, fluxfs_types::WorkerTargetId(0))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!store.cache_contains(&id));
+        let s = Arc::clone(&store);
+        assert!(!tokio::task::spawn_blocking(move || s.contains(&id))
+            .await
+            .unwrap()
+            .unwrap());
+        let s = Arc::clone(&store);
+        let err = tokio::task::spawn_blocking(move || s.get(&id))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(err, FluxError::NotFound));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
