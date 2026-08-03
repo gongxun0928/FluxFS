@@ -4,6 +4,13 @@ use fluxfs_types::{ChunkId, ChunkPage, FluxError, Result, WorkerTargetId};
 pub trait ChunkStore: Send + Sync {
     fn put(&self, data: &[u8]) -> Result<ChunkId>;
     fn get(&self, id: &ChunkId) -> Result<Vec<u8>>;
+    /// Fetch chunk bytes, optionally asking Workers to promote into Clean/hot
+    /// HybridCache (`promote_cache=true`). Default ignores the flag and calls
+    /// [`Self::get`] (local disk / stores without a cache tier).
+    fn get_with_promote(&self, id: &ChunkId, promote_cache: bool) -> Result<Vec<u8>> {
+        let _ = promote_cache;
+        self.get(id)
+    }
     fn contains(&self, id: &ChunkId) -> Result<bool>;
 
     fn list_chunks(&self) -> Result<Vec<ChunkId>> {

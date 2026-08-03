@@ -195,13 +195,14 @@ impl ChunkWorker for ChunkSvc {
         let _permit = self.try_enter().inspect_err(|_status| {
             FluxMetrics::inc(&self.metrics.chunk_rpc_error_total);
         })?;
-        let chunk =
-            ChunkId::try_from(request.into_inner().chunk_id.as_slice()).map_err(|error| {
-                FluxMetrics::inc(&self.metrics.chunk_rpc_error_total);
-                status_from_flux(error)
-            })?;
+        let req = request.into_inner();
+        let promote_cache = req.promote_cache;
+        let chunk = ChunkId::try_from(req.chunk_id.as_slice()).map_err(|error| {
+            FluxMetrics::inc(&self.metrics.chunk_rpc_error_total);
+            status_from_flux(error)
+        })?;
         let store = Arc::clone(&self.store);
-        let data = tokio::task::spawn_blocking(move || store.get(&chunk))
+        let data = tokio::task::spawn_blocking(move || store.get_with_promote(&chunk, promote_cache))
             .await
             .map_err(|error| {
                 FluxMetrics::inc(&self.metrics.chunk_rpc_error_total);

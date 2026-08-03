@@ -47,6 +47,7 @@ enum Command {
     },
     Get {
         id: ChunkId,
+        promote_cache: bool,
         reply: RpcReply<Vec<u8>>,
     },
     Contains {
@@ -378,7 +379,15 @@ impl ChunkStore for RemoteReplicatedChunkStore {
     }
 
     fn get(&self, id: &ChunkId) -> Result<Vec<u8>> {
-        self.call(|reply| Command::Get { id: *id, reply })
+        self.get_with_promote(id, false)
+    }
+
+    fn get_with_promote(&self, id: &ChunkId, promote_cache: bool) -> Result<Vec<u8>> {
+        self.call(|reply| Command::Get {
+            id: *id,
+            promote_cache,
+            reply,
+        })
     }
 
     fn contains(&self, id: &ChunkId) -> Result<bool> {
@@ -699,7 +708,11 @@ async fn handle_command(
             };
             let _ = reply.send(result);
         }
-        Command::Get { id, reply } => {
+        Command::Get {
+            id,
+            promote_cache,
+            reply,
+        } => {
             let mut errors = Vec::new();
             let mut result = None;
             let mut source_worker = None;
@@ -709,6 +722,7 @@ async fn handle_command(
                     .client
                     .get_chunk(GetChunkRequest {
                         chunk_id: id.as_bytes().to_vec(),
+                        promote_cache,
                     })
                     .await
                 {
@@ -1061,6 +1075,7 @@ async fn repair_pass_with_health(
             .client
             .get_chunk(GetChunkRequest {
                 chunk_id: chunk.as_bytes().to_vec(),
+                promote_cache: false,
             })
             .await
             .map_err(rpc_status_error)?

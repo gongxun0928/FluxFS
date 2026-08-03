@@ -190,6 +190,11 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         self.chunks.get(id)
     }
 
+    /// Fetch a chunk, optionally promoting into Worker Clean/hot HybridCache.
+    pub fn get_chunk_with_promote(&self, id: &ChunkId, promote_cache: bool) -> Result<Vec<u8>> {
+        self.chunks.get_with_promote(id, promote_cache)
+    }
+
     /// Flush one Dirty UFS-backed inode through the durable intent protocol.
     /// Ephemeral and already-clean files are already durable at their declared tier.
     pub fn flush_inode(&self, ino: InodeId) -> Result<Inode> {
@@ -786,7 +791,16 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
             let overlap_len = overlap_end - overlap_start;
             let data = match extent {
                 Extent::Local { len, chunk, .. } => {
-                    let chunk_data = self.chunks.get(chunk)?;
+                    // Clean (and Flushing→Clean) local extents may warm Worker
+                    // foyer; Dirty/Ephemeral/Conflict skip so DRAM stays Clean-biased.
+                    let promote_cache = matches!(
+                        inode.locality,
+                        LocalityLabel::Clean | LocalityLabel::External
+                    ) || inode
+                        .locality_fields
+                        .as_ref()
+                        .is_some_and(|f| f.data_state == DataState::UfsClean);
+                    let chunk_data = self.chunks.get_with_promote(chunk, promote_cache)?;
                     if chunk_data.len() as u64 != *len {
                         return Err(FluxError::Io(format!(
                             "chunk len mismatch: meta={len} actual={}",

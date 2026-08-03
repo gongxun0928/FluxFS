@@ -1,14 +1,13 @@
 //! foyer-backed hybrid cache in front of durable [`crate::DiskChunkStore`].
 //!
-//! Architecture (P0-B8 / task #29):
+//! Architecture (P0-B8 / task #29 + #38):
 //! - **DiskChunkStore** remains the authoritative durable store for Dirty
 //!   (and all Worker PutChunk) data. Eviction from the hybrid cache never
 //!   deletes or mutates packfile contents.
-//! - **foyer HybridCache** (DRAM + optional SSD) is v1 **read-through warm**
-//!   on durable `get` hits (content-addressed chunks are immutable, so warming
-//!   Dirty reads is safe). `put` never inserts. Locality-aware Clean-only
-//!   promotion ([`FoyerChunkStore::cache_clean`] from Worker/client) is a
-//!   follow-up — the helper exists for tests and that future wiring.
+//! - **foyer HybridCache** (DRAM + optional SSD) is a Clean/hot tier.
+//!   `put` never inserts. Durable `get` does **not** auto-warm; callers pass
+//!   `promote_cache=true` (via [`ChunkStore::get_with_promote`] / GetChunk RPC)
+//!   for Clean reads so Dirty traffic does not consume foyer DRAM.
 
 use crate::disk::DiskChunkStore;
 use crate::pack::CompactReport;
@@ -70,9 +69,8 @@ impl FoyerChunkStore {
 
     /// Insert bytes into the hybrid cache without touching the packfile.
     ///
-    /// v1 production path only reaches this via [`ChunkStore::get`]
-    /// read-through. Explicit Clean-only promotion from Worker/client is a
-    /// follow-up; until then Dirty and Clean reads share the warm budget.
+    /// Production reaches this when GetChunk sets `promote_cache=true` (Clean
+    /// reads). Dirty / repair paths omit promotion so foyer DRAM stays Clean-biased.
     pub fn cache_clean(&self, id: &ChunkId, data: &[u8]) {
         let props = HybridCacheProperties::default().with_location(Location::Default);
         self.cache
@@ -171,14 +169,17 @@ impl ChunkStore for FoyerChunkStore {
     }
 
     fn get(&self, id: &ChunkId) -> Result<Vec<u8>> {
+        self.get_with_promote(id, false)
+    }
+
+    fn get_with_promote(&self, id: &ChunkId, promote_cache: bool) -> Result<Vec<u8>> {
         if let Some(data) = self.cache_get(id)? {
             return Ok(data);
         }
         let data = self.disk.get(id)?;
-        // Read-through warm (v1): any durable hit, Dirty or Clean. Chunks are
-        // content-addressed/immutable so caching Dirty reads is safe; disk
-        // remains source of truth and eviction cannot drop durable bytes.
-        self.cache_clean(id, &data);
+        if promote_cache {
+            self.cache_clean(id, &data);
+        }
         Ok(data)
     }
 
@@ -226,7 +227,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn put_stays_out_of_cache_until_read_or_clean() {
+    async fn put_stays_out_of_cache_until_promote() {
         let (_dir, store) = open_store(0).await;
         let store = Arc::new(store);
         let s = Arc::clone(&store);
@@ -244,7 +245,20 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(got, b"dirty-bytes");
-        assert!(store.cache_contains(&id), "read-through should warm cache");
+        assert!(
+            !store.cache_contains(&id),
+            "default get must not promote Dirty reads"
+        );
+        let s = Arc::clone(&store);
+        let got = tokio::task::spawn_blocking(move || s.get_with_promote(&id, true))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, b"dirty-bytes");
+        assert!(
+            store.cache_contains(&id),
+            "promote_cache=true must warm HybridCache"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

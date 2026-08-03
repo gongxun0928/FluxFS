@@ -18,7 +18,13 @@ message PutChunkResponse {
   bool durable = 3;
 }
 
-message GetChunkRequest { bytes chunk_id = 1; }
+message GetChunkRequest {
+  bytes chunk_id = 1;
+  // When true, Worker may insert the returned bytes into its Clean/hot
+  // HybridCache (foyer). Dirty / repair / GC reads should leave this false
+  // so foyer DRAM is not polluted by authoritative Dirty traffic (task #38).
+  bool promote_cache = 2;
+}
 message GetChunkResponse {
   bytes data = 1;
   uint64 worker_id = 2;
