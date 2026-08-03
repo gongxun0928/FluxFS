@@ -218,19 +218,23 @@ cmp "$test_root/expected.bin" "$test_root/backing-after-remount.bin"
 # Mount no longer stop-the-world GC's. Explicit quiesced reclaim (admin/test)
 # removes superseded manifests/chunks from reachable Workers (worker-0 down).
 if [[ "${FLUXFS_SKIP_GC_ASSERT:-0}" != "1" ]]; then
-    for _ in $(seq 1 8); do
-        "$repo_dir/target/debug/fluxfs" orphan-gc \
-            --data-dir "$test_root/client" \
-            --meta-addr "http://127.0.0.1:$meta_port" \
-            --chunk-worker "http://127.0.0.1:$worker0_port" \
-            --chunk-worker "http://127.0.0.1:$worker1_port" \
-            --chunk-worker "http://127.0.0.1:$worker2_port" \
-            --allow-insecure-dev
-        if [[ "$(count_chunks "$test_root/worker-1")" -eq 0 ]] && \
-            [[ "$(count_chunks "$test_root/worker-2")" -eq 0 ]]; then
-            break
-        fi
-    done
+    "$repo_dir/target/debug/fluxfs" orphan-gc \
+        --data-dir "$test_root/client" \
+        --meta-addr "http://127.0.0.1:$meta_port" \
+        --chunk-worker "http://127.0.0.1:$worker0_port" \
+        --chunk-worker "http://127.0.0.1:$worker1_port" \
+        --chunk-worker "http://127.0.0.1:$worker2_port" \
+        --allow-insecure-dev
+    # Packfiles are append-only: delete removes the live heed index entry but
+    # historical frames remain until compaction. Stop Workers, compact each
+    # store, then count physical frames so this assertion measures live data.
+    kill "$worker1_pid" "$worker2_pid"
+    wait "$worker1_pid" 2>/dev/null || true
+    wait "$worker2_pid" 2>/dev/null || true
+    worker1_pid=""
+    worker2_pid=""
+    "$repo_dir/target/debug/fluxfs" compact-chunks --data-dir "$test_root/worker-1"
+    "$repo_dir/target/debug/fluxfs" compact-chunks --data-dir "$test_root/worker-2"
     test "$(count_chunks "$test_root/worker-1")" -eq 0
     test "$(count_chunks "$test_root/worker-2")" -eq 0
 fi
