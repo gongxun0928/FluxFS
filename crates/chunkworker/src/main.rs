@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use fluxfs_chunk::{ChunkStore, DiskChunkStore};
+use fluxfs_chunk::{ChunkStore, FoyerCacheConfig, FoyerChunkStore};
 use fluxfs_meta::{MetaStore, RemoteMetaStore};
 use fluxfs_metrics::{spawn_prometheus, FluxMetrics};
 use fluxfs_proto::chunk::v1::{
@@ -42,6 +42,16 @@ struct Cli {
     /// foreground put/get — compaction holds the pack write lock briefly).
     #[arg(long, default_value_t = 300)]
     compact_interval_secs: u64,
+    /// Clean/hot HybridCache DRAM capacity (task #29 / P0-B8). Dirty PutChunk
+    /// remains packfile-authoritative and is not write-through to this cache.
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    cache_memory_bytes: usize,
+    /// Clean/hot HybridCache SSD tier capacity. `0` = memory-only.
+    #[arg(long, default_value_t = 256 * 1024 * 1024)]
+    cache_disk_bytes: usize,
+    /// Directory for the foyer SSD device. Defaults to `<data-dir>/foyer-cache`.
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
     // ===== C1 mTLS (task #30) =====
     /// Cluster CA cert (PEM) used to verify client certs. Required when
     /// --tls-server-cert is set (mTLS); production default.
@@ -122,7 +132,7 @@ fn client_tls(cli: &Cli) -> Result<Option<fluxfs_tls::ClientTlsOptions>> {
 
 struct ChunkSvc {
     worker_id: u64,
-    store: Arc<DiskChunkStore>,
+    store: Arc<FoyerChunkStore>,
     in_flight: Arc<Semaphore>,
     gc_in_flight: Arc<Semaphore>,
     metrics: Arc<FluxMetrics>,
@@ -316,7 +326,20 @@ async fn main() -> Result<()> {
     if cli.heartbeat_interval_secs == 0 || cli.lease_secs <= cli.heartbeat_interval_secs {
         anyhow::bail!("--lease-secs must exceed a non-zero --heartbeat-interval-secs");
     }
-    let store = Arc::new(DiskChunkStore::open(&cli.data_dir).context("open chunk store")?);
+    let cache_dir = cli
+        .cache_dir
+        .clone()
+        .unwrap_or_else(|| cli.data_dir.join("foyer-cache"));
+    let cache_cfg = FoyerCacheConfig::new(
+        cache_dir.clone(),
+        cli.cache_memory_bytes,
+        cli.cache_disk_bytes,
+    );
+    let store = Arc::new(
+        FoyerChunkStore::open(&cli.data_dir, cache_cfg)
+            .await
+            .context("open chunk store + foyer HybridCache")?,
+    );
     let metrics = FluxMetrics::new();
     if let Some(addr) = cli.metrics_listen {
         spawn_prometheus(addr, Arc::clone(&metrics));
@@ -376,10 +399,13 @@ async fn main() -> Result<()> {
         None
     };
     println!(
-        "fluxfs-chunkworker id={} listening on {} data_dir={} max_in_flight={} compact_interval_secs={}",
+        "fluxfs-chunkworker id={} listening on {} data_dir={} cache_dir={} cache_memory_bytes={} cache_disk_bytes={} max_in_flight={} compact_interval_secs={}",
         cli.worker_id,
         cli.listen,
         cli.data_dir.display(),
+        cache_dir.display(),
+        cli.cache_memory_bytes,
+        cli.cache_disk_bytes,
         cli.max_in_flight,
         cli.compact_interval_secs
     );

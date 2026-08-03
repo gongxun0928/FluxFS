@@ -11,7 +11,7 @@ mod replicated;
 mod store;
 
 pub use disk::DiskChunkStore;
-pub use foyer_store::FoyerChunkStore;
+pub use foyer_store::{FoyerCacheConfig, FoyerChunkStore};
 pub use pack::CompactReport;
 pub use placement::select_worker_targets;
 pub use remote::{
