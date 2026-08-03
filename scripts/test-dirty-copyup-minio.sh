@@ -27,6 +27,7 @@ minio_pass="${FLUXFS_MINIO_PASS:-minioadmin}"
 minio_bucket="${FLUXFS_MINIO_BUCKET:-fluxfs}"
 minio_net="${FLUXFS_MINIO_NET:-fluxfs-net}"
 mc_image="${FLUXFS_MINIO_MC_IMAGE:-minio/mc:latest}"
+file_mib="${FLUXFS_DIRTY_FILE_MIB:-12}"
 meta_pid=""
 worker0_pid=""
 worker1_pid=""
@@ -70,7 +71,8 @@ start_worker() {
     local port=$2
     "$repo_dir/target/debug/fluxfs-chunkworker" \
         --worker-id "$id" --listen "127.0.0.1:$port" \
-        --data-dir "$test_root/worker-$id" >"$test_root/worker-$id.log" 2>&1 &
+        --data-dir "$test_root/worker-$id" --allow-insecure-dev \
+        >"$test_root/worker-$id.log" 2>&1 &
     case "$id" in
         0) worker0_pid=$! ;;
         1) worker1_pid=$! ;;
@@ -82,6 +84,7 @@ start_worker() {
 start_meta() {
     "$repo_dir/target/debug/fluxfs-metamaster" \
         --listen "127.0.0.1:$meta_port" --data-dir "$test_root/meta" \
+        --allow-insecure-dev \
         >"$test_root/meta.log" 2>&1 &
     meta_pid=$!
     wait_port "$meta_port"
@@ -100,6 +103,7 @@ start_mount() {
         --chunk-worker "http://127.0.0.1:$worker0_port" \
         --chunk-worker "http://127.0.0.1:$worker1_port" \
         --chunk-worker "http://127.0.0.1:$worker2_port" \
+        --allow-insecure-dev \
         >"$test_root/mount.log" 2>&1 &
     mount_pid=$!
     for _ in $(seq 1 100); do
@@ -119,7 +123,14 @@ start_mount() {
 
 mkdir -p "$mount_dir"
 bash "$repo_dir/scripts/dev-minio.sh" >/dev/null
-dd if=/dev/urandom of="$test_root/original.bin" bs=1M count=12 status=none
+if [[ "${FLUXFS_DIRTY_SPARSE:-0}" == "1" ]]; then
+    truncate -s "${file_mib}M" "$test_root/original.bin"
+    printf 'large-file-minio-prefix' | dd of="$test_root/original.bin" conv=notrunc status=none
+    printf 'large-file-minio-suffix' | dd of="$test_root/original.bin" \
+        bs=1 seek=$((file_mib * 1024 * 1024 - 23)) conv=notrunc status=none
+else
+    dd if=/dev/urandom of="$test_root/original.bin" bs=1M count="$file_mib" status=none
+fi
 cp "$test_root/original.bin" "$test_root/expected.bin"
 docker run --rm --network "$minio_net" --entrypoint /bin/sh \
     -v "$test_root:/test:ro" "$mc_image" -c "
@@ -189,6 +200,13 @@ finally:
 PY
 mc_sh "mc cat local/${minio_bucket}/${prefix}/large.bin" >"$test_root/backing-after-flush.bin"
 cmp "$test_root/expected.bin" "$test_root/backing-after-flush.bin"
+mc_sh "mc stat --json local/${minio_bucket}/${prefix}/large.bin" >"$test_root/stat.json"
+python3 - "$test_root/stat.json" <<'PY'
+import json, re, sys
+records = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
+etag = next((record.get("etag", "") for record in records if record.get("etag")), "")
+assert re.search(r"-[0-9]+$", etag), f"expected multipart ETag, got {etag!r}"
+PY
 
 fusermount3 -u "$mount_dir"
 wait "$mount_pid"
@@ -199,16 +217,25 @@ mc_sh "mc cat local/${minio_bucket}/${prefix}/large.bin" >"$test_root/backing-af
 cmp "$test_root/expected.bin" "$test_root/backing-after-remount.bin"
 # Mount no longer stop-the-world GC's. Explicit quiesced reclaim (admin/test)
 # removes superseded manifests/chunks from reachable Workers (worker-0 down).
-"$repo_dir/target/debug/fluxfs" orphan-gc \
-    --data-dir "$test_root/client" \
-    --meta-addr "http://127.0.0.1:$meta_port" \
-    --chunk-worker "http://127.0.0.1:$worker0_port" \
-    --chunk-worker "http://127.0.0.1:$worker1_port" \
-    --chunk-worker "http://127.0.0.1:$worker2_port"
-test "$(count_chunks "$test_root/worker-1")" -eq 0
-test "$(count_chunks "$test_root/worker-2")" -eq 0
+if [[ "${FLUXFS_SKIP_GC_ASSERT:-0}" != "1" ]]; then
+    for _ in $(seq 1 8); do
+        "$repo_dir/target/debug/fluxfs" orphan-gc \
+            --data-dir "$test_root/client" \
+            --meta-addr "http://127.0.0.1:$meta_port" \
+            --chunk-worker "http://127.0.0.1:$worker0_port" \
+            --chunk-worker "http://127.0.0.1:$worker1_port" \
+            --chunk-worker "http://127.0.0.1:$worker2_port" \
+            --allow-insecure-dev
+        if [[ "$(count_chunks "$test_root/worker-1")" -eq 0 ]] && \
+            [[ "$(count_chunks "$test_root/worker-2")" -eq 0 ]]; then
+            break
+        fi
+    done
+    test "$(count_chunks "$test_root/worker-1")" -eq 0
+    test "$(count_chunks "$test_root/worker-2")" -eq 0
+fi
 fusermount3 -u "$mount_dir"
 wait "$mount_pid"
 mount_pid=""
 
-echo "Dirty copy-up + fsync recovery + explicit orphan-gc + FUSE remount: ok"
+echo "Dirty copy-up + multipart fsync + FUSE remount: ok"

@@ -202,16 +202,17 @@ impl ChunkWorker for ChunkSvc {
             status_from_flux(error)
         })?;
         let store = Arc::clone(&self.store);
-        let data = tokio::task::spawn_blocking(move || store.get_with_promote(&chunk, promote_cache))
-            .await
-            .map_err(|error| {
-                FluxMetrics::inc(&self.metrics.chunk_rpc_error_total);
-                Status::internal(format!("chunk get task: {error}"))
-            })?
-            .map_err(|error| {
-                FluxMetrics::inc(&self.metrics.chunk_rpc_error_total);
-                status_from_flux(error)
-            })?;
+        let data =
+            tokio::task::spawn_blocking(move || store.get_with_promote(&chunk, promote_cache))
+                .await
+                .map_err(|error| {
+                    FluxMetrics::inc(&self.metrics.chunk_rpc_error_total);
+                    Status::internal(format!("chunk get task: {error}"))
+                })?
+                .map_err(|error| {
+                    FluxMetrics::inc(&self.metrics.chunk_rpc_error_total);
+                    status_from_flux(error)
+                })?;
         Ok(Response::new(GetChunkResponse {
             data,
             worker_id: self.worker_id,

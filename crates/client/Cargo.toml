@@ -6,6 +6,7 @@ license.workspace = true
 description = "Internal client API shared by CLI / FUSE / tests (not public SDK yet)"
 
 [dependencies]
+blake3 = { workspace = true }
 fluxfs-types = { workspace = true }
 fluxfs-meta = { workspace = true }
 fluxfs-chunk = { workspace = true }

@@ -99,13 +99,17 @@ EOF
    [qualification workload](meta-engine.md) keeps it while the measured gate
    passes; target-scale/concurrent-write evidence, not engine preference,
    triggers a RocksDB/LSM evaluation.
-2. **File size cap (alpha)**: e.g. **1 GiB** max to avoid multipart flush complexity (single Put path).
+2. **File size cap (historical)**: the original **1 GiB** limit avoided multipart
+   flush complexity. It was removed after bounded window writes/truncate and
+   multipart conditional publication landed.
 3. **ChunkWorker topology**: deploy **3 workers** in alpha so RF=2 can tolerate 1 failure; W2 must exercise 3-node failure modes.
 4. **proptest in W1**: pin property-test deps in skeleton; invariants must be enforceable from day 1, not bolted on in W3.
 
 ## Refinements (@ubuntu-gpt56 + @ubuntu-cc, msgs fb2ca008 / f1501f6f)
 
-1. **1 GiB cap is NOT global file size**: applies only to **Dirty/Ephemeral writes and whole-object flush/copy-up**. External read must support large objects via **Range GET** (core transparent-access promise). Over-cap writes → clear capability error.
+1. **Large-file boundary**: External reads use bounded Range GETs. Dirty/Ephemeral
+   writes and whole-object flush/copy-up must likewise remain bounded-memory;
+   no artificial 1 GiB cap remains.
 
 2. **MetaStore trait in W1**: heed is alpha **default**, not a frozen engine choice. Freeze trait boundary: create/lookup/update/reopen/recovery; **no engine types leak** into inode/manifest API (so later LSM/Mantle path is swap, not rewrite).
 

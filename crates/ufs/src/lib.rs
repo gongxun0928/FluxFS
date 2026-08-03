@@ -5,7 +5,7 @@
 
 use fluxfs_types::{ChunkId, FluxError, Result, UfsObject};
 use futures::future::try_join_all;
-use opendal::{services, EntryMode, Operator};
+use opendal::{services, EntryMode, Operator, Writer};
 use std::path::Path;
 
 mod read_path;
@@ -85,6 +85,133 @@ pub enum UfsProbe {
 }
 
 const FLUXFS_DIGEST_METADATA: &str = "fluxfs-blake3";
+/// S3 requires non-final multipart parts to be at least 5 MiB. Eight MiB keeps
+/// upload memory bounded while avoiding backend-specific minimum-size edges.
+pub const MULTIPART_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+
+/// A conditional, digest-verifying object publication assembled incrementally.
+///
+/// OpenDAL selects multipart upload for S3 when the configured chunk fills.
+/// Callers must call [`Self::abort`] after any upstream reconstruction error;
+/// `finish` aborts automatically when size/digest verification fails.
+pub struct VerifiedPublishWriter {
+    writer: Writer,
+    op: Operator,
+    write_key: String,
+    key: String,
+    rel: String,
+    staged_local_publish: bool,
+    expected_etag: Option<String>,
+    expected_size: u64,
+    target_digest: ChunkId,
+    digest_hex: String,
+    hasher: blake3::Hasher,
+    written: u64,
+}
+
+impl VerifiedPublishWriter {
+    pub async fn write(&mut self, data: &[u8]) -> Result<()> {
+        let next = self
+            .written
+            .checked_add(data.len() as u64)
+            .ok_or_else(|| FluxError::InvalidArg("publish size overflow".into()))?;
+        if next > self.expected_size {
+            let _ = self.writer.abort().await;
+            if self.staged_local_publish {
+                let _ = self.op.delete(&self.write_key).await;
+            }
+            return Err(FluxError::InvalidArg(format!(
+                "publish payload exceeds expected size {}",
+                self.expected_size
+            )));
+        }
+        if let Err(error) = self.writer.write(data.to_vec()).await {
+            let _ = self.writer.abort().await;
+            if self.staged_local_publish {
+                let _ = self.op.delete(&self.write_key).await;
+            }
+            return Err(map_publish_error(error));
+        }
+        self.hasher.update(data);
+        self.written = next;
+        Ok(())
+    }
+
+    pub async fn abort(&mut self) -> Result<()> {
+        self.writer.abort().await.map_err(map_opendal)?;
+        if self.staged_local_publish {
+            self.op.delete(&self.write_key).await.map_err(map_opendal)?;
+        }
+        Ok(())
+    }
+
+    pub async fn finish(mut self) -> Result<UfsObject> {
+        let actual_digest = ChunkId::from_raw(*self.hasher.finalize().as_bytes());
+        if self.written != self.expected_size || actual_digest != self.target_digest {
+            let _ = self.writer.abort().await;
+            if self.staged_local_publish {
+                let _ = self.op.delete(&self.write_key).await;
+            }
+            return Err(FluxError::InvalidArg(format!(
+                "publish payload verification failed: size={}/{} digest={}/{}",
+                self.written,
+                self.expected_size,
+                actual_digest.to_hex(),
+                self.target_digest.to_hex()
+            )));
+        }
+        if let Err(error) = self.writer.close().await {
+            let _ = self.writer.abort().await;
+            if self.staged_local_publish {
+                let _ = self.op.delete(&self.write_key).await;
+            }
+            return Err(map_publish_error(error));
+        }
+
+        if self.staged_local_publish {
+            let destination = self.op.stat(&self.key).await;
+            let condition_matches = match (&self.expected_etag, destination) {
+                (None, Err(error)) if error.kind() == opendal::ErrorKind::NotFound => true,
+                (Some(expected), Ok(metadata)) => metadata.etag() == Some(expected.as_str()),
+                _ => false,
+            };
+            if !condition_matches {
+                let _ = self.op.delete(&self.write_key).await;
+                return Err(FluxError::DirtyConflict);
+            }
+            if let Err(error) = self.op.rename(&self.write_key, &self.key).await {
+                let _ = self.op.delete(&self.write_key).await;
+                return Err(map_publish_error(error));
+            }
+        }
+
+        let meta = self.op.stat(&self.key).await.map_err(map_opendal)?;
+        if meta.content_length() != self.expected_size {
+            return Err(FluxError::Io(format!(
+                "published UFS size mismatch: want={} got={}",
+                self.expected_size,
+                meta.content_length()
+            )));
+        }
+        let stored_digest = meta
+            .user_metadata()
+            .and_then(|metadata| metadata.get(FLUXFS_DIGEST_METADATA));
+        if stored_digest != Some(&self.digest_hex) {
+            return Err(FluxError::Io(
+                "published UFS digest metadata missing or mismatched".into(),
+            ));
+        }
+
+        Ok(UfsObject {
+            key: self.rel,
+            size: meta.content_length(),
+            etag: meta.etag().map(str::to_owned),
+            mtime_ms: meta
+                .last_modified()
+                .map(|time| time.into_inner().as_millisecond()),
+        })
+    }
+}
 
 /// Backend guarantees required for crash-recoverable conditional publication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,13 +379,23 @@ impl Ufs {
         expected_etag: Option<&str>,
         target_digest: &ChunkId,
     ) -> Result<UfsObject> {
-        let actual_digest = ChunkId::from_bytes(data);
-        if &actual_digest != target_digest {
-            return Err(FluxError::InvalidArg(
-                "publish target_digest does not match payload".into(),
-            ));
-        }
+        let mut writer = self
+            .begin_verified_publish(rel, data.len() as u64, expected_etag, target_digest)
+            .await?;
+        writer.write(data).await?;
+        writer.finish().await
+    }
 
+    /// Start a bounded-memory conditional publication. On S3 this uses
+    /// multipart upload; the object becomes visible only after `finish` closes
+    /// the writer successfully.
+    pub async fn begin_verified_publish(
+        &self,
+        rel: &str,
+        expected_size: u64,
+        expected_etag: Option<&str>,
+        target_digest: &ChunkId,
+    ) -> Result<VerifiedPublishWriter> {
         let caps = self.publish_capabilities();
         if !caps.verifiable_digest_metadata {
             return Err(FluxError::Capability(
@@ -280,41 +417,43 @@ impl Ufs {
         }
 
         let key = self.key(rel);
+        // Filesystem writers expose an opened/truncated destination before
+        // close. Stage locally and rename only after payload verification so a
+        // failed or aborted stream never publishes a partial object. S3 writes
+        // directly to the final key because multipart completion is atomic.
+        let staged_local_publish = self.op.info().scheme() == "fs";
+        let write_key = if staged_local_publish {
+            format!("{key}.fluxfs-upload-{}", uuid::Uuid::new_v4())
+        } else {
+            key.clone()
+        };
         let digest_hex = target_digest.to_hex();
         let write = self
             .op
-            .write_with(&key, data.to_vec())
+            .writer_with(&write_key)
+            .chunk(MULTIPART_CHUNK_BYTES)
+            .concurrent(4)
             .user_metadata([(FLUXFS_DIGEST_METADATA.to_string(), digest_hex.clone())]);
-        let result = match expected_etag {
-            Some(etag) => write.if_match(etag).await,
-            None => write.if_not_exists(true).await,
-        };
-        result.map_err(map_publish_error)?;
-
-        let meta = self.op.stat(&key).await.map_err(map_opendal)?;
-        if meta.content_length() != data.len() as u64 {
-            return Err(FluxError::Io(format!(
-                "published UFS size mismatch: want={} got={}",
-                data.len(),
-                meta.content_length()
-            )));
+        let writer = match (staged_local_publish, expected_etag) {
+            (true, _) => write.if_not_exists(true).await,
+            (false, Some(etag)) => write.if_match(etag).await,
+            (false, None) => write.if_not_exists(true).await,
         }
-        let stored_digest = meta
-            .user_metadata()
-            .and_then(|metadata| metadata.get(FLUXFS_DIGEST_METADATA));
-        if stored_digest != Some(&digest_hex) {
-            return Err(FluxError::Io(
-                "published UFS digest metadata missing or mismatched".into(),
-            ));
-        }
+        .map_err(map_publish_error)?;
 
-        Ok(UfsObject {
-            key: rel.to_string(),
-            size: meta.content_length(),
-            etag: meta.etag().map(str::to_owned),
-            mtime_ms: meta
-                .last_modified()
-                .map(|time| time.into_inner().as_millisecond()),
+        Ok(VerifiedPublishWriter {
+            writer,
+            op: self.op.clone(),
+            write_key,
+            key,
+            rel: rel.to_string(),
+            staged_local_publish,
+            expected_etag: expected_etag.map(str::to_owned),
+            expected_size,
+            target_digest: *target_digest,
+            digest_hex,
+            hasher: blake3::Hasher::new(),
+            written: 0,
         })
     }
 
@@ -473,6 +612,44 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(bad_digest, FluxError::InvalidArg(_)));
+    }
+
+    #[tokio::test]
+    async fn verified_stream_publish_is_incremental_and_aborts_bad_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let ufs = Ufs::local(dir.path()).unwrap();
+        let pieces = [b"streamed-".as_slice(), b"multipart-", b"payload"];
+        let payload = pieces.concat();
+        let digest = ChunkId::from_bytes(&payload);
+        let mut writer = ufs
+            .begin_verified_publish("stream.bin", payload.len() as u64, None, &digest)
+            .await
+            .unwrap();
+        for piece in pieces {
+            writer.write(piece).await.unwrap();
+        }
+        let published = writer.finish().await.unwrap();
+        assert_eq!(published.size, payload.len() as u64);
+        assert_eq!(
+            ufs.read_range("stream.bin", 0, published.size)
+                .await
+                .unwrap(),
+            payload
+        );
+
+        let mut incomplete = ufs
+            .begin_verified_publish("incomplete.bin", 8, None, &ChunkId::from_bytes(b"12345678"))
+            .await
+            .unwrap();
+        incomplete.write(b"1234").await.unwrap();
+        assert!(matches!(
+            incomplete.finish().await,
+            Err(FluxError::InvalidArg(_))
+        ));
+        assert_eq!(
+            ufs.head("incomplete.bin").await.unwrap_err(),
+            FluxError::NotFound
+        );
     }
 
     #[test]

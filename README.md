@@ -93,4 +93,8 @@ cargo run -p fluxfs -- mount --ufs s3://fluxfs --data-dir /tmp/fluxfs-external-d
 - dentry + inode namespace; External lazy + rebuildable TTL cache
 - Dirty/Ephemeral default RF=2; Clean/External cache RF=1
 - Ephemeral via `--no-ufs`; no nested mounts; External write → copy-up → Dirty
-- Dirty/Ephemeral write + whole-object flush cap: 1 GiB; External large reads via Range GET
+- Dirty/Ephemeral random writes and truncate use bounded 4 MiB windows; UFS flush uses
+  bounded-memory multipart publication. There is no artificial 1 GiB file cap.
+- Configure the object store's incomplete-multipart lifecycle cleanup: a process
+  crash before CompleteMultipartUpload cannot publish partial data, but may leave
+  unreachable upload parts for the backend to reap.

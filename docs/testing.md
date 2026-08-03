@@ -72,6 +72,8 @@ file locking, xattrs, and other semantics explicitly outside v0.1.
 - **W2:** Dirty/Ephemeral RF=2 read/write tests plus one real three-node Raft
   partition/leader-crash test. Single-voter wiring is not sufficient evidence.
 - **W3:** flush/fsync/crash matrix proves publish and generation-CAS ordering.
+  `scripts/test-large-file-minio.sh` is the real 1025 MiB gate: bounded copy-up,
+  multipart ETag, conditional fsync publication, byte comparison, and remount.
 - **W4:** External hydrate/copy-up tests cover range reads and object-token
   changes for versioned and non-versioned UFS backends.
 - **W5:** FUSE integration and the declared pjdfstest allowlist pass.

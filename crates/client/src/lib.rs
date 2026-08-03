@@ -5,8 +5,7 @@ use fluxfs_meta::MetaStore;
 use fluxfs_types::{
     BackingMode, ChunkId, DataGen, DataState, Extent, ExtentTree, FileType, FlushId, FlushIntent,
     FluxError, Inode, InodeId, LocalityFields, LocalityLabel, Manifest, OpState, Origin,
-    RequestOpId, Result, UfsObject, UfsVersion, WriteTicketId, CHUNK_SIZE, DIRTY_WRITE_CAP_BYTES,
-    ROOT_INODE,
+    RequestOpId, Result, UfsObject, UfsVersion, WriteTicketId, CHUNK_SIZE, ROOT_INODE,
 };
 use fluxfs_ufs::{ReadPathConfig, ReadPathStats, Ufs, UfsEntryMode, UfsProbe, UfsReadPath};
 use std::collections::{BTreeSet, HashMap};
@@ -234,8 +233,7 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
                 "Dirty inode head does not match manifest snapshot".into(),
             ));
         }
-        let bytes = self.read_inode_range(&inode, 0, inode.size)?;
-        let target_digest = ChunkId::from_bytes(&bytes);
+        let target_digest = self.inode_digest(&inode)?;
         let target = inode
             .ufs
             .as_ref()
@@ -429,18 +427,10 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         ))? {
             Some(published) => published,
             None => {
-                let bytes = self.read_inode_range(&inode, 0, inode.size)?;
-                if ChunkId::from_bytes(&bytes) != intent.target_digest {
-                    return self.record_flush_conflict(
-                        ino,
-                        intent.flush_id,
-                        "flush reconstructed bytes do not match target digest",
-                    );
-                }
-                match ufs.block_on(
-                    ufs.ufs.publish_full_verified(
+                let mut writer = match ufs.block_on(
+                    ufs.ufs.begin_verified_publish(
                         &object.key,
-                        &bytes,
+                        inode.size,
                         intent
                             .expected_ufs_version
                             .as_ref()
@@ -448,7 +438,31 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
                         &intent.target_digest,
                     ),
                 ) {
+                    Ok(writer) => writer,
+                    Err(FluxError::DirtyConflict) => {
+                        return self.record_flush_conflict(
+                            ino,
+                            intent.flush_id,
+                            "conditional UFS publish detected external version drift",
+                        );
+                    }
+                    Err(error) => return Err(error),
+                };
+                let upload =
+                    self.for_each_inode_chunk(&inode, |bytes| ufs.block_on(writer.write(bytes)));
+                if let Err(error) = upload {
+                    let _ = ufs.block_on(writer.abort());
+                    return Err(error);
+                }
+                match ufs.block_on(writer.finish()) {
                     Ok(published) => published,
+                    Err(FluxError::InvalidArg(_)) => {
+                        return self.record_flush_conflict(
+                            ino,
+                            intent.flush_id,
+                            "flush reconstructed bytes do not match target digest",
+                        );
+                    }
                     Err(FluxError::DirtyConflict) => {
                         return self.record_flush_conflict(
                             ino,
@@ -513,8 +527,8 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         self.read_inode_range(&inode, offset, size as u64)
     }
 
-    /// Durable random write. External files copy up only the touched chunk-aligned
-    /// windows; Ephemeral files retain the MVP whole-file rewrite path.
+    /// Durable random write. Only touched chunk-aligned windows are reconstructed,
+    /// so sparse and multi-GiB files do not require whole-file buffering.
     pub fn write_at(&self, ino: InodeId, offset: u64, data: &[u8]) -> Result<u32> {
         if data.is_empty() {
             return Ok(0);
@@ -530,57 +544,12 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         let end = offset
             .checked_add(data.len() as u64)
             .ok_or_else(|| FluxError::InvalidArg("offset overflow".into()))?;
-        if end > DIRTY_WRITE_CAP_BYTES {
-            return Err(FluxError::Capability(format!(
-                "write would exceed {} byte Dirty/Ephemeral cap",
-                DIRTY_WRITE_CAP_BYTES
-            )));
-        }
-
-        if matches!(
-            inode.locality_fields.as_ref().map(|f| f.backing_mode),
-            Some(BackingMode::UfsBacked)
-        ) {
-            return self.write_ufs_backed(&mut inode, offset, data, end);
-        }
-
-        let mut buf = if inode.size == 0 {
-            Vec::new()
-        } else {
-            self.read_inode_range(&inode, 0, inode.size)?
-        };
-        if (buf.len() as u64) < end {
-            buf.resize(end as usize, 0);
-        }
-        let start = offset as usize;
-        buf[start..start + data.len()].copy_from_slice(data);
-
-        let gen = DataGen(inode.head_gen.0.saturating_add(1));
-        let (manifest, staged) = self.build_local_manifest(ino, gen, &buf);
-        let now = now_ms();
-        inode.size = buf.len() as u64;
-        inode.head_gen = gen;
-        inode.generation = inode.generation.saturating_add(1);
-        inode.mtime_ms = now;
-        inode.ctime_ms = now;
-        self.commit_staged_manifest(
-            inode.generation.saturating_sub(1),
-            &inode,
-            &manifest,
-            &staged,
-        )?;
-        Ok(data.len() as u32)
+        self.write_chunked(&mut inode, offset, data, end)
     }
 
     /// Copy up each touched 4 MiB window as a durable Local extent, then atomically
     /// switch the inode head. Untouched bytes remain pinned UFS ranges.
-    fn write_ufs_backed(
-        &self,
-        inode: &mut Inode,
-        offset: u64,
-        data: &[u8],
-        end: u64,
-    ) -> Result<u32> {
+    fn write_chunked(&self, inode: &mut Inode, offset: u64, data: &[u8], end: u64) -> Result<u32> {
         let expected_generation = inode.generation;
         let old_size = inode.size;
         let new_size = old_size.max(end);
@@ -637,15 +606,20 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         inode.size = new_size;
         inode.head_gen = gen;
         inode.generation = inode.generation.saturating_add(1);
-        inode.locality_fields = Some(LocalityFields {
-            backing_mode: BackingMode::UfsBacked,
-            data_state: DataState::Dirty,
-            op_state: OpState::None,
-            origin: inode
-                .locality_fields
-                .as_ref()
-                .map(|f| f.origin)
-                .unwrap_or(Origin::Imported),
+        let old_fields = inode.locality_fields.clone().unwrap_or_default();
+        inode.locality_fields = Some(match old_fields.backing_mode {
+            BackingMode::UfsBacked => LocalityFields {
+                backing_mode: BackingMode::UfsBacked,
+                data_state: DataState::Dirty,
+                op_state: OpState::None,
+                origin: old_fields.origin,
+            },
+            BackingMode::Ephemeral => LocalityFields {
+                backing_mode: BackingMode::Ephemeral,
+                data_state: DataState::Ephemeral,
+                op_state: OpState::None,
+                origin: old_fields.origin,
+            },
         });
         inode.locality = LocalityLabel::derive(
             inode.locality_fields.as_ref().expect("just assigned"),
@@ -668,59 +642,104 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         if inode.file_type != FileType::Regular {
             return Err(FluxError::IsDirectory);
         }
-        if size > DIRTY_WRITE_CAP_BYTES {
-            return Err(FluxError::Capability(format!(
-                "truncate exceeds {} byte cap",
-                DIRTY_WRITE_CAP_BYTES
-            )));
-        }
-        let mut buf = self.read_all(ino)?;
-        buf.resize(size as usize, 0);
+        let expected_generation = inode.generation;
         let gen = DataGen(inode.head_gen.0.saturating_add(1));
-        let (manifest, staged) = self.build_local_manifest(ino, gen, &buf);
+        let current = match inode.manifest_id {
+            Some(id) => self.meta.get_manifest(id)?,
+            None => Manifest::empty(ino, inode.head_gen),
+        };
+        let mut extents = Vec::new();
+        let mut staged = Vec::new();
+        for extent in &current.extents {
+            let start = extent.offset();
+            if start >= size {
+                break;
+            }
+            let end = start
+                .checked_add(extent.len())
+                .ok_or_else(|| FluxError::InvalidArg("extent end overflow".into()))?;
+            if end <= size {
+                extents.push(extent.clone());
+                continue;
+            }
+            let keep = size - start;
+            match extent {
+                Extent::Local { chunk, .. } => {
+                    let bytes = self.chunks.get(chunk)?;
+                    let keep = usize::try_from(keep).map_err(|_| {
+                        FluxError::Capability("partial chunk exceeds address space".into())
+                    })?;
+                    if bytes.len() < keep {
+                        return Err(FluxError::Io("chunk shorter than manifest extent".into()));
+                    }
+                    let bytes = bytes[..keep].to_vec();
+                    let chunk = ChunkId::from_bytes(&bytes);
+                    extents.push(Extent::Local {
+                        offset: start,
+                        len: keep as u64,
+                        chunk,
+                    });
+                    staged.push((chunk, bytes));
+                }
+                Extent::UfsRange {
+                    ufs_key,
+                    ufs_version,
+                    offset_in_object,
+                    ..
+                } => extents.push(Extent::UfsRange {
+                    offset: start,
+                    len: keep,
+                    ufs_key: ufs_key.clone(),
+                    ufs_version: ufs_version.clone(),
+                    offset_in_object: *offset_in_object,
+                }),
+            }
+        }
+        let manifest = Manifest {
+            inode: ino,
+            gen,
+            size,
+            extents: ExtentTree::try_from(extents)?,
+        };
         inode.head_gen = gen;
         let now = now_ms();
         inode.size = size;
         inode.generation = inode.generation.saturating_add(1);
         inode.mtime_ms = now;
         inode.ctime_ms = now;
-        self.commit_staged_manifest(
-            inode.generation.saturating_sub(1),
-            &inode,
-            &manifest,
-            &staged,
-        )
+        self.commit_staged_manifest(expected_generation, &inode, &manifest, &staged)
     }
 
-    /// Split one logical file image into bounded content-addressed RPC/storage chunks.
-    /// Build hashes before Put so Meta can durably reserve every content address.
-    fn build_local_manifest(
+    fn for_each_inode_chunk(
         &self,
-        ino: InodeId,
-        gen: DataGen,
-        data: &[u8],
-    ) -> (Manifest, Vec<(ChunkId, Vec<u8>)>) {
-        let mut extents = Vec::with_capacity(data.len().div_ceil(CHUNK_SIZE as usize));
-        let mut staged = Vec::with_capacity(extents.capacity());
-        for (index, bytes) in data.chunks(CHUNK_SIZE as usize).enumerate() {
-            let chunk = ChunkId::from_bytes(bytes);
-            extents.push(Extent::Local {
-                offset: index as u64 * CHUNK_SIZE,
-                len: bytes.len() as u64,
-                chunk,
-            });
-            staged.push((chunk, bytes.to_vec()));
+        inode: &Inode,
+        mut consume: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let mut offset = 0;
+        while offset < inode.size {
+            let len = (inode.size - offset).min(CHUNK_SIZE);
+            let bytes = self.read_inode_range(inode, offset, len)?;
+            if bytes.len() as u64 != len {
+                return Err(FluxError::Io(format!(
+                    "streamed inode range length mismatch: want={len} got={}",
+                    bytes.len()
+                )));
+            }
+            consume(&bytes)?;
+            offset = offset
+                .checked_add(len)
+                .ok_or_else(|| FluxError::InvalidArg("stream offset overflow".into()))?;
         }
-        (
-            Manifest {
-                inode: ino,
-                gen,
-                size: data.len() as u64,
-                extents: ExtentTree::try_from(extents)
-                    .expect("chunked local manifest offsets are unique"),
-            },
-            staged,
-        )
+        Ok(())
+    }
+
+    fn inode_digest(&self, inode: &Inode) -> Result<ChunkId> {
+        let mut hasher = blake3::Hasher::new();
+        self.for_each_inode_chunk(inode, |bytes| {
+            hasher.update(bytes);
+            Ok(())
+        })?;
+        Ok(ChunkId::from_raw(*hasher.finalize().as_bytes()))
     }
 
     fn commit_staged_manifest(
@@ -1181,6 +1200,56 @@ mod tests {
         let mid = client.get_inode(file.id).unwrap().manifest_id.unwrap();
         let manifest = client.meta.get_manifest(mid).unwrap();
         assert_eq!(manifest.extents.len(), 2);
+    }
+
+    #[test]
+    fn sparse_write_and_truncate_beyond_one_gib_are_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = HeedMetaStore::open(dir.path().join("meta")).unwrap();
+        let chunks = DiskChunkStore::open(dir.path().join("chunks")).unwrap();
+        let client = FluxClient::new(meta, chunks);
+        let file = client
+            .create_file(ROOT_INODE, "large-sparse.bin", 0o644, 0, 0)
+            .unwrap();
+        let large_size = (1_u64 << 30) + CHUNK_SIZE + 37;
+
+        let grown = client.truncate(file.id, large_size).unwrap();
+        assert_eq!(grown.size, large_size);
+        let grown_manifest = client
+            .meta
+            .get_manifest(grown.manifest_id.unwrap())
+            .unwrap();
+        assert!(grown_manifest.extents.is_empty());
+
+        let marker_offset = large_size - 11;
+        client
+            .write_at(file.id, marker_offset, b"large-file!")
+            .unwrap();
+        assert_eq!(
+            client.read_at(file.id, marker_offset - 8, 19).unwrap(),
+            [vec![0; 8], b"large-file!".to_vec()].concat()
+        );
+        let dirty = client.get_inode(file.id).unwrap();
+        let dirty_manifest = client
+            .meta
+            .get_manifest(dirty.manifest_id.unwrap())
+            .unwrap();
+        assert_eq!(dirty_manifest.extents.len(), 1);
+
+        let shrunk = client.truncate(file.id, marker_offset + 5).unwrap();
+        assert_eq!(shrunk.size, marker_offset + 5);
+        assert_eq!(
+            client.read_at(file.id, marker_offset, 32).unwrap(),
+            b"large"
+        );
+        let shrunk_manifest = client
+            .meta
+            .get_manifest(shrunk.manifest_id.unwrap())
+            .unwrap();
+        assert_eq!(shrunk_manifest.extents.len(), 1);
+        let tail = shrunk_manifest.extents.iter().next().unwrap();
+        assert_eq!(tail.offset() + tail.len(), marker_offset + 5);
+        assert!(tail.len() <= CHUNK_SIZE);
     }
 
     #[test]

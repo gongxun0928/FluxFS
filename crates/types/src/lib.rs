@@ -939,8 +939,6 @@ pub enum FluxError {
 pub type Result<T> = std::result::Result<T, FluxError>;
 
 pub const ROOT_INODE: InodeId = 1;
-/// Alpha cap for Dirty/Ephemeral writes and whole-object flush/copy-up (not External reads).
-pub const DIRTY_WRITE_CAP_BYTES: u64 = 1 << 30;
 
 /// Default chunk size for MVP. Extents are aligned to this.
 pub const CHUNK_SIZE: u64 = 4 * 1024 * 1024; // 4 MiB

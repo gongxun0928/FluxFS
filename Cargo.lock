@@ -940,6 +940,7 @@ dependencies = [
 name = "fluxfs-client"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "fluxfs-chunk",
  "fluxfs-meta",
  "fluxfs-types",
@@ -1056,6 +1057,7 @@ dependencies = [
 name = "fluxfs-ufs"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "fluxfs-types",
  "futures",
  "opendal",
@@ -1064,6 +1066,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
