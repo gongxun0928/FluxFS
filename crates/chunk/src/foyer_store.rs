@@ -4,10 +4,11 @@
 //! - **DiskChunkStore** remains the authoritative durable store for Dirty
 //!   (and all Worker PutChunk) data. Eviction from the hybrid cache never
 //!   deletes or mutates packfile contents.
-//! - **foyer HybridCache** (DRAM + optional SSD) is a Clean/hot read facade:
-//!   `put` does not insert into the cache; callers promote Clean bytes via
-//!   [`FoyerChunkStore::cache_clean`], and `get` may warm the cache on a
-//!   durable hit (read-through).
+//! - **foyer HybridCache** (DRAM + optional SSD) is v1 **read-through warm**
+//!   on durable `get` hits (content-addressed chunks are immutable, so warming
+//!   Dirty reads is safe). `put` never inserts. Locality-aware Clean-only
+//!   promotion ([`FoyerChunkStore::cache_clean`] from Worker/client) is a
+//!   follow-up — the helper exists for tests and that future wiring.
 
 use crate::disk::DiskChunkStore;
 use crate::pack::CompactReport;
@@ -67,10 +68,11 @@ impl FoyerChunkStore {
         })
     }
 
-    /// Promote Clean (or other safely-evictable) bytes into the hybrid cache.
+    /// Insert bytes into the hybrid cache without touching the packfile.
     ///
-    /// Does not write the authoritative packfile. Dirty durability must go
-    /// through [`ChunkStore::put`].
+    /// v1 production path only reaches this via [`ChunkStore::get`]
+    /// read-through. Explicit Clean-only promotion from Worker/client is a
+    /// follow-up; until then Dirty and Clean reads share the warm budget.
     pub fn cache_clean(&self, id: &ChunkId, data: &[u8]) {
         let props = HybridCacheProperties::default().with_location(Location::Default);
         self.cache
@@ -149,6 +151,8 @@ async fn build_hybrid_cache(config: &FoyerCacheConfig) -> Result<HybridCache<Vec
             .build()
             .map_err(|e| FluxError::Io(format!("foyer device: {e}")))?;
         // Keep block size modest so small test capacities still admit entries.
+        // Default prod (256 MiB disk) → raw /4 = 64 MiB → clamp to 4 MiB max.
+        // Sub-MiB disk fixtures should prefer disk_capacity_bytes=0 (memory-only).
         let block_size = (config.disk_capacity_bytes / 4).clamp(64 * 1024, 4 * 1024 * 1024);
         builder
             .with_engine_config(BlockEngineConfig::new(device).with_block_size(block_size))
@@ -171,8 +175,9 @@ impl ChunkStore for FoyerChunkStore {
             return Ok(data);
         }
         let data = self.disk.get(id)?;
-        // Read-through warm: accelerate subsequent Clean/hot reads. Disk remains
-        // source of truth; cache eviction cannot drop durable bytes.
+        // Read-through warm (v1): any durable hit, Dirty or Clean. Chunks are
+        // content-addressed/immutable so caching Dirty reads is safe; disk
+        // remains source of truth and eviction cannot drop durable bytes.
         self.cache_clean(id, &data);
         Ok(data)
     }
