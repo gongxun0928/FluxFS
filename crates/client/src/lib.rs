@@ -47,9 +47,7 @@ impl UfsRuntime {
         let reads = if let Some(rt) = &rt {
             rt.block_on(UfsReadPath::open(ufs.clone(), config))?
         } else {
-            tokio::task::block_in_place(|| {
-                handle.block_on(UfsReadPath::open(ufs.clone(), config))
-            })?
+            tokio::task::block_in_place(|| handle.block_on(UfsReadPath::open(ufs.clone(), config)))?
         };
         Ok(Self {
             ufs,
@@ -1638,12 +1636,7 @@ mod tests {
         std::fs::create_dir_all(&ufs_root).unwrap();
         std::fs::write(ufs_root.join("obj.bin"), b"hello-clean-cache").unwrap();
 
-        let cfg = ReadPathConfig::for_mount(
-            dir.path(),
-            16 * 1024 * 1024,
-            16 * 1024 * 1024,
-            None,
-        );
+        let cfg = ReadPathConfig::for_mount(dir.path(), 16 * 1024 * 1024, 16 * 1024 * 1024, None);
         assert_eq!(
             cfg.cache_dir.as_deref(),
             Some(dir.path().join("ufs-foyer-cache").as_path())

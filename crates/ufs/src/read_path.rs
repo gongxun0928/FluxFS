@@ -68,9 +68,7 @@ impl ReadPathConfig {
             max_cached_parts: max_cached_parts.max(1),
             prefetch_parts: 2,
             disk_capacity_bytes,
-            cache_dir: Some(
-                cache_dir.unwrap_or_else(|| data_dir.as_ref().join("ufs-foyer-cache")),
-            ),
+            cache_dir: Some(cache_dir.unwrap_or_else(|| data_dir.as_ref().join("ufs-foyer-cache"))),
         }
     }
 }
