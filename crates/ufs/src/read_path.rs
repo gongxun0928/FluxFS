@@ -1,21 +1,32 @@
 //! Bounded, version-aware UFS range cache with parallel misses and single-flight.
+//!
+//! P0-B8 / task #39: Clean/External hot path uses foyer `HybridCache` (DRAM +
+//! optional SSD). Dirty `Extent::Local` traffic never enters this cache — it
+//! stays on the ChunkWorker packfile path.
 
 use crate::Ufs;
 use fluxfs_types::{FluxError, Result, UfsObject};
+use foyer::{
+    BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder,
+    HybridCachePolicy, PsyncIoEngineConfig, RecoverMode, Source,
+};
 use futures::future::try_join_all;
-use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{Mutex, OnceCell};
-
 #[derive(Debug, Clone)]
 pub struct ReadPathConfig {
     /// Cache/fetch granularity. The MVP default limits amplification while still
     /// allowing four requests to cover one 4 MiB FluxFS chunk in parallel.
     pub part_size: u64,
+    /// Soft bound on cached parts (maps to foyer DRAM weighter capacity).
     pub max_cached_parts: usize,
     /// Number of parts scheduled after the requested range.
     pub prefetch_parts: usize,
+    /// Optional SSD tier capacity. `0` = memory-only HybridCache.
+    pub disk_capacity_bytes: usize,
+    /// Directory for the foyer disk device when `disk_capacity_bytes > 0`.
+    pub cache_dir: Option<PathBuf>,
 }
 
 impl Default for ReadPathConfig {
@@ -24,7 +35,16 @@ impl Default for ReadPathConfig {
             part_size: 1024 * 1024,
             max_cached_parts: 256,
             prefetch_parts: 2,
+            disk_capacity_bytes: 0,
+            cache_dir: None,
         }
+    }
+}
+
+impl ReadPathConfig {
+    fn memory_capacity_bytes(&self) -> usize {
+        let part = self.part_size.max(1) as usize;
+        self.max_cached_parts.max(1).saturating_mul(part).max(64 * 1024)
     }
 }
 
@@ -34,36 +54,22 @@ pub struct ReadPathStats {
     pub cache_hits: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct PartKey {
-    path: String,
-    version: String,
-    index: u64,
-}
-
-type PartResult = Result<Arc<Vec<u8>>>;
-type PartCell = Arc<OnceCell<PartResult>>;
-
-#[derive(Default)]
-struct CacheState {
-    entries: HashMap<PartKey, PartCell>,
-    insertion_order: VecDeque<PartKey>,
-}
-
 /// Read policy layered above OpenDAL.
 ///
 /// Required parts are fetched concurrently. Concurrent readers of one part
-/// share the same future, and successful parts remain in a bounded FIFO cache.
+/// share the same foyer `get_or_fetch`, and successful parts remain in a
+/// bounded HybridCache (DRAM + optional SSD).
 pub struct UfsReadPath {
     ufs: Ufs,
     config: ReadPathConfig,
-    cache: Mutex<CacheState>,
+    cache: HybridCache<String, Vec<u8>>,
     backend_fetches: AtomicU64,
     cache_hits: AtomicU64,
 }
 
 impl UfsReadPath {
-    pub fn new(ufs: Ufs, config: ReadPathConfig) -> Result<Arc<Self>> {
+    /// Open the Clean/External HybridCache. Must run on a Tokio runtime.
+    pub async fn open(ufs: Ufs, config: ReadPathConfig) -> Result<Arc<Self>> {
         if config.part_size == 0 {
             return Err(FluxError::InvalidArg("UFS part_size must be > 0".into()));
         }
@@ -72,13 +78,34 @@ impl UfsReadPath {
                 "UFS max_cached_parts must be > 0".into(),
             ));
         }
+        let cache = build_hybrid_cache(&config).await?;
         Ok(Arc::new(Self {
             ufs,
             config,
-            cache: Mutex::new(CacheState::default()),
+            cache,
             backend_fetches: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
         }))
+    }
+
+    /// Flush and close the HybridCache disk tier (tests / graceful shutdown).
+    pub async fn close_cache(&self) -> Result<()> {
+        self.cache
+            .close()
+            .await
+            .map_err(|e| FluxError::Ufs(format!("foyer close: {e}")))
+    }
+
+    /// Sync helper for call sites that already own / can borrow a runtime.
+    pub fn new(ufs: Ufs, config: ReadPathConfig) -> Result<Arc<Self>> {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(Self::open(ufs, config))),
+            Err(_) => {
+                let rt = tokio::runtime::Runtime::new()
+                    .map_err(|e| FluxError::Ufs(format!("ufs read-path runtime: {e}")))?;
+                rt.block_on(Self::open(ufs, config))
+            }
+        }
     }
 
     pub fn stats(&self) -> ReadPathStats {
@@ -131,63 +158,39 @@ impl UfsReadPath {
         object: UfsObject,
         index: u64,
     ) -> Result<Arc<Vec<u8>>> {
-        let key = PartKey {
-            path: rel.clone(),
-            version,
-            index,
-        };
-        let (cell, existed) = {
-            let mut cache = self.cache.lock().await;
-            if let Some(cell) = cache.entries.get(&key) {
-                (Arc::clone(cell), true)
-            } else {
-                while cache.entries.len() >= self.config.max_cached_parts {
-                    let Some(oldest) = cache.insertion_order.pop_front() else {
-                        break;
-                    };
-                    cache.entries.remove(&oldest);
+        let key = part_cache_key(&rel, &version, index);
+        let this = Arc::clone(self);
+        let fetch_key = key.clone();
+        let entry = self
+            .cache
+            .get_or_fetch(&key, || {
+                let this = Arc::clone(&this);
+                let rel = rel.clone();
+                let object = object.clone();
+                async move {
+                    this.backend_fetches.fetch_add(1, Ordering::Relaxed);
+                    let start = index * this.config.part_size;
+                    let expected = this.config.part_size.min(object.size - start);
+                    let data = this
+                        .ufs
+                        .read_range_pinned(&rel, start, expected, object.etag.as_deref())
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    if data.len() as u64 != expected {
+                        return Err(anyhow::anyhow!(
+                            "short UFS range read: path={rel} offset={start} expected={expected} actual={}",
+                            data.len()
+                        ));
+                    }
+                    Ok(data)
                 }
-                let cell = Arc::new(OnceCell::new());
-                cache.entries.insert(key.clone(), Arc::clone(&cell));
-                cache.insertion_order.push_back(key.clone());
-                (cell, false)
-            }
-        };
-        if existed {
-            self.cache_hits.fetch_add(1, Ordering::Relaxed);
-        }
-
-        let result = cell
-            .get_or_init(|| async {
-                self.backend_fetches.fetch_add(1, Ordering::Relaxed);
-                let start = index * self.config.part_size;
-                let expected = self.config.part_size.min(object.size - start);
-                let data = self
-                    .ufs
-                    .read_range_pinned(&rel, start, expected, object.etag.as_deref())
-                    .await?;
-                if data.len() as u64 != expected {
-                    return Err(FluxError::Ufs(format!(
-                        "short UFS range read: path={rel} offset={start} expected={expected} actual={}",
-                        data.len()
-                    )));
-                }
-                Ok(Arc::new(data))
             })
             .await
-            .clone();
-
-        if result.is_err() {
-            let mut cache = self.cache.lock().await;
-            if cache
-                .entries
-                .get(&key)
-                .is_some_and(|cached| Arc::ptr_eq(cached, &cell))
-            {
-                cache.entries.remove(&key);
-            }
+            .map_err(|e| FluxError::Ufs(format!("foyer get_or_fetch {fetch_key}: {e}")))?;
+        if matches!(entry.source(), Source::Memory | Source::Disk) {
+            self.cache_hits.fetch_add(1, Ordering::Relaxed);
         }
-        result
+        Ok(Arc::new(entry.value().clone()))
     }
 
     fn spawn_prefetch(self: &Arc<Self>, rel: &str, object: &UfsObject, first: u64) {
@@ -206,6 +209,49 @@ impl UfsReadPath {
             });
         }
     }
+}
+
+async fn build_hybrid_cache(config: &ReadPathConfig) -> Result<HybridCache<String, Vec<u8>>> {
+    let memory = config.memory_capacity_bytes();
+    let builder = HybridCacheBuilder::new()
+        .with_name("fluxfs-ufs-clean")
+        .with_policy(HybridCachePolicy::WriteOnInsertion)
+        .with_flush_on_close(true)
+        .memory(memory)
+        .with_weighter(|_k, v: &Vec<u8>| v.len().max(1))
+        .storage()
+        .with_io_engine_config(PsyncIoEngineConfig::new())
+        .with_recover_mode(RecoverMode::Quiet);
+
+    let hybrid = if config.disk_capacity_bytes == 0 {
+        builder
+            .build()
+            .await
+            .map_err(|e| FluxError::Ufs(format!("foyer open (memory-only): {e}")))?
+    } else {
+        let dir = config.cache_dir.clone().ok_or_else(|| {
+            FluxError::InvalidArg(
+                "UFS Clean cache_dir required when disk_capacity_bytes > 0".into(),
+            )
+        })?;
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| FluxError::Ufs(format!("create ufs foyer dir {}: {e}", dir.display())))?;
+        let device = FsDeviceBuilder::new(&dir)
+            .with_capacity(config.disk_capacity_bytes)
+            .build()
+            .map_err(|e| FluxError::Ufs(format!("foyer device: {e}")))?;
+        let block_size = (config.disk_capacity_bytes / 4).clamp(64 * 1024, 4 * 1024 * 1024);
+        builder
+            .with_engine_config(BlockEngineConfig::new(device).with_block_size(block_size))
+            .build()
+            .await
+            .map_err(|e| FluxError::Ufs(format!("foyer open: {e}")))?
+    };
+    Ok(hybrid)
+}
+
+fn part_cache_key(rel: &str, version: &str, index: u64) -> String {
+    format!("{rel}\0{version}\0{index}")
 }
 
 fn version_token(object: &UfsObject) -> String {
@@ -227,16 +273,18 @@ mod tests {
             part_size: 4,
             max_cached_parts: 16,
             prefetch_parts,
+            disk_capacity_bytes: 0,
+            cache_dir: None,
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn parallel_parts_are_cached() {
         let dir = tempfile::tempdir().unwrap();
         let ufs = Ufs::local(dir.path()).unwrap();
         ufs.write_full("obj", b"0123456789abcdef").await.unwrap();
         let object = ufs.head("obj").await.unwrap();
-        let path = UfsReadPath::new(ufs, config(0)).unwrap();
+        let path = UfsReadPath::open(ufs, config(0)).await.unwrap();
 
         assert_eq!(
             path.read("obj", &object, 2, 10).await.unwrap(),
@@ -251,13 +299,13 @@ mod tests {
         assert_eq!(path.stats().cache_hits, 3);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_readers_share_one_fetch() {
         let dir = tempfile::tempdir().unwrap();
         let ufs = Ufs::local(dir.path()).unwrap();
         ufs.write_full("obj", b"01234567").await.unwrap();
         let object = ufs.head("obj").await.unwrap();
-        let path = UfsReadPath::new(ufs, config(0)).unwrap();
+        let path = UfsReadPath::open(ufs, config(0)).await.unwrap();
 
         let reads = (0..16).map(|_| {
             let path = Arc::clone(&path);
@@ -269,17 +317,47 @@ mod tests {
         assert_eq!(path.stats().backend_fetches, 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn short_range_is_rejected_and_not_cached() {
         let dir = tempfile::tempdir().unwrap();
         let ufs = Ufs::local(dir.path()).unwrap();
         ufs.write_full("obj", b"abc").await.unwrap();
         let mut object = ufs.head("obj").await.unwrap();
         object.size = 4;
-        let path = UfsReadPath::new(ufs, config(0)).unwrap();
+        let path = UfsReadPath::open(ufs, config(0)).await.unwrap();
 
         assert!(path.read("obj", &object, 0, 4).await.is_err());
         assert!(path.read("obj", &object, 0, 4).await.is_err());
         assert_eq!(path.stats().backend_fetches, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clean_ssd_tier_survives_reopen() {
+        let ufs_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let ufs = Ufs::local(ufs_dir.path()).unwrap();
+        ufs.write_full("obj", b"0123456789abcdef").await.unwrap();
+        let object = ufs.head("obj").await.unwrap();
+
+        let cfg = ReadPathConfig {
+            part_size: 4,
+            max_cached_parts: 16,
+            prefetch_parts: 0,
+            disk_capacity_bytes: 16 * 1024 * 1024,
+            cache_dir: Some(cache_dir.path().to_path_buf()),
+        };
+        {
+            let path = UfsReadPath::open(ufs.clone(), cfg.clone()).await.unwrap();
+            assert_eq!(path.read("obj", &object, 0, 8).await.unwrap(), b"01234567");
+            path.close_cache().await.unwrap();
+        }
+
+        // New process-equivalent: reopen cache against same SSD dir; delete UFS
+        // bytes so a miss would fail — hit must come from foyer SSD tier.
+        std::fs::remove_file(ufs_dir.path().join("obj")).unwrap();
+        let path = UfsReadPath::open(ufs, cfg).await.unwrap();
+        assert_eq!(path.read("obj", &object, 0, 8).await.unwrap(), b"01234567");
+        assert_eq!(path.stats().backend_fetches, 0);
+        assert!(path.stats().cache_hits >= 1);
     }
 }

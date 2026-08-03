@@ -6,8 +6,10 @@ license.workspace = true
 description = "UFS adapter over OpenDAL (prefetch / parallel Range later)"
 
 [dependencies]
+anyhow = { workspace = true }
 blake3 = { workspace = true }
 fluxfs-types = { workspace = true }
+foyer = { workspace = true }
 futures = "0.3"
 opendal = { workspace = true }
 serde = { workspace = true }

@@ -24,18 +24,37 @@ struct UfsRuntime {
 
 impl UfsRuntime {
     fn new(ufs: Ufs) -> Result<Self> {
-        let reads = UfsReadPath::new(ufs.clone(), ReadPathConfig::default())?;
+        // Capture / create the runtime first so foyer HybridCache open can
+        // bind to the same Tokio spawner used by subsequent UFS reads.
+        // Always keep a Handle even for an owned Runtime so nested calls that
+        // see Handle::try_current() (inside block_on) can use block_in_place
+        // instead of re-entering Runtime::block_on (deadlock).
         let (handle, rt) = match Handle::try_current() {
-            Ok(handle) => (Some(handle), None),
-            Err(_) => (
-                None,
-                Some(Runtime::new().map_err(|e| FluxError::Ufs(e.to_string()))?),
-            ),
+            Ok(handle) => (handle, None),
+            Err(_) => {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .thread_name("fluxfs-ufs")
+                    .build()
+                    .map_err(|e| FluxError::Ufs(e.to_string()))?;
+                let handle = rt.handle().clone();
+                (handle, Some(rt))
+            }
+        };
+        // Never call block_in_place unless already inside a runtime — sync
+        // unit tests own a Runtime and must drive open via Runtime::block_on.
+        let reads = if let Some(rt) = &rt {
+            rt.block_on(UfsReadPath::open(ufs.clone(), ReadPathConfig::default()))?
+        } else {
+            tokio::task::block_in_place(|| {
+                handle.block_on(UfsReadPath::open(ufs.clone(), ReadPathConfig::default()))
+            })?
         };
         Ok(Self {
             ufs,
             reads,
-            handle,
+            handle: Some(handle),
             rt,
         })
     }
@@ -44,10 +63,10 @@ impl UfsRuntime {
         if Handle::try_current().is_ok() {
             let handle = self.handle.as_ref().expect("runtime handle captured");
             tokio::task::block_in_place(|| handle.block_on(fut))
-        } else if let Some(handle) = &self.handle {
-            handle.block_on(fut)
         } else if let Some(rt) = &self.rt {
             rt.block_on(fut)
+        } else if let Some(handle) = &self.handle {
+            handle.block_on(fut)
         } else {
             unreachable!("UFS executor missing")
         }

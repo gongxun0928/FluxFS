@@ -1057,8 +1057,10 @@ dependencies = [
 name = "fluxfs-ufs"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "blake3",
  "fluxfs-types",
+ "foyer",
  "futures",
  "opendal",
  "serde",
