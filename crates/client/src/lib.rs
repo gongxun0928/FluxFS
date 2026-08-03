@@ -23,7 +23,7 @@ struct UfsRuntime {
 }
 
 impl UfsRuntime {
-    fn new(ufs: Ufs) -> Result<Self> {
+    fn new(ufs: Ufs, config: ReadPathConfig) -> Result<Self> {
         // Capture / create the runtime first so foyer HybridCache open can
         // bind to the same Tokio spawner used by subsequent UFS reads.
         // Always keep a Handle even for an owned Runtime so nested calls that
@@ -45,10 +45,10 @@ impl UfsRuntime {
         // Never call block_in_place unless already inside a runtime — sync
         // unit tests own a Runtime and must drive open via Runtime::block_on.
         let reads = if let Some(rt) = &rt {
-            rt.block_on(UfsReadPath::open(ufs.clone(), ReadPathConfig::default()))?
+            rt.block_on(UfsReadPath::open(ufs.clone(), config))?
         } else {
             tokio::task::block_in_place(|| {
-                handle.block_on(UfsReadPath::open(ufs.clone(), ReadPathConfig::default()))
+                handle.block_on(UfsReadPath::open(ufs.clone(), config))
             })?
         };
         Ok(Self {
@@ -109,9 +109,17 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         }
     }
 
-    /// Attach OpenDAL UFS for External lazy namespace (read-only vertical).
-    pub fn with_ufs(mut self, ufs: Ufs) -> Result<Self> {
-        self.ufs = Some(UfsRuntime::new(ufs)?);
+    /// Attach OpenDAL UFS with the default in-memory Clean read cache (tests).
+    pub fn with_ufs(self, ufs: Ufs) -> Result<Self> {
+        self.with_ufs_config(ufs, ReadPathConfig::default())
+    }
+
+    /// Attach OpenDAL UFS with an explicit Clean/External HybridCache config.
+    ///
+    /// Production mounts should pass [`ReadPathConfig::for_mount`] so the SSD
+    /// tier is enabled under `<data-dir>/ufs-foyer-cache`.
+    pub fn with_ufs_config(mut self, ufs: Ufs, config: ReadPathConfig) -> Result<Self> {
+        self.ufs = Some(UfsRuntime::new(ufs, config)?);
         Ok(self)
     }
 
@@ -121,6 +129,11 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
 
     pub fn ufs_read_stats(&self) -> Option<ReadPathStats> {
         self.ufs.as_ref().map(|ufs| ufs.reads.stats())
+    }
+
+    /// Inspect the Clean/External read-path cache configuration (if attached).
+    pub fn ufs_read_config(&self) -> Option<&ReadPathConfig> {
+        self.ufs.as_ref().map(|ufs| ufs.reads.config())
     }
 
     pub fn root(&self) -> InodeId {
@@ -1616,5 +1629,46 @@ mod tests {
                 Some(Extent::UfsRange { .. })
             ));
         }
+    }
+
+    #[test]
+    fn mount_ufs_cache_config_reaches_read_path_with_ssd_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let ufs_root = dir.path().join("ufs");
+        std::fs::create_dir_all(&ufs_root).unwrap();
+        std::fs::write(ufs_root.join("obj.bin"), b"hello-clean-cache").unwrap();
+
+        let cfg = ReadPathConfig::for_mount(
+            dir.path(),
+            16 * 1024 * 1024,
+            16 * 1024 * 1024,
+            None,
+        );
+        assert_eq!(
+            cfg.cache_dir.as_deref(),
+            Some(dir.path().join("ufs-foyer-cache").as_path())
+        );
+        assert_ne!(
+            cfg.cache_dir.as_deref(),
+            Some(dir.path().join("foyer-cache").as_path()),
+            "UFS cache dir must stay isolated from Worker foyer-cache"
+        );
+        assert!(cfg.disk_capacity_bytes > 0);
+
+        let client = FluxClient::new(
+            HeedMetaStore::open(dir.path().join("meta")).unwrap(),
+            DiskChunkStore::open(dir.path().join("chunks")).unwrap(),
+        )
+        .with_ufs_config(Ufs::local(&ufs_root).unwrap(), cfg.clone())
+        .unwrap();
+
+        let live = client.ufs_read_config().expect("ufs attached");
+        assert_eq!(live.disk_capacity_bytes, cfg.disk_capacity_bytes);
+        assert_eq!(live.cache_dir, cfg.cache_dir);
+        assert!(live.cache_dir.as_ref().unwrap().exists());
+
+        let inode = client.lookup(ROOT_INODE, "obj.bin").unwrap();
+        assert_eq!(client.read_all(inode.id).unwrap(), b"hello-clean-cache");
+        assert!(client.ufs_read_stats().unwrap().backend_fetches >= 1);
     }
 }

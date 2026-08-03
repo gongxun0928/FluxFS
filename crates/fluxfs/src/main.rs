@@ -4,7 +4,7 @@ use fluxfs_chunk::{ChunkStore, DiskChunkStore, RemoteReplicatedChunkStore, Repli
 use fluxfs_client::FluxClient;
 use fluxfs_meta::{start_single_voter, HeedMetaStore, MetaStore, RaftMetaStore, RemoteMetaStore};
 use fluxfs_types::{FileType, ROOT_INODE};
-use fluxfs_ufs::{RangeReq, S3Options, Ufs};
+use fluxfs_ufs::{RangeReq, ReadPathConfig, S3Options, Ufs};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -86,6 +86,16 @@ enum Cmd {
         /// Maximum chunk operations waiting in the remote client queue.
         #[arg(long, default_value_t = fluxfs_chunk::DEFAULT_MAX_PENDING_CHUNK_OPS)]
         chunk_max_pending: usize,
+        /// Clean/External UFS HybridCache DRAM capacity (task #39).
+        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        ufs_cache_memory_bytes: usize,
+        /// Clean/External UFS HybridCache SSD capacity. `0` disables the disk tier.
+        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        ufs_cache_disk_bytes: usize,
+        /// Directory for the UFS foyer SSD device. Defaults to
+        /// `<data-dir>/ufs-foyer-cache` (isolated from Worker `foyer-cache`).
+        #[arg(long)]
+        ufs_cache_dir: Option<PathBuf>,
         #[command(flatten)]
         tls: TlsClientArgs,
     },
@@ -195,6 +205,9 @@ async fn main() -> Result<()> {
             meta_addr,
             chunk_workers,
             chunk_max_pending,
+            ufs_cache_memory_bytes,
+            ufs_cache_disk_bytes,
+            ufs_cache_dir,
             tls,
         } => match (no_ufs, ufs.as_deref()) {
             (true, None) => run_mount(
@@ -208,13 +221,19 @@ async fn main() -> Result<()> {
             )?,
             (false, Some(uri)) => {
                 let ufs = open_ufs_uri(uri).context("open --ufs")?;
+                let read_cfg = ReadPathConfig::for_mount(
+                    &data_dir,
+                    ufs_cache_memory_bytes,
+                    ufs_cache_disk_bytes,
+                    ufs_cache_dir,
+                );
                 run_mount(
                     data_dir,
                     mountpoint,
                     meta_addr,
                     chunk_workers,
                     chunk_max_pending,
-                    Some(ufs),
+                    Some((ufs, read_cfg)),
                     tls,
                 )?;
             }
@@ -365,7 +384,7 @@ fn run_mount(
     meta_addr: Option<String>,
     chunk_workers: Vec<String>,
     chunk_max_pending: usize,
-    ufs: Option<Ufs>,
+    ufs: Option<(Ufs, ReadPathConfig)>,
     tls: TlsClientArgs,
 ) -> Result<()> {
     if !fluxfs_fuse::mount_supported() {
@@ -433,7 +452,7 @@ fn mount_remote_chunks(
     mountpoint: PathBuf,
     meta_addr: Option<String>,
     chunks: RemoteReplicatedChunkStore,
-    ufs: Option<Ufs>,
+    ufs: Option<(Ufs, ReadPathConfig)>,
     tls: TlsClientArgs,
 ) -> Result<()> {
     let available = chunks
@@ -474,7 +493,7 @@ fn mount_with_chunks<C: ChunkStore + 'static>(
     meta_addr: Option<String>,
     chunks: C,
     chunk_mode: &str,
-    ufs: Option<Ufs>,
+    ufs: Option<(Ufs, ReadPathConfig)>,
     tls: TlsClientArgs,
 ) -> Result<()> {
     let mode = if ufs.is_some() {
@@ -711,11 +730,24 @@ fn reconcile_before_mount<M: MetaStore, C: ChunkStore>(client: &FluxClient<M, C>
 fn build_client<M: MetaStore + 'static, C: ChunkStore + 'static>(
     meta: M,
     chunks: C,
-    ufs: Option<Ufs>,
+    ufs: Option<(Ufs, ReadPathConfig)>,
 ) -> Result<Arc<FluxClient<M, C>>> {
     let client = FluxClient::new(meta, chunks);
-    let client = if let Some(ufs) = ufs {
-        client.with_ufs(ufs).context("attach UFS")?
+    let client = if let Some((ufs, read_cfg)) = ufs {
+        if read_cfg.disk_capacity_bytes > 0 {
+            let dir = read_cfg
+                .cache_dir
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<unset>".into());
+            println!(
+                "ufs clean cache: memory_parts={} disk_bytes={} dir={}",
+                read_cfg.max_cached_parts, read_cfg.disk_capacity_bytes, dir
+            );
+        }
+        client
+            .with_ufs_config(ufs, read_cfg)
+            .context("attach UFS")?
     } else {
         client
     };

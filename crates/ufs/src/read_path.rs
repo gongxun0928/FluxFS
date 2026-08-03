@@ -44,7 +44,34 @@ impl Default for ReadPathConfig {
 impl ReadPathConfig {
     fn memory_capacity_bytes(&self) -> usize {
         let part = self.part_size.max(1) as usize;
-        self.max_cached_parts.max(1).saturating_mul(part).max(64 * 1024)
+        self.max_cached_parts
+            .max(1)
+            .saturating_mul(part)
+            .max(64 * 1024)
+    }
+
+    /// Production Clean/External cache for a FUSE/client mount.
+    ///
+    /// `cache_dir` defaults to `<data_dir>/ufs-foyer-cache` so it never shares
+    /// a foyer device with ChunkWorker (`<worker-data>/foyer-cache`).
+    pub fn for_mount(
+        data_dir: impl AsRef<std::path::Path>,
+        memory_capacity_bytes: usize,
+        disk_capacity_bytes: usize,
+        cache_dir: Option<PathBuf>,
+    ) -> Self {
+        let part_size = 1024 * 1024u64;
+        let part = part_size as usize;
+        let max_cached_parts = memory_capacity_bytes.max(part) / part;
+        Self {
+            part_size,
+            max_cached_parts: max_cached_parts.max(1),
+            prefetch_parts: 2,
+            disk_capacity_bytes,
+            cache_dir: Some(
+                cache_dir.unwrap_or_else(|| data_dir.as_ref().join("ufs-foyer-cache")),
+            ),
+        }
     }
 }
 
@@ -113,6 +140,11 @@ impl UfsReadPath {
             backend_fetches: self.backend_fetches.load(Ordering::Relaxed),
             cache_hits: self.cache_hits.load(Ordering::Relaxed),
         }
+    }
+
+    /// Configuration used to open this HybridCache (production wiring tests).
+    pub fn config(&self) -> &ReadPathConfig {
+        &self.config
     }
 
     /// Read one logical range. `object` pins the size and, when present, ETag.
