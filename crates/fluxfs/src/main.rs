@@ -503,9 +503,17 @@ fn mount_with_chunks<C: ChunkStore + 'static>(
         let raft_dir = data_dir.join("raft");
         let store = Arc::new(HeedMetaStore::open(&meta_path).context("open meta")?);
         let rt = tokio::runtime::Runtime::new().context("tokio runtime")?;
-        let raft = rt
-            .block_on(start_single_voter(store.clone(), &raft_dir, "127.0.0.1:0"))
-            .context("start embedded openraft")?;
+        // This fn runs inside `#[tokio::main]`'s multi-thread runtime; calling
+        // `rt.block_on(...)` directly would nest runtimes and panic. Use
+        // `block_in_place` on the AMBIENT runtime to release its worker while
+        // the embedded raft runtime drives `start_single_voter` to completion.
+        // The `rt` is then handed off to RaftMetaStore, which keeps it alive
+        // for the lifetime of the mount.
+        let raft_handle = rt.handle().clone();
+        let raft = tokio::task::block_in_place(|| {
+            raft_handle.block_on(start_single_voter(store.clone(), &raft_dir, "127.0.0.1:0"))
+        })
+        .context("start embedded openraft")?;
         let meta = RaftMetaStore::new_owned(store, raft, rt);
         let client = build_client(meta, chunks, ufs)?;
         reconcile_before_mount(&client)?;
