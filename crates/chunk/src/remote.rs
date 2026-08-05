@@ -1176,7 +1176,9 @@ async fn inventory_page_with_holders(
                 )));
             }
             let has_more = !response.next_cursor.is_empty();
-            let buf = buffers.get_mut(worker_id).expect("buffer for healthy worker");
+            let buf = buffers
+                .get_mut(worker_id)
+                .expect("buffer for healthy worker");
             for raw in response.chunk_ids {
                 buf.push_back(ChunkId::try_from(raw.as_slice())?);
             }
