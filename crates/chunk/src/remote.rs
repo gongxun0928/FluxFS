@@ -487,6 +487,8 @@ fn rpc_loop(
     // Exclusive per-worker after-cursor for repair inventory merge.
     // Absence means "start from the beginning" for that worker.
     let mut repair_cursor: BTreeMap<u64, ChunkId> = BTreeMap::new();
+    // Per-worker cursors for GC/`list_chunks_page` (reset when caller passes cursor=None).
+    let mut list_cursor: BTreeMap<u64, ChunkId> = BTreeMap::new();
     let mut meta_client = {
         let _enter = runtime.enter();
         meta_endpoint.and_then(|endpoint| {
@@ -525,6 +527,7 @@ fn rpc_loop(
                     if routing_rebuilt {
                         last_healthy.clear();
                         repair_cursor.clear();
+                        list_cursor.clear();
                     }
                 }
             }
@@ -535,6 +538,7 @@ fn rpc_loop(
             required,
             &mut last_healthy,
             &mut repair_cursor,
+            &mut list_cursor,
             command,
         ));
     }
@@ -632,6 +636,7 @@ async fn handle_command(
     required: usize,
     last_healthy: &mut BTreeSet<u64>,
     repair_cursor: &mut BTreeMap<u64, ChunkId>,
+    list_cursor: &mut BTreeMap<u64, ChunkId>,
     command: Command,
 ) {
     match command {
@@ -865,7 +870,13 @@ async fn handle_command(
             limit,
             reply,
         } => {
-            let result = all_chunks_page(clients, cursor, limit).await;
+            // `cursor=None` means "restart walk"; `Some(_)` continues the
+            // durable per-worker merge state (the ChunkId value is only a
+            // client-side continuation token).
+            if cursor.is_none() {
+                list_cursor.clear();
+            }
+            let result = all_chunks_page(clients, list_cursor, limit).await;
             let _ = reply.send(result);
         }
         Command::Targets { reply } => {
@@ -893,7 +904,7 @@ async fn handle_command(
 
 async fn all_chunks_page(
     clients: &mut [WorkerRpcClient],
-    cursor: Option<ChunkId>,
+    list_cursor: &mut BTreeMap<u64, ChunkId>,
     limit: usize,
 ) -> Result<ChunkPage> {
     if limit == 0 {
@@ -901,20 +912,12 @@ async fn all_chunks_page(
             "chunk inventory page limit must be non-zero".into(),
         ));
     }
-    // Single global cursor API: merge with per-worker local cursors seeded from
-    // the same exclusive after, then advance only keys actually returned.
-    let mut local: BTreeMap<u64, ChunkId> = BTreeMap::new();
-    if let Some(cursor) = cursor {
-        for client in clients.iter() {
-            local.insert(client.id.0, cursor);
-        }
-    }
     let healthy: BTreeMap<u64, usize> = clients
         .iter()
         .enumerate()
         .map(|(index, client)| (client.id.0, index))
         .collect();
-    let page = inventory_page_with_holders(clients, &healthy, &mut local, limit).await?;
+    let page = inventory_page_with_holders(clients, &healthy, list_cursor, limit).await?;
     Ok(ChunkPage {
         chunks: page.chunks.keys().copied().collect(),
         next_cursor: page.more.then(|| {
@@ -1345,6 +1348,32 @@ mod tests {
             let page = take_merged_inventory_page_from_lists(&workers, &mut cursor, 2);
             got.extend(page.chunks.keys().copied());
             if !page.more {
+                break;
+            }
+        }
+        assert_eq!(got, vec![a, b, c]);
+    }
+
+    #[test]
+    fn list_chunks_page_style_global_token_keeps_per_worker_state() {
+        // Simulates GC/`all_chunks_page`: caller only stores Option<last>, but
+        // the RPC thread keeps the real per-worker cursors across calls
+        // (`cursor=None` resets; `Some(_)` continues without reseeding).
+        let a = raw_id(1);
+        let b = raw_id(2);
+        let c = raw_id(3);
+        let workers = BTreeMap::from([(1u64, vec![a, c]), (2u64, vec![b])]);
+        let mut list_cursor = BTreeMap::new();
+        let mut client_token: Option<ChunkId> = None;
+        let mut got = Vec::new();
+        loop {
+            if client_token.is_none() {
+                list_cursor.clear();
+            }
+            let page = take_merged_inventory_page_from_lists(&workers, &mut list_cursor, 2);
+            got.extend(page.chunks.keys().copied());
+            client_token = page.more.then(|| *page.chunks.keys().next_back().unwrap());
+            if client_token.is_none() {
                 break;
             }
         }
