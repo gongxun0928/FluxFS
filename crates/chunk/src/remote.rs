@@ -16,7 +16,7 @@ use fluxfs_proto::{ChunkWorkerClient, MetaServiceClient};
 use fluxfs_types::{
     ChunkId, ChunkPage, FluxError, Result, WorkerMembership, WorkerTargetId, CHUNK_SIZE,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -484,7 +484,9 @@ fn rpc_loop(
         })
         .collect::<Vec<_>>();
     let mut last_healthy = BTreeSet::new();
-    let mut repair_cursor: Option<ChunkId> = None;
+    // Exclusive per-worker after-cursor for repair inventory merge.
+    // Absence means "start from the beginning" for that worker.
+    let mut repair_cursor: BTreeMap<u64, ChunkId> = BTreeMap::new();
     let mut meta_client = {
         let _enter = runtime.enter();
         meta_endpoint.and_then(|endpoint| {
@@ -522,7 +524,7 @@ fn rpc_loop(
                     );
                     if routing_rebuilt {
                         last_healthy.clear();
-                        repair_cursor = None;
+                        repair_cursor.clear();
                     }
                 }
             }
@@ -629,7 +631,7 @@ async fn handle_command(
     membership: Option<&WorkerMembership>,
     required: usize,
     last_healthy: &mut BTreeSet<u64>,
-    repair_cursor: &mut Option<ChunkId>,
+    repair_cursor: &mut BTreeMap<u64, ChunkId>,
     command: Command,
 ) {
     match command {
@@ -644,7 +646,7 @@ async fn handle_command(
             };
             let current = healthy.keys().copied().collect::<BTreeSet<_>>();
             if &current != last_healthy {
-                *repair_cursor = None;
+                repair_cursor.clear();
                 match repair_with_health(clients, membership, required, &healthy, repair_cursor)
                     .await
                 {
@@ -827,7 +829,7 @@ async fn handle_command(
         Command::Repair { reply } => {
             let result = async {
                 let healthy = healthy_workers(clients).await?;
-                *repair_cursor = None;
+                repair_cursor.clear();
                 let report =
                     repair_with_health(clients, membership, required, &healthy, repair_cursor)
                         .await?;
@@ -842,7 +844,7 @@ async fn handle_command(
                 let healthy = healthy_workers(clients).await?;
                 let current = healthy.keys().copied().collect::<BTreeSet<_>>();
                 if &current != last_healthy {
-                    *repair_cursor = None;
+                    repair_cursor.clear();
                     *last_healthy = current;
                 }
                 repair_pass_with_health(
@@ -899,39 +901,29 @@ async fn all_chunks_page(
             "chunk inventory page limit must be non-zero".into(),
         ));
     }
-    let mut chunks = Vec::new();
-    let mut reached = 0usize;
-    let mut worker_has_more = false;
-    for client in clients.iter_mut() {
-        if let Ok(response) = client
-            .client
-            .list_chunks(ListChunksRequest {
-                after_chunk_id: cursor
-                    .map(|chunk| chunk.as_bytes().to_vec())
-                    .unwrap_or_default(),
-                limit: limit.try_into().unwrap_or(u32::MAX),
-            })
-            .await
-        {
-            reached += 1;
-            let response = response.into_inner();
-            worker_has_more |= !response.next_cursor.is_empty();
-            for raw in response.chunk_ids {
-                chunks.push(ChunkId::try_from(raw.as_slice())?);
-            }
+    // Single global cursor API: merge with per-worker local cursors seeded from
+    // the same exclusive after, then advance only keys actually returned.
+    let mut local: BTreeMap<u64, ChunkId> = BTreeMap::new();
+    if let Some(cursor) = cursor {
+        for client in clients.iter() {
+            local.insert(client.id.0, cursor);
         }
     }
-    if reached == 0 {
-        return Err(FluxError::Io("chunk inventory reached no workers".into()));
-    }
-    chunks.sort_by_key(ChunkId::to_hex);
-    chunks.dedup();
-    let has_more = worker_has_more || chunks.len() > limit;
-    chunks.truncate(limit);
-    let next_cursor = has_more.then(|| *chunks.last().expect("non-empty inventory page"));
+    let healthy: BTreeMap<u64, usize> = clients
+        .iter()
+        .enumerate()
+        .map(|(index, client)| (client.id.0, index))
+        .collect();
+    let page = inventory_page_with_holders(clients, &healthy, &mut local, limit).await?;
     Ok(ChunkPage {
-        chunks,
-        next_cursor,
+        chunks: page.chunks.keys().copied().collect(),
+        next_cursor: page.more.then(|| {
+            *page
+                .chunks
+                .keys()
+                .next_back()
+                .expect("non-empty page when more")
+        }),
     })
 }
 
@@ -993,9 +985,9 @@ async fn repair_with_health(
     membership: Option<&WorkerMembership>,
     required: usize,
     healthy: &BTreeMap<u64, usize>,
-    repair_cursor: &mut Option<ChunkId>,
+    repair_cursor: &mut BTreeMap<u64, ChunkId>,
 ) -> Result<RepairReport> {
-    *repair_cursor = None;
+    repair_cursor.clear();
     let mut checked_chunks = 0usize;
     let mut repaired_replicas = 0usize;
     loop {
@@ -1026,7 +1018,7 @@ async fn repair_pass_with_health(
     membership: Option<&WorkerMembership>,
     required: usize,
     healthy: &BTreeMap<u64, usize>,
-    repair_cursor: &mut Option<ChunkId>,
+    repair_cursor: &mut BTreeMap<u64, ChunkId>,
     limit: usize,
 ) -> Result<RepairReport> {
     if healthy.len() < required {
@@ -1041,7 +1033,7 @@ async fn repair_pass_with_health(
         ));
     }
 
-    let page = inventory_page_with_holders(clients, healthy, *repair_cursor, limit).await?;
+    let page = inventory_page_with_holders(clients, healthy, repair_cursor, limit).await?;
     let checked_chunks = page.chunks.len();
     let mut repaired_replicas = 0usize;
 
@@ -1121,71 +1113,170 @@ async fn repair_pass_with_health(
         }
     }
 
-    *repair_cursor = page.next_cursor;
     Ok(RepairReport {
         healthy_workers: healthy.keys().copied().collect(),
         checked_chunks,
         repaired_replicas,
-        more: page.next_cursor.is_some(),
+        more: page.more,
     })
 }
 
 struct InventoryPage {
     chunks: BTreeMap<ChunkId, BTreeSet<u64>>,
-    next_cursor: Option<ChunkId>,
+    more: bool,
 }
 
+/// K-way merge of per-worker inventory pages with independent exclusive cursors.
+///
+/// A shared global `after` + truncate-to-limit is incorrect when workers hold
+/// disjoint key ranges: keys fetched but truncated from the merged page can be
+/// skipped if the walk stops early, and holder sets can be incomplete. Each
+/// worker only advances past keys it contributed to an emitted page entry.
 async fn inventory_page_with_holders(
     clients: &mut [WorkerRpcClient],
     healthy: &BTreeMap<u64, usize>,
-    cursor: Option<ChunkId>,
+    cursor: &mut BTreeMap<u64, ChunkId>,
     limit: usize,
 ) -> Result<InventoryPage> {
-    let mut inventory = BTreeMap::<ChunkId, BTreeSet<u64>>::new();
-    let mut worker_has_more = false;
-    let after = cursor
-        .map(|chunk| chunk.as_bytes().to_vec())
-        .unwrap_or_default();
-    for (worker_id, index) in healthy {
-        let response = clients[*index]
-            .client
-            .list_chunks(ListChunksRequest {
-                after_chunk_id: after.clone(),
-                limit: limit.try_into().unwrap_or(u32::MAX),
-            })
-            .await
-            .map_err(rpc_status_error)?
-            .into_inner();
-        if response.worker_id != *worker_id {
-            return Err(FluxError::Io(format!(
-                "inventory worker id mismatch: expected {worker_id}, got {}",
-                response.worker_id
-            )));
-        }
-        worker_has_more |= !response.next_cursor.is_empty();
-        for raw in response.chunk_ids {
-            inventory
-                .entry(ChunkId::try_from(raw.as_slice())?)
-                .or_default()
-                .insert(*worker_id);
-        }
+    let mut buffers: BTreeMap<u64, VecDeque<ChunkId>> = BTreeMap::new();
+    let mut may_have_more: BTreeMap<u64, bool> = BTreeMap::new();
+    for worker_id in healthy.keys().copied() {
+        buffers.insert(worker_id, VecDeque::new());
+        may_have_more.insert(worker_id, true);
     }
 
-    let mut keys = inventory.keys().copied().collect::<Vec<_>>();
-    keys.sort_by_key(ChunkId::to_hex);
-    let has_more = worker_has_more || keys.len() > limit;
-    keys.truncate(limit);
-    let next_cursor = has_more.then(|| *keys.last().expect("non-empty inventory page"));
-    let mut page_chunks = BTreeMap::new();
-    for key in keys {
-        if let Some(holders) = inventory.remove(&key) {
-            page_chunks.insert(key, holders);
+    let mut page_chunks = BTreeMap::<ChunkId, BTreeSet<u64>>::new();
+    while page_chunks.len() < limit {
+        for (worker_id, index) in healthy {
+            let buf_empty = buffers
+                .get(worker_id)
+                .is_none_or(std::collections::VecDeque::is_empty);
+            if !buf_empty || !may_have_more.get(worker_id).copied().unwrap_or(false) {
+                continue;
+            }
+            let after = cursor.get(worker_id).copied();
+            let response = clients[*index]
+                .client
+                .list_chunks(ListChunksRequest {
+                    after_chunk_id: after
+                        .map(|chunk| chunk.as_bytes().to_vec())
+                        .unwrap_or_default(),
+                    limit: limit.try_into().unwrap_or(u32::MAX),
+                })
+                .await
+                .map_err(rpc_status_error)?
+                .into_inner();
+            if response.worker_id != *worker_id {
+                return Err(FluxError::Io(format!(
+                    "inventory worker id mismatch: expected {worker_id}, got {}",
+                    response.worker_id
+                )));
+            }
+            let has_more = !response.next_cursor.is_empty();
+            let buf = buffers.get_mut(worker_id).expect("buffer for healthy worker");
+            for raw in response.chunk_ids {
+                buf.push_back(ChunkId::try_from(raw.as_slice())?);
+            }
+            if buf.is_empty() {
+                may_have_more.insert(*worker_id, false);
+            } else {
+                may_have_more.insert(*worker_id, has_more);
+            }
         }
+
+        let Some(min_key) = buffers
+            .values()
+            .filter_map(|buf| buf.front().copied())
+            .min()
+        else {
+            break;
+        };
+        let mut holders = BTreeSet::new();
+        for (worker_id, buf) in buffers.iter_mut() {
+            if buf.front().copied() == Some(min_key) {
+                buf.pop_front();
+                holders.insert(*worker_id);
+                cursor.insert(*worker_id, min_key);
+            }
+        }
+        page_chunks.insert(min_key, holders);
     }
+
+    let more = page_chunks.len() == limit
+        && (buffers.values().any(|buf| !buf.is_empty())
+            || may_have_more.values().any(|more| *more));
     Ok(InventoryPage {
         chunks: page_chunks,
-        next_cursor,
+        more,
     })
+}
+
+#[cfg(test)]
+/// Pure k-way merge used by unit tests (same cursor advance rules as the RPC path).
+fn take_merged_inventory_page_from_lists(
+    worker_lists: &BTreeMap<u64, Vec<ChunkId>>,
+    cursor: &mut BTreeMap<u64, ChunkId>,
+    limit: usize,
+) -> InventoryPage {
+    let mut buffers: BTreeMap<u64, VecDeque<ChunkId>> = BTreeMap::new();
+    let mut may_have_more: BTreeMap<u64, bool> = BTreeMap::new();
+    for worker_id in worker_lists.keys().copied() {
+        buffers.insert(worker_id, VecDeque::new());
+        may_have_more.insert(worker_id, true);
+    }
+
+    let mut page_chunks = BTreeMap::<ChunkId, BTreeSet<u64>>::new();
+    while page_chunks.len() < limit {
+        for (worker_id, list) in worker_lists {
+            let buf_empty = buffers
+                .get(worker_id)
+                .is_none_or(std::collections::VecDeque::is_empty);
+            if !buf_empty || !may_have_more.get(worker_id).copied().unwrap_or(false) {
+                continue;
+            }
+            let after = cursor.get(worker_id).copied();
+            let mut page = list
+                .iter()
+                .copied()
+                .filter(|chunk| after.is_none_or(|cursor| *chunk > cursor))
+                .take(limit.saturating_add(1))
+                .collect::<Vec<_>>();
+            let has_more = page.len() > limit;
+            page.truncate(limit);
+            let buf = buffers.get_mut(worker_id).expect("buffer");
+            buf.extend(page.iter().copied());
+            if buf.is_empty() {
+                may_have_more.insert(*worker_id, false);
+            } else {
+                may_have_more.insert(*worker_id, has_more);
+            }
+        }
+
+        let Some(min_key) = buffers
+            .values()
+            .filter_map(|buf| buf.front().copied())
+            .min()
+        else {
+            break;
+        };
+        let mut holders = BTreeSet::new();
+        for (worker_id, buf) in buffers.iter_mut() {
+            if buf.front().copied() == Some(min_key) {
+                buf.pop_front();
+                holders.insert(*worker_id);
+                cursor.insert(*worker_id, min_key);
+            }
+        }
+        page_chunks.insert(min_key, holders);
+    }
+
+    let more = page_chunks.len() == limit
+        && (buffers.values().any(|buf| !buf.is_empty())
+            || may_have_more.values().any(|more| *more));
+    InventoryPage {
+        chunks: page_chunks,
+        more,
+    }
 }
 
 #[cfg(test)]
@@ -1232,6 +1323,62 @@ mod tests {
         const {
             assert!(REPAIR_PAGE_SIZE > 0);
             assert!(REPAIR_PAGE_SIZE < u32::MAX as usize);
+        }
+    }
+
+    fn raw_id(byte: u8) -> ChunkId {
+        ChunkId::from_raw([byte; 32])
+    }
+
+    #[test]
+    fn merged_inventory_uneven_workers_does_not_skip_keys() {
+        // gpt56 #27 counterexample: A=[a,c] (exact page, no next), B=[b], limit=2.
+        let a = raw_id(1);
+        let b = raw_id(2);
+        let c = raw_id(3);
+        assert!(a < b && b < c);
+
+        let workers = BTreeMap::from([(1u64, vec![a, c]), (2u64, vec![b])]);
+        let mut cursor = BTreeMap::new();
+        let mut got = Vec::new();
+        loop {
+            let page = take_merged_inventory_page_from_lists(&workers, &mut cursor, 2);
+            got.extend(page.chunks.keys().copied());
+            if !page.more {
+                break;
+            }
+        }
+        assert_eq!(got, vec![a, b, c]);
+    }
+
+    #[test]
+    fn merged_inventory_skewed_ranges_cover_all_keys_and_holders() {
+        // Disjoint ranges across workers with small page size.
+        let keys: Vec<ChunkId> = (1u8..=9).map(raw_id).collect();
+        let workers = BTreeMap::from([
+            (1u64, vec![keys[0], keys[1], keys[2], keys[6]]), // 1,2,3,7
+            (2u64, vec![keys[3], keys[4], keys[5]]),          // 4,5,6
+            (3u64, vec![keys[2], keys[7], keys[8]]),          // 3,8,9 (3 shared w/ W1)
+        ]);
+        let mut cursor = BTreeMap::new();
+        let mut got = BTreeMap::<ChunkId, BTreeSet<u64>>::new();
+        loop {
+            let page = take_merged_inventory_page_from_lists(&workers, &mut cursor, 2);
+            for (chunk, holders) in page.chunks {
+                assert!(
+                    got.insert(chunk, holders.clone()).is_none(),
+                    "duplicate chunk {}",
+                    chunk.to_hex()
+                );
+            }
+            if !page.more {
+                break;
+            }
+        }
+        assert_eq!(got.len(), 9);
+        assert_eq!(got.get(&keys[2]).unwrap(), &BTreeSet::from([1u64, 3]));
+        for (i, key) in keys.iter().enumerate() {
+            assert!(got.contains_key(key), "missing key index {i}");
         }
     }
 
