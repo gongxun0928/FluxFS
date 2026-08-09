@@ -13,6 +13,7 @@ use fluxfs_proto::chunk::v1::{
 };
 use fluxfs_proto::meta::v1::GetWorkerMembershipRequest;
 use fluxfs_proto::meta_codec::decode_worker_membership;
+use fluxfs_proto::request_id::RequestIdInterceptor;
 use fluxfs_proto::{ChunkWorkerClient, MetaServiceClient};
 use fluxfs_types::{
     ChunkId, ChunkPage, FluxError, Result, WorkerMembership, WorkerTargetId, CHUNK_SIZE,
@@ -347,15 +348,15 @@ impl RemoteReplicatedChunkStore {
 
     /// One throttled scrub page on the low-priority GC RPC pool.
     pub fn repair_pass(&self, limit: usize) -> Result<RepairReport> {
-        let started = Instant::now();
         let span = tracing::info_span!("repair_pass", limit);
         let _enter = span.enter();
+        let _timer =
+            fluxfs_metrics::process_metrics().map(|m| m.repair_pass_latency_ms.start_timer());
         let report = self.call_gc(|reply| Command::RepairPass { limit, reply })?;
         if let Some(m) = fluxfs_metrics::process_metrics() {
             FluxMetrics::inc(&m.repair_pass_total);
             FluxMetrics::add(&m.repair_replica_total, report.repaired_replicas as u64);
             FluxMetrics::set(&m.repair_lag_more, u64::from(report.more));
-            FluxMetrics::observe_ms(&m.repair_pass_latency_ms, started);
         }
         Ok(report)
     }
@@ -464,9 +465,13 @@ impl Drop for RemoteReplicatedChunkStore {
     }
 }
 
+type ChunkClient = ChunkWorkerClient<
+    tonic::service::interceptor::InterceptedService<Channel, RequestIdInterceptor>,
+>;
+
 struct WorkerRpcClient {
     id: WorkerTargetId,
-    client: ChunkWorkerClient<Channel>,
+    client: ChunkClient,
 }
 
 fn rpc_loop(
@@ -489,7 +494,7 @@ fn rpc_loop(
         .into_iter()
         .map(|(id, channel)| WorkerRpcClient {
             id,
-            client: ChunkWorkerClient::new(channel)
+            client: ChunkWorkerClient::with_interceptor(channel, RequestIdInterceptor)
                 .max_decoding_message_size(MAX_CHUNK_RPC_MESSAGE)
                 .max_encoding_message_size(MAX_CHUNK_RPC_MESSAGE),
         })
@@ -505,7 +510,12 @@ fn rpc_loop(
         meta_endpoint.and_then(|endpoint| {
             configured_endpoint(&endpoint, tls_cfg.as_ref(), insecure_dev)
                 .ok()
-                .map(|endpoint| MetaServiceClient::new(endpoint.connect_lazy()))
+                .map(|endpoint| {
+                    MetaServiceClient::with_interceptor(
+                        endpoint.connect_lazy(),
+                        RequestIdInterceptor,
+                    )
+                })
         })
     };
     let mut last_membership_refresh = Instant::now() - Duration::from_secs(2);
@@ -601,9 +611,12 @@ fn worker_clients_from_membership(
             let endpoint = configured_endpoint(&worker.endpoint, tls_cfg, insecure_dev)?;
             Ok(WorkerRpcClient {
                 id: worker.id,
-                client: ChunkWorkerClient::new(endpoint.connect_lazy())
-                    .max_decoding_message_size(MAX_CHUNK_RPC_MESSAGE)
-                    .max_encoding_message_size(MAX_CHUNK_RPC_MESSAGE),
+                client: ChunkWorkerClient::with_interceptor(
+                    endpoint.connect_lazy(),
+                    RequestIdInterceptor,
+                )
+                .max_decoding_message_size(MAX_CHUNK_RPC_MESSAGE)
+                .max_encoding_message_size(MAX_CHUNK_RPC_MESSAGE),
             })
         })
         .collect()

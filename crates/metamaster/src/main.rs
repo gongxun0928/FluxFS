@@ -31,13 +31,14 @@ use fluxfs_proto::meta_codec::{
 use fluxfs_proto::{MetaService, MetaServiceServer};
 use fluxfs_types::{
     FlushId, FluxError, GcLeaseId, ManifestId, RequestOpId, WorkerMembership, WriteTicketId,
+    PLACEMENT_MIN_AVAILABLE_BYTES,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
 use tonic::{Request, Response, Status};
 use tracing::Instrument;
+use tracing_subscriber::fmt::format::FmtSpan;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -92,35 +93,49 @@ impl MetaSvc {
     fn sample_capacity(&self, membership: &WorkerMembership) {
         let mut min = u64::MAX;
         let mut sum = 0u64;
+        let mut low = 0u64;
         for worker in &membership.workers {
             sum = sum.saturating_add(worker.available_bytes);
             min = min.min(worker.available_bytes);
+            if worker.available_bytes < PLACEMENT_MIN_AVAILABLE_BYTES {
+                low += 1;
+            }
         }
         if membership.workers.is_empty() {
             min = 0;
         }
         FluxMetrics::set(&self.metrics.worker_available_bytes_min, min);
         FluxMetrics::set(&self.metrics.worker_available_bytes_sum, sum);
+        FluxMetrics::set(&self.metrics.worker_capacity_low, low);
     }
 
-    async fn write(&self, req: MetaRaftRequest) -> std::result::Result<MetaRaftResponse, Status> {
-        let started = Instant::now();
+    async fn write(
+        &self,
+        corr_id: &str,
+        req: MetaRaftRequest,
+    ) -> std::result::Result<MetaRaftResponse, Status> {
         let op = req.op_name();
-        let request_id = req
+        let op_id = req
             .request_id()
             .filter(|id| !id.is_none())
             .map(|id| id.to_hex())
             .unwrap_or_else(|| "-".into());
-        let span = tracing::info_span!("meta_rpc", op, request_id = %request_id);
+        let span = tracing::info_span!(
+            "meta_rpc",
+            op,
+            request_id = %corr_id,
+            op_id = %op_id
+        );
         async move {
+            let _timer = self.metrics.meta_rpc_latency_ms.start_timer();
             FluxMetrics::inc(&self.metrics.meta_rpc_total);
+            tracing::debug!(op, request_id = %corr_id, "meta rpc begin");
             // Sample wall time once before propose; apply never reads a clock.
             let req = req.with_ledger_now(fluxfs_meta::unix_time_millis());
             let resp = self.raft.client_write(req).await.map_err(|e| {
                 FluxMetrics::inc(&self.metrics.meta_rpc_error_total);
                 Status::unavailable(format!("raft write: {e}"))
             })?;
-            FluxMetrics::observe_ms(&self.metrics.meta_rpc_latency_ms, started);
             Ok(resp.data)
         }
         .instrument(span)
@@ -227,15 +242,19 @@ impl MetaService for MetaSvc {
         // B4 brought this handler in; capability enforcement added during
         // c1-mtls-auth rebase (gpt56 msg 741e0837): mutating membership write.
         fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
+        let corr_id = fluxfs_proto::request_id::extract_request_id(&req);
         let request = req.into_inner();
         let registration =
             decode_worker_registration(&request.registration_json).map_err(status_from_flux)?;
         let response = self
-            .write(MetaRaftRequest::RegisterWorker {
-                request_id: parse_request_op_id(&request.request_id),
-                ledger_now_unix_ms: 0,
-                registration,
-            })
+            .write(
+                &corr_id,
+                MetaRaftRequest::RegisterWorker {
+                    request_id: parse_request_op_id(&request.request_id),
+                    ledger_now_unix_ms: 0,
+                    registration,
+                },
+            )
             .await?;
         let membership = self.map_resp_worker_membership(response)?;
         self.sample_capacity(&membership);
@@ -298,21 +317,25 @@ impl MetaService for MetaSvc {
         req: Request<CreateRequest>,
     ) -> Result<Response<CreateResponse>, Status> {
         fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
+        let corr_id = fluxfs_proto::request_id::extract_request_id(&req);
         let r = req.into_inner();
         let ft = file_type_from_wire(r.file_type).map_err(status_from_flux)?;
         let request_id = parse_request_op_id(&r.request_id);
         let resp = self
-            .write(MetaRaftRequest::Create {
-                request_id,
-                ledger_now_unix_ms: 0,
-                parent: r.parent,
-                name: r.name,
-                file_type: ft,
-                mode: r.mode,
-                uid: r.uid,
-                gid: r.gid,
-                expected_parent_generation: parent_gen_cas(r.expected_parent_generation),
-            })
+            .write(
+                &corr_id,
+                MetaRaftRequest::Create {
+                    request_id,
+                    ledger_now_unix_ms: 0,
+                    parent: r.parent,
+                    name: r.name,
+                    file_type: ft,
+                    mode: r.mode,
+                    uid: r.uid,
+                    gid: r.gid,
+                    expected_parent_generation: parent_gen_cas(r.expected_parent_generation),
+                },
+            )
             .await?;
         let inode = self.map_resp_inode(resp)?;
         Ok(Response::new(CreateResponse {
@@ -337,13 +360,17 @@ impl MetaService for MetaSvc {
         req: Request<PutInodeRequest>,
     ) -> Result<Response<PutInodeResponse>, Status> {
         fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
+        let corr_id = fluxfs_proto::request_id::extract_request_id(&req);
         let inode = decode_inode(&req.into_inner().inode_json).map_err(status_from_flux)?;
         let resp = self
-            .write(MetaRaftRequest::PutInode {
-                request_id: Some(RequestOpId::random()),
-                ledger_now_unix_ms: 0,
-                inode: Box::new(inode),
-            })
+            .write(
+                &corr_id,
+                MetaRaftRequest::PutInode {
+                    request_id: Some(RequestOpId::random()),
+                    ledger_now_unix_ms: 0,
+                    inode: Box::new(inode),
+                },
+            )
             .await?;
         self.map_resp_empty(resp)?;
         Ok(Response::new(PutInodeResponse {}))
@@ -354,14 +381,18 @@ impl MetaService for MetaSvc {
         req: Request<PutManifestRequest>,
     ) -> Result<Response<PutManifestResponse>, Status> {
         fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
+        let corr_id = fluxfs_proto::request_id::extract_request_id(&req);
         let manifest =
             decode_manifest(&req.into_inner().manifest_json).map_err(status_from_flux)?;
         let resp = self
-            .write(MetaRaftRequest::PutManifest {
-                request_id: Some(RequestOpId::random()),
-                ledger_now_unix_ms: 0,
-                manifest: Box::new(manifest),
-            })
+            .write(
+                &corr_id,
+                MetaRaftRequest::PutManifest {
+                    request_id: Some(RequestOpId::random()),
+                    ledger_now_unix_ms: 0,
+                    manifest: Box::new(manifest),
+                },
+            )
             .await?;
         let id = self.map_resp_manifest_id(resp)?;
         Ok(Response::new(PutManifestResponse { manifest_id: id }))
@@ -372,18 +403,22 @@ impl MetaService for MetaSvc {
         req: Request<CommitInodeManifestRequest>,
     ) -> Result<Response<CommitInodeManifestResponse>, Status> {
         fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
+        let corr_id = fluxfs_proto::request_id::extract_request_id(&req);
         let r = req.into_inner();
         let inode = decode_inode(&r.inode_json).map_err(status_from_flux)?;
         let manifest = decode_manifest(&r.manifest_json).map_err(status_from_flux)?;
         let request_id = parse_request_op_id(&r.request_id);
         let resp = self
-            .write(MetaRaftRequest::CommitInodeManifest {
-                request_id,
-                ledger_now_unix_ms: 0,
-                expected_generation: r.expected_generation,
-                inode: Box::new(inode),
-                manifest: Box::new(manifest),
-            })
+            .write(
+                &corr_id,
+                MetaRaftRequest::CommitInodeManifest {
+                    request_id,
+                    ledger_now_unix_ms: 0,
+                    expected_generation: r.expected_generation,
+                    inode: Box::new(inode),
+                    manifest: Box::new(manifest),
+                },
+            )
             .await?;
         let inode = self.map_resp_inode(resp)?;
         let manifest_id = inode
@@ -401,17 +436,21 @@ impl MetaService for MetaSvc {
         req: Request<ReserveChunksRequest>,
     ) -> Result<Response<ReserveChunksResponse>, Status> {
         fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
+        let corr_id = fluxfs_proto::request_id::extract_request_id(&req);
         let r = req.into_inner();
         let response = self
-            .write(MetaRaftRequest::ReserveChunks {
-                request_id: parse_request_op_id(&r.request_id),
-                ledger_now_unix_ms: 0,
-                ticket: WriteTicketId(r.ticket),
-                inode: r.inode,
-                expected_generation: r.expected_generation,
-                chunks: decode_chunk_ids(&r.chunks_json).map_err(status_from_flux)?,
-                expires_at_unix_ms: fluxfs_meta::write_reservation_deadline(),
-            })
+            .write(
+                &corr_id,
+                MetaRaftRequest::ReserveChunks {
+                    request_id: parse_request_op_id(&r.request_id),
+                    ledger_now_unix_ms: 0,
+                    ticket: WriteTicketId(r.ticket),
+                    inode: r.inode,
+                    expected_generation: r.expected_generation,
+                    chunks: decode_chunk_ids(&r.chunks_json).map_err(status_from_flux)?,
+                    expires_at_unix_ms: fluxfs_meta::write_reservation_deadline(),
+                },
+            )
             .await?;
         self.map_resp_empty(response)?;
         Ok(Response::new(ReserveChunksResponse {}))
@@ -422,13 +461,17 @@ impl MetaService for MetaSvc {
         req: Request<AbortChunkReservationRequest>,
     ) -> Result<Response<AbortChunkReservationResponse>, Status> {
         fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
+        let corr_id = fluxfs_proto::request_id::extract_request_id(&req);
         let r = req.into_inner();
         let response = self
-            .write(MetaRaftRequest::AbortChunkReservation {
-                request_id: parse_request_op_id(&r.request_id),
-                ledger_now_unix_ms: 0,
-                ticket: WriteTicketId(r.ticket),
-            })
+            .write(
+                &corr_id,
+                MetaRaftRequest::AbortChunkReservation {
+                    request_id: parse_request_op_id(&r.request_id),
+                    ledger_now_unix_ms: 0,
+                    ticket: WriteTicketId(r.ticket),
+                },
+            )
             .await?;
         self.map_resp_empty(response)?;
         Ok(Response::new(AbortChunkReservationResponse {}))
@@ -439,14 +482,18 @@ impl MetaService for MetaSvc {
         req: Request<ExpireChunkReservationsRequest>,
     ) -> Result<Response<ExpireChunkReservationsResponse>, Status> {
         fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::GcControl)?;
+        let corr_id = fluxfs_proto::request_id::extract_request_id(&req);
         let r = req.into_inner();
         let response = self
-            .write(MetaRaftRequest::ExpireChunkReservations {
-                request_id: None,
-                ledger_now_unix_ms: 0,
-                cutoff_unix_ms: fluxfs_meta::unix_time_millis(),
-                max_to_expire: r.max_to_expire,
-            })
+            .write(
+                &corr_id,
+                MetaRaftRequest::ExpireChunkReservations {
+                    request_id: None,
+                    ledger_now_unix_ms: 0,
+                    cutoff_unix_ms: fluxfs_meta::unix_time_millis(),
+                    max_to_expire: r.max_to_expire,
+                },
+            )
             .await?;
         self.map_resp_empty(response)?;
         Ok(Response::new(ExpireChunkReservationsResponse {}))
@@ -457,16 +504,22 @@ impl MetaService for MetaSvc {
         req: Request<CommitInodeManifestReservedRequest>,
     ) -> Result<Response<CommitInodeManifestResponse>, Status> {
         fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
+        let corr_id = fluxfs_proto::request_id::extract_request_id(&req);
         let r = req.into_inner();
         let response = self
-            .write(MetaRaftRequest::CommitInodeManifestReserved {
-                request_id: parse_request_op_id(&r.request_id),
-                ledger_now_unix_ms: 0,
-                ticket: WriteTicketId(r.ticket),
-                expected_generation: r.expected_generation,
-                inode: Box::new(decode_inode(&r.inode_json).map_err(status_from_flux)?),
-                manifest: Box::new(decode_manifest(&r.manifest_json).map_err(status_from_flux)?),
-            })
+            .write(
+                &corr_id,
+                MetaRaftRequest::CommitInodeManifestReserved {
+                    request_id: parse_request_op_id(&r.request_id),
+                    ledger_now_unix_ms: 0,
+                    ticket: WriteTicketId(r.ticket),
+                    expected_generation: r.expected_generation,
+                    inode: Box::new(decode_inode(&r.inode_json).map_err(status_from_flux)?),
+                    manifest: Box::new(
+                        decode_manifest(&r.manifest_json).map_err(status_from_flux)?,
+                    ),
+                },
+            )
             .await?;
         let inode = self.map_resp_inode(response)?;
         let manifest_id = inode
@@ -484,13 +537,17 @@ impl MetaService for MetaSvc {
         req: Request<TombstoneGcBatchRequest>,
     ) -> Result<Response<TombstoneGcBatchResponse>, Status> {
         fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::GcControl)?;
+        let corr_id = fluxfs_proto::request_id::extract_request_id(&req);
         let r = req.into_inner();
         let response = self
-            .write(MetaRaftRequest::TombstoneGcBatch {
-                request_id: parse_request_op_id(&r.request_id),
-                ledger_now_unix_ms: 0,
-                candidates: decode_chunk_ids(&r.chunks_json).map_err(status_from_flux)?,
-            })
+            .write(
+                &corr_id,
+                MetaRaftRequest::TombstoneGcBatch {
+                    request_id: parse_request_op_id(&r.request_id),
+                    ledger_now_unix_ms: 0,
+                    candidates: decode_chunk_ids(&r.chunks_json).map_err(status_from_flux)?,
+                },
+            )
             .await?;
         let batch = self.map_resp_gc_batch(response)?;
         Ok(Response::new(TombstoneGcBatchResponse {
@@ -515,14 +572,18 @@ impl MetaService for MetaSvc {
         req: Request<InitializeGcDeleteTargetsRequest>,
     ) -> Result<Response<InitializeGcDeleteTargetsResponse>, Status> {
         fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::GcControl)?;
+        let corr_id = fluxfs_proto::request_id::extract_request_id(&req);
         let r = req.into_inner();
         let response = self
-            .write(MetaRaftRequest::InitializeGcDeleteTargets {
-                request_id: None,
-                ledger_now_unix_ms: 0,
-                chunks: decode_chunk_ids(&r.chunks_json).map_err(status_from_flux)?,
-                targets: decode_worker_targets(&r.targets_json).map_err(status_from_flux)?,
-            })
+            .write(
+                &corr_id,
+                MetaRaftRequest::InitializeGcDeleteTargets {
+                    request_id: None,
+                    ledger_now_unix_ms: 0,
+                    chunks: decode_chunk_ids(&r.chunks_json).map_err(status_from_flux)?,
+                    targets: decode_worker_targets(&r.targets_json).map_err(status_from_flux)?,
+                },
+            )
             .await?;
         self.map_resp_empty(response)?;
         Ok(Response::new(InitializeGcDeleteTargetsResponse {}))
@@ -533,13 +594,17 @@ impl MetaService for MetaSvc {
         req: Request<AcknowledgeGcDeletesRequest>,
     ) -> Result<Response<AcknowledgeGcDeletesResponse>, Status> {
         fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::GcControl)?;
+        let corr_id = fluxfs_proto::request_id::extract_request_id(&req);
         let r = req.into_inner();
         let response = self
-            .write(MetaRaftRequest::AcknowledgeGcDeletes {
-                request_id: None,
-                ledger_now_unix_ms: 0,
-                deleted: decode_gc_delete_acks(&r.deleted_json).map_err(status_from_flux)?,
-            })
+            .write(
+                &corr_id,
+                MetaRaftRequest::AcknowledgeGcDeletes {
+                    request_id: None,
+                    ledger_now_unix_ms: 0,
+                    deleted: decode_gc_delete_acks(&r.deleted_json).map_err(status_from_flux)?,
+                },
+            )
             .await?;
         self.map_resp_empty(response)?;
         Ok(Response::new(AcknowledgeGcDeletesResponse {}))
@@ -550,13 +615,17 @@ impl MetaService for MetaSvc {
         req: Request<FinalizeGcTombstonesRequest>,
     ) -> Result<Response<FinalizeGcTombstonesResponse>, Status> {
         fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::GcControl)?;
+        let corr_id = fluxfs_proto::request_id::extract_request_id(&req);
         let r = req.into_inner();
         let response = self
-            .write(MetaRaftRequest::FinalizeGcTombstones {
-                request_id: parse_request_op_id(&r.request_id),
-                ledger_now_unix_ms: 0,
-                chunks: decode_chunk_ids(&r.chunks_json).map_err(status_from_flux)?,
-            })
+            .write(
+                &corr_id,
+                MetaRaftRequest::FinalizeGcTombstones {
+                    request_id: parse_request_op_id(&r.request_id),
+                    ledger_now_unix_ms: 0,
+                    chunks: decode_chunk_ids(&r.chunks_json).map_err(status_from_flux)?,
+                },
+            )
             .await?;
         self.map_resp_empty(response)?;
         Ok(Response::new(FinalizeGcTombstonesResponse {}))
@@ -579,16 +648,20 @@ impl MetaService for MetaSvc {
         req: Request<BeginFlushRequest>,
     ) -> Result<Response<BeginFlushResponse>, Status> {
         fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
+        let corr_id = fluxfs_proto::request_id::extract_request_id(&req);
         let r = req.into_inner();
         let intent = decode_flush_intent(&r.intent_json).map_err(status_from_flux)?;
         let response = self
-            .write(MetaRaftRequest::BeginFlush {
-                request_id: parse_request_op_id(&r.request_id),
-                ledger_now_unix_ms: 0,
-                expected_generation: r.expected_generation,
-                inode: r.inode,
-                intent: Box::new(intent),
-            })
+            .write(
+                &corr_id,
+                MetaRaftRequest::BeginFlush {
+                    request_id: parse_request_op_id(&r.request_id),
+                    ledger_now_unix_ms: 0,
+                    expected_generation: r.expected_generation,
+                    inode: r.inode,
+                    intent: Box::new(intent),
+                },
+            )
             .await?;
         let inode = self.map_resp_inode(response)?;
         Ok(Response::new(BeginFlushResponse {
@@ -601,17 +674,21 @@ impl MetaService for MetaSvc {
         req: Request<CommitFlushRequest>,
     ) -> Result<Response<CommitFlushResponse>, Status> {
         fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
+        let corr_id = fluxfs_proto::request_id::extract_request_id(&req);
         let r = req.into_inner();
         let published_ufs = decode_ufs_object(&r.published_ufs_json).map_err(status_from_flux)?;
         let response = self
-            .write(MetaRaftRequest::CommitFlush {
-                request_id: parse_request_op_id(&r.request_id),
-                ledger_now_unix_ms: 0,
-                expected_generation: r.expected_generation,
-                inode: r.inode,
-                flush_id: FlushId(r.flush_id),
-                published_ufs: Box::new(published_ufs),
-            })
+            .write(
+                &corr_id,
+                MetaRaftRequest::CommitFlush {
+                    request_id: parse_request_op_id(&r.request_id),
+                    ledger_now_unix_ms: 0,
+                    expected_generation: r.expected_generation,
+                    inode: r.inode,
+                    flush_id: FlushId(r.flush_id),
+                    published_ufs: Box::new(published_ufs),
+                },
+            )
             .await?;
         let inode = self.map_resp_inode(response)?;
         Ok(Response::new(CommitFlushResponse {
@@ -624,16 +701,20 @@ impl MetaService for MetaSvc {
         req: Request<FailFlushConflictRequest>,
     ) -> Result<Response<FailFlushConflictResponse>, Status> {
         fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
+        let corr_id = fluxfs_proto::request_id::extract_request_id(&req);
         let r = req.into_inner();
         let response = self
-            .write(MetaRaftRequest::FailFlushConflict {
-                request_id: parse_request_op_id(&r.request_id),
-                ledger_now_unix_ms: 0,
-                expected_generation: r.expected_generation,
-                inode: r.inode,
-                flush_id: FlushId(r.flush_id),
-                error: r.error,
-            })
+            .write(
+                &corr_id,
+                MetaRaftRequest::FailFlushConflict {
+                    request_id: parse_request_op_id(&r.request_id),
+                    ledger_now_unix_ms: 0,
+                    expected_generation: r.expected_generation,
+                    inode: r.inode,
+                    flush_id: FlushId(r.flush_id),
+                    error: r.error,
+                },
+            )
             .await?;
         let inode = self.map_resp_inode(response)?;
         Ok(Response::new(FailFlushConflictResponse {
@@ -658,13 +739,17 @@ impl MetaService for MetaSvc {
         req: Request<BeginGcRequest>,
     ) -> Result<Response<BeginGcResponse>, Status> {
         fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::GcControl)?;
+        let corr_id = fluxfs_proto::request_id::extract_request_id(&req);
         let r = req.into_inner();
         let response = self
-            .write(MetaRaftRequest::BeginGc {
-                request_id: parse_request_op_id(&r.request_id),
-                ledger_now_unix_ms: 0,
-                lease_id: GcLeaseId(r.lease_id),
-            })
+            .write(
+                &corr_id,
+                MetaRaftRequest::BeginGc {
+                    request_id: parse_request_op_id(&r.request_id),
+                    ledger_now_unix_ms: 0,
+                    lease_id: GcLeaseId(r.lease_id),
+                },
+            )
             .await?;
         let plan = self.map_resp_gc_plan(response)?;
         Ok(Response::new(BeginGcResponse {
@@ -690,13 +775,17 @@ impl MetaService for MetaSvc {
         req: Request<FinishGcRequest>,
     ) -> Result<Response<FinishGcResponse>, Status> {
         fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::GcControl)?;
+        let corr_id = fluxfs_proto::request_id::extract_request_id(&req);
         let r = req.into_inner();
         let response = self
-            .write(MetaRaftRequest::FinishGc {
-                request_id: parse_request_op_id(&r.request_id),
-                ledger_now_unix_ms: 0,
-                lease_id: GcLeaseId(r.lease_id),
-            })
+            .write(
+                &corr_id,
+                MetaRaftRequest::FinishGc {
+                    request_id: parse_request_op_id(&r.request_id),
+                    ledger_now_unix_ms: 0,
+                    lease_id: GcLeaseId(r.lease_id),
+                },
+            )
             .await?;
         self.map_resp_empty(response)?;
         Ok(Response::new(FinishGcResponse {}))
@@ -707,6 +796,7 @@ impl MetaService for MetaSvc {
         req: Request<ImportExternalRequest>,
     ) -> Result<Response<ImportExternalResponse>, Status> {
         fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
+        let corr_id = fluxfs_proto::request_id::extract_request_id(&req);
         let r = req.into_inner();
         let inode = decode_inode(&r.inode_json).map_err(status_from_flux)?;
         let manifest = if r.manifest_json.is_empty() {
@@ -715,15 +805,18 @@ impl MetaService for MetaSvc {
             Some(decode_manifest(&r.manifest_json).map_err(status_from_flux)?)
         };
         let resp = self
-            .write(MetaRaftRequest::ImportExternal {
-                request_id: parse_request_op_id(&r.request_id),
-                ledger_now_unix_ms: 0,
-                parent: r.parent,
-                name: r.name,
-                inode: Box::new(inode),
-                manifest: manifest.map(Box::new),
-                expected_parent_generation: parent_gen_cas(r.expected_parent_generation),
-            })
+            .write(
+                &corr_id,
+                MetaRaftRequest::ImportExternal {
+                    request_id: parse_request_op_id(&r.request_id),
+                    ledger_now_unix_ms: 0,
+                    parent: r.parent,
+                    name: r.name,
+                    inode: Box::new(inode),
+                    manifest: manifest.map(Box::new),
+                    expected_parent_generation: parent_gen_cas(r.expected_parent_generation),
+                },
+            )
             .await?;
         let inode = self.map_resp_inode(resp)?;
         Ok(Response::new(ImportExternalResponse {
@@ -736,15 +829,19 @@ impl MetaService for MetaSvc {
         req: Request<UnlinkRequest>,
     ) -> Result<Response<UnlinkResponse>, Status> {
         fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
+        let corr_id = fluxfs_proto::request_id::extract_request_id(&req);
         let r = req.into_inner();
         let resp = self
-            .write(MetaRaftRequest::Unlink {
-                request_id: Some(RequestOpId::random()),
-                ledger_now_unix_ms: 0,
-                parent: r.parent,
-                name: r.name,
-                expected_parent_generation: parent_gen_cas(r.expected_parent_generation),
-            })
+            .write(
+                &corr_id,
+                MetaRaftRequest::Unlink {
+                    request_id: Some(RequestOpId::random()),
+                    ledger_now_unix_ms: 0,
+                    parent: r.parent,
+                    name: r.name,
+                    expected_parent_generation: parent_gen_cas(r.expected_parent_generation),
+                },
+            )
             .await?;
         self.map_resp_empty(resp)?;
         Ok(Response::new(UnlinkResponse {}))
@@ -801,6 +898,7 @@ async fn main() -> Result<()> {
     fluxfs_tls::install_crypto_provider();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
         .init();
     let cli = Cli::parse();
     std::fs::create_dir_all(&cli.data_dir)?;

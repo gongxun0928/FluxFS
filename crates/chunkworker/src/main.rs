@@ -8,15 +8,17 @@ use fluxfs_proto::chunk::v1::{
     GetChunkRequest, GetChunkResponse, HealthRequest, HealthResponse, ListChunksRequest,
     ListChunksResponse, PutChunkRequest, PutChunkResponse,
 };
+use fluxfs_proto::request_id;
 use fluxfs_proto::{ChunkWorker, ChunkWorkerServer};
 use fluxfs_types::{ChunkId, FluxError, WorkerRegistration, WorkerTargetId, CHUNK_SIZE};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response, Status};
 use tracing::Instrument;
+use tracing_subscriber::fmt::format::FmtSpan;
 
 const MAX_CHUNK_RPC_MESSAGE: usize = CHUNK_SIZE as usize + 64 * 1024;
 
@@ -139,35 +141,63 @@ struct ChunkSvc {
     metrics: Arc<FluxMetrics>,
 }
 
-impl ChunkSvc {
-    fn sample_watermarks(&self) {
+/// Releases the semaphore permit then refreshes watermark gauges (fixes stale
+/// available counts after Drop).
+struct TrackedPermit {
+    permit: Option<OwnedSemaphorePermit>,
+    metrics: Arc<FluxMetrics>,
+    pool: Arc<Semaphore>,
+    gc_pool: Arc<Semaphore>,
+}
+
+impl TrackedPermit {
+    fn acquire(
+        pool: &Arc<Semaphore>,
+        gc_pool: &Arc<Semaphore>,
+        metrics: &Arc<FluxMetrics>,
+        gc: bool,
+    ) -> Result<Self, Status> {
+        let target = if gc { gc_pool } else { pool };
+        let permit = Arc::clone(target)
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("chunk worker in-flight limit reached"))?;
+        let tracked = Self {
+            permit: Some(permit),
+            metrics: Arc::clone(metrics),
+            pool: Arc::clone(pool),
+            gc_pool: Arc::clone(gc_pool),
+        };
+        tracked.sample();
+        Ok(tracked)
+    }
+
+    fn sample(&self) {
         FluxMetrics::set(
             &self.metrics.chunk_inflight_available,
-            self.in_flight.available_permits() as u64,
+            self.pool.available_permits() as u64,
         );
         FluxMetrics::set(
             &self.metrics.chunk_gc_inflight_available,
-            self.gc_in_flight.available_permits() as u64,
+            self.gc_pool.available_permits() as u64,
         );
-    }
-
-    fn try_enter(&self) -> Result<OwnedSemaphorePermit, Status> {
-        let permit = try_enter(&self.in_flight);
-        self.sample_watermarks();
-        permit
-    }
-
-    fn try_enter_gc(&self) -> Result<OwnedSemaphorePermit, Status> {
-        let permit = try_enter(&self.gc_in_flight);
-        self.sample_watermarks();
-        permit
     }
 }
 
-fn try_enter(in_flight: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit, Status> {
-    Arc::clone(in_flight)
-        .try_acquire_owned()
-        .map_err(|_| Status::resource_exhausted("chunk worker in-flight limit reached"))
+impl Drop for TrackedPermit {
+    fn drop(&mut self) {
+        self.permit.take();
+        self.sample();
+    }
+}
+
+impl ChunkSvc {
+    fn try_enter(&self) -> Result<TrackedPermit, Status> {
+        TrackedPermit::acquire(&self.in_flight, &self.gc_in_flight, &self.metrics, false)
+    }
+
+    fn try_enter_gc(&self) -> Result<TrackedPermit, Status> {
+        TrackedPermit::acquire(&self.in_flight, &self.gc_in_flight, &self.metrics, true)
+    }
 }
 
 #[tonic::async_trait]
@@ -177,10 +207,17 @@ impl ChunkWorker for ChunkSvc {
         request: Request<PutChunkRequest>,
     ) -> Result<Response<PutChunkResponse>, Status> {
         fluxfs_tls::require_in_extensions(&request, fluxfs_types::auth::Capability::PutChunk)?;
-        let started = Instant::now();
-        let span = tracing::info_span!("chunk_rpc", op = "put_chunk", worker_id = self.worker_id);
+        let request_id = request_id::extract_request_id(&request);
+        let span = tracing::info_span!(
+            "chunk_rpc",
+            op = "put_chunk",
+            request_id = %request_id,
+            worker_id = self.worker_id
+        );
         async move {
+            let _timer = self.metrics.chunk_rpc_latency_ms.start_timer();
             FluxMetrics::inc(&self.metrics.chunk_rpc_total);
+            tracing::debug!(request_id = %request_id, "chunk put begin");
             let _permit = self.try_enter().inspect_err(|_status| {
                 FluxMetrics::inc(&self.metrics.chunk_rpc_error_total);
             })?;
@@ -198,7 +235,6 @@ impl ChunkWorker for ChunkSvc {
                     status_from_flux(error)
                 })?;
             FluxMetrics::add(&self.metrics.chunk_put_bytes_total, nbytes);
-            FluxMetrics::observe_ms(&self.metrics.chunk_rpc_latency_ms, started);
             Ok(Response::new(PutChunkResponse {
                 chunk_id: chunk.as_bytes().to_vec(),
                 worker_id: self.worker_id,
@@ -214,10 +250,17 @@ impl ChunkWorker for ChunkSvc {
         request: Request<GetChunkRequest>,
     ) -> Result<Response<GetChunkResponse>, Status> {
         fluxfs_tls::require_in_extensions(&request, fluxfs_types::auth::Capability::GetChunk)?;
-        let started = Instant::now();
-        let span = tracing::info_span!("chunk_rpc", op = "get_chunk", worker_id = self.worker_id);
+        let request_id = request_id::extract_request_id(&request);
+        let span = tracing::info_span!(
+            "chunk_rpc",
+            op = "get_chunk",
+            request_id = %request_id,
+            worker_id = self.worker_id
+        );
         async move {
+            let _timer = self.metrics.chunk_rpc_latency_ms.start_timer();
             FluxMetrics::inc(&self.metrics.chunk_rpc_total);
+            tracing::debug!(request_id = %request_id, "chunk get begin");
             let _permit = self.try_enter().inspect_err(|_status| {
                 FluxMetrics::inc(&self.metrics.chunk_rpc_error_total);
             })?;
@@ -239,7 +282,6 @@ impl ChunkWorker for ChunkSvc {
                         FluxMetrics::inc(&self.metrics.chunk_rpc_error_total);
                         status_from_flux(error)
                     })?;
-            FluxMetrics::observe_ms(&self.metrics.chunk_rpc_latency_ms, started);
             Ok(Response::new(GetChunkResponse {
                 data,
                 worker_id: self.worker_id,
@@ -350,6 +392,7 @@ async fn main() -> Result<()> {
     fluxfs_tls::install_crypto_provider();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
         .init();
     let cli = Cli::parse();
     if cli.max_in_flight == 0 || cli.gc_max_in_flight == 0 {
@@ -510,9 +553,35 @@ mod tests {
 
     #[test]
     fn in_flight_gate_rejects_without_queueing() {
-        let gate = Arc::new(Semaphore::new(1));
-        let _held = try_enter(&gate).unwrap();
-        let error = try_enter(&gate).unwrap_err();
-        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        let pool = Arc::new(Semaphore::new(1));
+        let gc_pool = Arc::new(Semaphore::new(1));
+        let metrics = FluxMetrics::new();
+        let _held = TrackedPermit::acquire(&pool, &gc_pool, &metrics, false).unwrap();
+        match TrackedPermit::acquire(&pool, &gc_pool, &metrics, false) {
+            Err(error) => assert_eq!(error.code(), tonic::Code::ResourceExhausted),
+            Ok(_) => panic!("expected resource exhausted"),
+        }
+    }
+
+    #[test]
+    fn tracked_permit_restores_inflight_watermark_on_drop() {
+        let pool = Arc::new(Semaphore::new(4));
+        let gc_pool = Arc::new(Semaphore::new(2));
+        let metrics = FluxMetrics::new();
+        {
+            let _held = TrackedPermit::acquire(&pool, &gc_pool, &metrics, false).unwrap();
+            assert_eq!(
+                metrics
+                    .chunk_inflight_available
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                3
+            );
+        }
+        assert_eq!(
+            metrics
+                .chunk_inflight_available
+                .load(std::sync::atomic::Ordering::Relaxed),
+            4
+        );
     }
 }

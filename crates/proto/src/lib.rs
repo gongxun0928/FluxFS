@@ -15,6 +15,7 @@ pub mod chunk {
 }
 
 pub mod meta_codec;
+pub mod request_id;
 
 pub use chunk::v1::chunk_worker_client::ChunkWorkerClient;
 pub use chunk::v1::chunk_worker_server::{ChunkWorker, ChunkWorkerServer};

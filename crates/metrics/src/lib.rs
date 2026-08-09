@@ -34,6 +34,13 @@ impl LatencyHistogram {
         self.count.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn start_timer(&self) -> LatencyTimer<'_> {
+        LatencyTimer {
+            hist: self,
+            started: Instant::now(),
+        }
+    }
+
     fn render(&self, out: &mut String, name: &str, help: &str) {
         out.push_str("# HELP ");
         out.push_str(name);
@@ -66,6 +73,19 @@ impl LatencyHistogram {
     }
 }
 
+/// Observes latency on Drop so early-return / error paths are included.
+pub struct LatencyTimer<'a> {
+    hist: &'a LatencyHistogram,
+    started: Instant,
+}
+
+impl Drop for LatencyTimer<'_> {
+    fn drop(&mut self) {
+        let ms = self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        self.hist.observe_ms(ms);
+    }
+}
+
 /// Shared process metrics registry.
 #[derive(Debug, Default)]
 pub struct FluxMetrics {
@@ -95,6 +115,9 @@ pub struct FluxMetrics {
     pub worker_available_bytes_min: AtomicU64,
     /// Sum of worker `available_bytes` (capacity headroom).
     pub worker_available_bytes_sum: AtomicU64,
+    /// Workers whose advertised `available_bytes` is below placement minimum
+    /// ([`fluxfs_types::PLACEMENT_MIN_AVAILABLE_BYTES`] = 4 MiB). Alert signal.
+    pub worker_capacity_low: AtomicU64,
     /// ChunkWorker foreground semaphore permits currently available.
     pub chunk_inflight_available: AtomicU64,
     /// ChunkWorker GC-pool semaphore permits currently available.
@@ -282,6 +305,12 @@ impl FluxMetrics {
         );
         gauge(
             &mut out,
+            "fluxfs_worker_capacity_low",
+            "Count of workers with available_bytes below placement minimum (4MiB); alert when > 0",
+            self.worker_capacity_low.load(Ordering::Relaxed),
+        );
+        gauge(
+            &mut out,
             "fluxfs_chunk_inflight_available",
             "Foreground ChunkWorker in-flight permits available",
             self.chunk_inflight_available.load(Ordering::Relaxed),
@@ -359,13 +388,25 @@ mod tests {
         FluxMetrics::add(&m.chunk_put_bytes_total, 64);
         m.meta_rpc_latency_ms.observe_ms(3);
         FluxMetrics::set(&m.gc_tombstone_pending, 7);
+        FluxMetrics::set(&m.worker_capacity_low, 2);
         let text = m.render_prometheus();
         assert!(text.contains("fluxfs_meta_rpc_total 1"));
         assert!(text.contains("fluxfs_chunk_put_bytes_total 64"));
         assert!(text.contains("fluxfs_gc_tombstone_pending 7"));
+        assert!(text.contains("fluxfs_worker_capacity_low 2"));
         assert!(text.contains("fluxfs_meta_rpc_latency_ms_bucket{le=\"5\"} 1"));
         assert!(text.contains("fluxfs_meta_rpc_latency_ms_count 1"));
         assert!(text.contains("fluxfs_repair_pass_total"));
+    }
+
+    #[test]
+    fn latency_timer_observes_on_drop_including_early_return() {
+        let m = FluxMetrics::new();
+        {
+            let _timer = m.meta_rpc_latency_ms.start_timer();
+            // simulate error path without explicit observe
+        }
+        assert_eq!(m.meta_rpc_latency_ms.count.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

@@ -12,7 +12,7 @@ use fluxfs_ufs::{ReadPathConfig, ReadPathStats, Ufs, UfsEntryMode, UfsProbe, Ufs
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::Mutex;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::runtime::{Handle, Runtime};
 
 struct UfsRuntime {
@@ -228,9 +228,9 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
     /// Flush one Dirty UFS-backed inode through the durable intent protocol.
     /// Ephemeral and already-clean files are already durable at their declared tier.
     pub fn flush_inode(&self, ino: InodeId) -> Result<Inode> {
-        let started = Instant::now();
         let span = tracing::info_span!("flush_inode", inode = ino);
         let _enter = span.enter();
+        let _timer = fluxfs_metrics::process_metrics().map(|m| m.flush_latency_ms.start_timer());
         let _guard = self
             .io_lock
             .lock()
@@ -289,9 +289,6 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
             self.meta.begin_flush(inode.generation, inode.id, &intent)?;
             self.complete_flush_intent(inode.id, &intent)
         };
-        if let Some(m) = fluxfs_metrics::process_metrics() {
-            FluxMetrics::observe_ms(&m.flush_latency_ms, started);
-        }
         result
     }
 
@@ -345,9 +342,9 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
                 "GC batch size must be non-zero".into(),
             ));
         }
-        let started = Instant::now();
         let span = tracing::info_span!("gc_pass", batch_size);
         let _enter = span.enter();
+        let _timer = fluxfs_metrics::process_metrics().map(|m| m.gc_pass_latency_ms.start_timer());
         if let Some(m) = fluxfs_metrics::process_metrics() {
             FluxMetrics::inc(&m.gc_pass_total);
         }
@@ -384,9 +381,6 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
                 .filter(|tombstone| batch.tombstoned_chunks.contains(&tombstone.chunk))
                 .collect::<Vec<_>>();
             report.removed_chunks += self.reclaim_tombstones(&created)?;
-        }
-        if let Some(m) = fluxfs_metrics::process_metrics() {
-            FluxMetrics::observe_ms(&m.gc_pass_latency_ms, started);
         }
         Ok(report)
     }

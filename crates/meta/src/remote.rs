@@ -17,6 +17,7 @@ use fluxfs_proto::meta_codec::{
     encode_gc_delete_acks, encode_inode, encode_manifest, encode_ufs_object,
     encode_worker_registration, encode_worker_targets, file_type_to_wire, flux_from_status,
 };
+use fluxfs_proto::request_id::RequestIdInterceptor;
 use fluxfs_proto::MetaServiceClient;
 use fluxfs_types::{
     ChunkId, Dentry, FileType, FlushId, FlushIntent, FluxError, GcBatch, GcLeaseId, GcPlan,
@@ -26,12 +27,15 @@ use fluxfs_types::{
 use std::future::Future;
 use std::sync::Mutex;
 use tokio::runtime::{Handle, Runtime};
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
+
+type MetaClient = MetaServiceClient<InterceptedService<Channel, RequestIdInterceptor>>;
 
 pub struct RemoteMetaStore {
     /// Owned runtime only when constructed outside an existing Tokio context.
     rt: Option<Runtime>,
-    client: Mutex<MetaServiceClient<Channel>>,
+    client: Mutex<MetaClient>,
 }
 
 impl RemoteMetaStore {
@@ -90,12 +94,14 @@ impl RemoteMetaStore {
         let (rt, client) = if let Ok(handle) = Handle::try_current() {
             let endpoint = build_endpoint()?;
             let _ = &handle;
-            let client = MetaServiceClient::new(endpoint.connect_lazy());
+            let client =
+                MetaServiceClient::with_interceptor(endpoint.connect_lazy(), RequestIdInterceptor);
             (None, client)
         } else {
             let rt = Runtime::new().map_err(|e| FluxError::Meta(e.to_string()))?;
             let endpoint = build_endpoint()?;
-            let client = MetaServiceClient::new(endpoint.connect_lazy());
+            let client =
+                MetaServiceClient::with_interceptor(endpoint.connect_lazy(), RequestIdInterceptor);
             (Some(rt), client)
         };
 
@@ -105,7 +111,7 @@ impl RemoteMetaStore {
         })
     }
 
-    fn client(&self) -> Result<MetaServiceClient<Channel>> {
+    fn client(&self) -> Result<MetaClient> {
         self.client
             .lock()
             .map(|g| g.clone())

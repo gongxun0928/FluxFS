@@ -164,6 +164,10 @@ async fn main() -> Result<()> {
     fluxfs_tls::install_crypto_provider();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_span_events(
+            tracing_subscriber::fmt::format::FmtSpan::NEW
+                | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
+        )
         .init();
 
     let cli = Cli::parse();
@@ -799,7 +803,10 @@ async fn run_chunk_probe(addr: &str, mode: &str, tls: &TlsClientArgs) -> Result<
     }
     // Connection is lazy; the chosen RPC drives the TLS handshake + Phase 3
     // authz interceptor + per-handler capability evaluation.
-    let mut client = ChunkWorkerClient::new(endpoint.connect_lazy());
+    let mut client = ChunkWorkerClient::with_interceptor(
+        endpoint.connect_lazy(),
+        fluxfs_proto::request_id::RequestIdInterceptor,
+    );
     match mode {
         "health" => {
             let resp = client

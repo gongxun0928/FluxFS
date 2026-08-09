@@ -943,6 +943,10 @@ pub const ROOT_INODE: InodeId = 1;
 /// Default chunk size for MVP. Extents are aligned to this.
 pub const CHUNK_SIZE: u64 = 4 * 1024 * 1024; // 4 MiB
 
+/// Placement refuses workers below this free capacity (one chunk window).
+/// Used by `#31` `fluxfs_worker_capacity_low` alert gauge.
+pub const PLACEMENT_MIN_AVAILABLE_BYTES: u64 = CHUNK_SIZE;
+
 /// Default TTL for External lazy-imported dentry cache.
 pub const EXTERNAL_CACHE_TTL_SECS: u64 = 60;
 

@@ -33,5 +33,6 @@ echo "$BODY" | grep -q 'fluxfs_meta_rpc_latency_ms_bucket'
 echo "$BODY" | grep -q 'fluxfs_gc_tombstone_pending'
 echo "$BODY" | grep -q 'fluxfs_flush_intent_pending'
 echo "$BODY" | grep -q 'fluxfs_worker_available_bytes_min'
+echo "$BODY" | grep -q 'fluxfs_worker_capacity_low'
 echo "$BODY" | grep -q 'fluxfs_repair_pass_total'
 echo "metrics smoke: ok"
