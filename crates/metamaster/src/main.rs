@@ -304,6 +304,7 @@ impl MetaService for MetaSvc {
         let resp = self
             .write(MetaRaftRequest::Create {
                 request_id,
+                ledger_now_unix_ms: 0,
                 parent: r.parent,
                 name: r.name,
                 file_type: ft,
@@ -378,6 +379,7 @@ impl MetaService for MetaSvc {
         let resp = self
             .write(MetaRaftRequest::CommitInodeManifest {
                 request_id,
+                ledger_now_unix_ms: 0,
                 expected_generation: r.expected_generation,
                 inode: Box::new(inode),
                 manifest: Box::new(manifest),
