@@ -257,6 +257,14 @@ impl MetaStore for RaftMetaStore {
         })?)
     }
 
+    fn prune_client_requests(&self, max_to_prune: usize) -> Result<()> {
+        Self::map_empty(self.write(MetaRaftRequest::PruneClientRequests {
+            request_id: None,
+            cutoff_unix_ms: crate::unix_time_millis(),
+            max_to_prune: max_to_prune.try_into().unwrap_or(u64::MAX),
+        })?)
+    }
+
     fn commit_inode_manifest_reserved_with_id(
         &self,
         op_id: RequestOpId,

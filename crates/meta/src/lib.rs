@@ -53,3 +53,7 @@ pub fn unix_time_millis() -> u64 {
 pub fn write_reservation_deadline() -> u64 {
     unix_time_millis().saturating_add(WRITE_RESERVATION_TTL_MS)
 }
+
+pub fn client_request_deadline() -> u64 {
+    unix_time_millis().saturating_add(fluxfs_types::CLIENT_REQUEST_RETENTION_MS)
+}

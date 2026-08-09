@@ -216,7 +216,7 @@ mod tests {
     use super::*;
     use crate::{
         ChunkId, DataGen, DedupResult, Extent, ExtentTree, FileType, FlushId, LocalityLabel,
-        ManifestId, RequestOpId, UfsVersion,
+        ManifestId, RequestOpId, UfsVersion, CLIENT_REQUEST_RETENTION_MS,
     };
 
     fn sample_inode() -> Inode {
@@ -274,6 +274,8 @@ mod tests {
         DedupEntry {
             op_id: RequestOpId::from_bytes([0xff; 16]),
             result: DedupResult::Created { inode: 7 },
+            created_at_unix_ms: 1_000,
+            expires_at_unix_ms: 1_000 + CLIENT_REQUEST_RETENTION_MS,
         }
     }
 

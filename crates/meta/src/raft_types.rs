@@ -87,6 +87,13 @@ pub enum MetaRaftRequest {
         cutoff_unix_ms: u64,
         max_to_expire: u64,
     },
+    /// Drop expired `client_requests` ledger rows (deterministic cutoff).
+    PruneClientRequests {
+        #[serde(default)]
+        request_id: Option<RequestOpId>,
+        cutoff_unix_ms: u64,
+        max_to_prune: u64,
+    },
     CommitInodeManifestReserved {
         #[serde(default)]
         request_id: Option<RequestOpId>,
@@ -184,6 +191,7 @@ impl MetaRaftRequest {
             | Self::ReserveChunks { request_id, .. }
             | Self::AbortChunkReservation { request_id, .. }
             | Self::ExpireChunkReservations { request_id, .. }
+            | Self::PruneClientRequests { request_id, .. }
             | Self::CommitInodeManifestReserved { request_id, .. }
             | Self::TombstoneGcBatch { request_id, .. }
             | Self::FinalizeGcTombstones { request_id, .. }
@@ -209,6 +217,7 @@ impl MetaRaftRequest {
             | Self::ReserveChunks { request_id, .. }
             | Self::AbortChunkReservation { request_id, .. }
             | Self::ExpireChunkReservations { request_id, .. }
+            | Self::PruneClientRequests { request_id, .. }
             | Self::CommitInodeManifestReserved { request_id, .. }
             | Self::TombstoneGcBatch { request_id, .. }
             | Self::FinalizeGcTombstones { request_id, .. }

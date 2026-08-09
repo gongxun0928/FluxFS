@@ -46,6 +46,11 @@ pub enum SnapshotRecord {
     ClientRequest {
         id: String,
         resp: MetaRaftResponse,
+        /// Absolute expiry for the dedup ledger (#13). `0` on legacy snapshots.
+        #[serde(default)]
+        expires_at_unix_ms: u64,
+        #[serde(default)]
+        created_at_unix_ms: u64,
     },
     Reservation(ChunkReservation),
     DeleteTombstone(GcTombstone),

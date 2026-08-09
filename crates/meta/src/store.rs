@@ -105,6 +105,10 @@ pub trait MetaStore: Send + Sync {
     /// embed its sampled cutoff in the replicated command.
     fn expire_chunk_reservations(&self, max_to_expire: usize) -> Result<()>;
 
+    /// Prune expired (and soft-cap overflow) client request-id ledger rows.
+    /// Raft implementations must stamp `cutoff_unix_ms` into the command.
+    fn prune_client_requests(&self, max_to_prune: usize) -> Result<()>;
+
     fn commit_inode_manifest_reserved_with_id(
         &self,
         op_id: RequestOpId,

@@ -311,6 +311,11 @@ impl MetaStore for RemoteMetaStore {
         Ok(())
     }
 
+    fn prune_client_requests(&self, max_to_prune: usize) -> Result<()> {
+        // ExpireChunkReservations apply also prunes the client_requests ledger.
+        self.expire_chunk_reservations(max_to_prune)
+    }
+
     fn commit_inode_manifest_reserved_with_id(
         &self,
         op_id: RequestOpId,

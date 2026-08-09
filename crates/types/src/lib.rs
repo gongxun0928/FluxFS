@@ -951,6 +951,13 @@ pub const EXTERNAL_CACHE_TTL_SECS: u64 = 60;
 // Raft does NOT dedup client retries. The server retains each completed
 // `RequestOpId` result for a retry horizon. See task #13 / ZeroFS dedup.rs.
 
+/// Default how long a completed mutation result is retained for retries.
+pub const CLIENT_REQUEST_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
+/// Max entries removed by one deterministic prune batch.
+pub const CLIENT_REQUEST_PRUNE_BATCH: usize = 256;
+/// Soft cap on ledger size; putting past this triggers oldest-first prune.
+pub const CLIENT_REQUEST_LEDGER_SOFT_CAP: usize = 10_000;
+
 /// Client-supplied id for non-idempotent mutation deduplication.
 ///
 /// All-zero (`RequestOpId::NONE`) means "no id supplied" — not dedupable.
@@ -1018,6 +1025,12 @@ pub enum DedupResult {
 pub struct DedupEntry {
     pub op_id: RequestOpId,
     pub result: DedupResult,
+    /// Wall time when the result was retained (leader-stamped / apply time).
+    #[serde(default)]
+    pub created_at_unix_ms: u64,
+    /// Absolute expiry; prune and retry-miss after this instant.
+    #[serde(default)]
+    pub expires_at_unix_ms: u64,
 }
 
 #[cfg(test)]
