@@ -3,7 +3,7 @@
 #![allow(clippy::result_large_err)] // openraft StorageError is large by design
 
 use std::io::SeekFrom;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -23,6 +23,86 @@ struct StoredSnapshot {
     meta: SnapshotMeta<NodeId, BasicNode>,
     /// On-disk streaming snapshot (not held as a full `Vec<u8>`).
     path: PathBuf,
+}
+
+fn sync_snapshot_dir(path: &Path) -> std::io::Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("snapshot path has no parent directory"))?;
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// Publish a complete snapshot without ever exposing a half-written final file.
+fn publish_snapshot_file(temp: &Path, final_path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(temp)?.sync_all()?;
+    std::fs::rename(temp, final_path)?;
+    sync_snapshot_dir(final_path)
+}
+
+fn remove_snapshot_file(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => sync_snapshot_dir(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn managed_snapshot_kind(name: &str) -> Option<&'static str> {
+    if name.starts_with("incoming-") && name.ends_with(".snap") {
+        Some("incoming")
+    } else if name.starts_with("installed-") && name.ends_with(".snap") {
+        Some("installed")
+    } else if name.starts_with("built-") && name.ends_with(".snap") {
+        Some("built")
+    } else if name.starts_with(".building-") && name.ends_with(".tmp") {
+        Some("building")
+    } else if name.starts_with(".installing-") && name.ends_with(".tmp") {
+        Some("installing")
+    } else {
+        None
+    }
+}
+
+/// Remove files which cannot be referenced after a process restart.
+fn prune_snapshot_dir_on_startup(snapshot_dir: &Path) -> std::io::Result<usize> {
+    prune_snapshot_dir(snapshot_dir, None, |_| true)
+}
+
+/// After a successful install, only receiver/install artifacts are stale. A
+/// locally built snapshot may be active concurrently and must not be removed.
+fn prune_received_snapshot_files(snapshot_dir: &Path, preserve: &Path) -> std::io::Result<usize> {
+    prune_snapshot_dir(snapshot_dir, Some(preserve), |kind| {
+        matches!(kind, "incoming" | "installed" | "installing")
+    })
+}
+
+fn prune_snapshot_dir(
+    snapshot_dir: &Path,
+    preserve: Option<&Path>,
+    should_remove: impl Fn(&str) -> bool,
+) -> std::io::Result<usize> {
+    let mut removed = 0;
+    for entry in std::fs::read_dir(snapshot_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if preserve.is_some_and(|keep| keep == path) || !entry.file_type()?.is_file() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(kind) = managed_snapshot_kind(&name) else {
+            continue;
+        };
+        if should_remove(kind) {
+            std::fs::remove_file(path)?;
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        std::fs::File::open(snapshot_dir)?.sync_all()?;
+    }
+    Ok(removed)
 }
 
 /// State machine backed by durable Heed for inode/dentry/manifest.
@@ -48,6 +128,12 @@ impl MetaStateMachine {
             StorageError::from(StorageIOError::<NodeId>::write_snapshot(
                 None,
                 &std::io::Error::other(e.to_string()),
+            ))
+        })?;
+        prune_snapshot_dir_on_startup(&snapshot_dir).map_err(|e| {
+            StorageError::from(StorageIOError::<NodeId>::write_snapshot(
+                None,
+                &std::io::Error::other(format!("prune stale snapshots: {e}")),
             ))
         })?;
         Ok(Arc::new(Self {
@@ -89,14 +175,27 @@ impl RaftSnapshotBuilder<FluxRaftTypeConfig> for Arc<MetaStateMachine> {
         } else {
             format!("--{snapshot_idx}")
         };
-        let path = self.snapshot_dir.join(format!("{snapshot_id}.snap"));
-        self.store
-            .export_snapshot_to_path(&sm, &path)
-            .map_err(|e| {
-                StorageError::from(StorageIOError::<NodeId>::read_state_machine(
-                    &std::io::Error::other(e.to_string()),
-                ))
-            })?;
+        let path = self.snapshot_dir.join(format!("built-{snapshot_idx}.snap"));
+        let temp = self
+            .snapshot_dir
+            .join(format!(".building-{snapshot_idx}.tmp"));
+        if let Err(error) = self.store.export_snapshot_to_path(&sm, &temp) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(StorageError::from(
+                StorageIOError::<NodeId>::read_state_machine(&std::io::Error::other(
+                    error.to_string(),
+                )),
+            ));
+        }
+        if let Err(error) = publish_snapshot_file(&temp, &path) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(StorageError::from(
+                StorageIOError::<NodeId>::write_snapshot(
+                    None,
+                    &std::io::Error::other(error.to_string()),
+                ),
+            ));
+        }
 
         let last_applied_log = sm.last_applied_log;
         let last_membership = sm.last_membership.clone();
@@ -108,15 +207,23 @@ impl RaftSnapshotBuilder<FluxRaftTypeConfig> for Arc<MetaStateMachine> {
             snapshot_id,
         };
 
-        {
+        let previous = {
             let mut current_snapshot = self.current_snapshot.write().await;
-            if let Some(prev) = current_snapshot.take() {
-                let _ = std::fs::remove_file(prev.path);
+            current_snapshot
+                .replace(StoredSnapshot {
+                    meta: meta.clone(),
+                    path: path.clone(),
+                })
+                .map(|snapshot| snapshot.path)
+        };
+        if let Some(previous) = previous {
+            if let Err(error) = remove_snapshot_file(&previous) {
+                tracing::warn!(
+                    path = %previous.display(),
+                    %error,
+                    "failed to prune superseded snapshot"
+                );
             }
-            *current_snapshot = Some(StoredSnapshot {
-                meta: meta.clone(),
-                path: path.clone(),
-            });
         }
 
         let file = MetaStateMachine::open_snapshot_file(&path).await?;
@@ -186,8 +293,7 @@ impl RaftStateMachine<FluxRaftTypeConfig> for Arc<MetaStateMachine> {
         let idx = self.snapshot_idx.fetch_add(1, Ordering::Relaxed) + 1;
         let path = self.snapshot_dir.join(format!("incoming-{idx}.snap"));
         let file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .read(true)
             .write(true)
             .open(&path)
@@ -216,16 +322,25 @@ impl RaftStateMachine<FluxRaftTypeConfig> for Arc<MetaStateMachine> {
             ))
         })?;
         // Install via std::fs for heed's sync reader API: copy to a durable path first.
+        let install_idx = self.snapshot_idx.fetch_add(1, Ordering::Relaxed) + 1;
+        let temp = self
+            .snapshot_dir
+            .join(format!(".installing-{install_idx}.tmp"));
         let durable = self
             .snapshot_dir
-            .join(format!("installed-{}.snap", meta.snapshot_id));
-        {
-            let mut out = tokio::fs::File::create(&durable).await.map_err(|e| {
-                StorageError::from(StorageIOError::<NodeId>::write_snapshot(
-                    Some(meta.signature()),
-                    &std::io::Error::other(e.to_string()),
-                ))
-            })?;
+            .join(format!("installed-{install_idx}.snap"));
+        let copy_result = async {
+            let mut out = tokio::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temp)
+                .await
+                .map_err(|e| {
+                    StorageError::from(StorageIOError::<NodeId>::write_snapshot(
+                        Some(meta.signature()),
+                        &std::io::Error::other(e.to_string()),
+                    ))
+                })?;
             tokio::io::copy(&mut snapshot, &mut out)
                 .await
                 .map_err(|e| {
@@ -240,6 +355,31 @@ impl RaftStateMachine<FluxRaftTypeConfig> for Arc<MetaStateMachine> {
                     &std::io::Error::other(e.to_string()),
                 ))
             })?;
+            out.sync_all().await.map_err(|e| {
+                StorageError::from(StorageIOError::<NodeId>::write_snapshot(
+                    Some(meta.signature()),
+                    &std::io::Error::other(e.to_string()),
+                ))
+            })?;
+            drop(out);
+            tokio::fs::rename(&temp, &durable).await.map_err(|e| {
+                StorageError::from(StorageIOError::<NodeId>::write_snapshot(
+                    Some(meta.signature()),
+                    &std::io::Error::other(e.to_string()),
+                ))
+            })?;
+            sync_snapshot_dir(&durable).map_err(|e| {
+                StorageError::from(StorageIOError::<NodeId>::write_snapshot(
+                    Some(meta.signature()),
+                    &std::io::Error::other(e.to_string()),
+                ))
+            })?;
+            Ok::<(), StorageError<NodeId>>(())
+        }
+        .await;
+        if let Err(error) = copy_result {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error);
         }
 
         let snap_sm = {
@@ -270,14 +410,16 @@ impl RaftStateMachine<FluxRaftTypeConfig> for Arc<MetaStateMachine> {
         })?;
         drop(sm);
 
-        let mut current_snapshot = self.current_snapshot.write().await;
-        if let Some(prev) = current_snapshot.take() {
-            let _ = std::fs::remove_file(prev.path);
+        {
+            let mut current_snapshot = self.current_snapshot.write().await;
+            *current_snapshot = Some(StoredSnapshot {
+                meta: meta.clone(),
+                path: durable.clone(),
+            });
         }
-        *current_snapshot = Some(StoredSnapshot {
-            meta: meta.clone(),
-            path: durable,
-        });
+        if let Err(error) = prune_received_snapshot_files(&self.snapshot_dir, &durable) {
+            tracing::warn!(%error, "failed to prune stale received snapshots");
+        }
         Ok(())
     }
 
@@ -298,5 +440,88 @@ impl RaftStateMachine<FluxRaftTypeConfig> for Arc<MetaStateMachine> {
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         self.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn atomic_publish_replaces_final_and_removes_temp() {
+        let dir = tempdir().unwrap();
+        let temp = dir.path().join(".building-1.tmp");
+        let final_path = dir.path().join("built-1.snap");
+        std::fs::write(&final_path, b"old").unwrap();
+        let mut file = std::fs::File::create(&temp).unwrap();
+        file.write_all(b"complete snapshot").unwrap();
+        drop(file);
+
+        publish_snapshot_file(&temp, &final_path).unwrap();
+
+        assert!(!temp.exists());
+        assert_eq!(std::fs::read(final_path).unwrap(), b"complete snapshot");
+    }
+
+    #[test]
+    fn startup_prunes_only_managed_snapshot_artifacts() {
+        let dir = tempdir().unwrap();
+        for name in [
+            "incoming-1.snap",
+            "installed-2.snap",
+            "built-3.snap",
+            ".building-4.tmp",
+            ".installing-5.tmp",
+        ] {
+            std::fs::write(dir.path().join(name), b"stale").unwrap();
+        }
+        std::fs::write(dir.path().join("keep.txt"), b"keep").unwrap();
+
+        assert_eq!(prune_snapshot_dir_on_startup(dir.path()).unwrap(), 5);
+        assert!(dir.path().join("keep.txt").exists());
+        assert_eq!(prune_snapshot_dir_on_startup(dir.path()).unwrap(), 0);
+    }
+
+    #[test]
+    fn state_machine_startup_invokes_snapshot_prune() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(HeedMetaStore::open(dir.path().join("meta")).unwrap());
+        let snapshot_dir = store.snapshot_dir();
+        std::fs::create_dir_all(&snapshot_dir).unwrap();
+        std::fs::write(snapshot_dir.join("incoming-1.snap"), b"partial").unwrap();
+        std::fs::write(snapshot_dir.join("installed-2.snap"), b"stale").unwrap();
+
+        let _state_machine = MetaStateMachine::new(store).unwrap();
+
+        assert!(!snapshot_dir.join("incoming-1.snap").exists());
+        assert!(!snapshot_dir.join("installed-2.snap").exists());
+    }
+
+    #[test]
+    fn installed_prune_preserves_current_and_concurrent_build() {
+        let dir = tempdir().unwrap();
+        let current = dir.path().join("installed-3.snap");
+        for name in [
+            "incoming-1.snap",
+            "installed-2.snap",
+            "installed-3.snap",
+            ".installing-4.tmp",
+            ".building-5.tmp",
+            "built-5.snap",
+        ] {
+            std::fs::write(dir.path().join(name), b"snapshot").unwrap();
+        }
+
+        assert_eq!(
+            prune_received_snapshot_files(dir.path(), &current).unwrap(),
+            3
+        );
+        assert!(current.exists());
+        assert!(dir.path().join(".building-5.tmp").exists());
+        assert!(dir.path().join("built-5.snap").exists());
     }
 }
