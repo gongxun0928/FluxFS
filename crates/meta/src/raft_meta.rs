@@ -61,6 +61,8 @@ impl RaftMetaStore {
     }
 
     fn write(&self, req: MetaRaftRequest) -> Result<MetaRaftResponse> {
+        // Sample wall time once before propose; apply never reads a clock.
+        let req = req.with_ledger_now(crate::unix_time_millis());
         let resp = self
             .block_on(self.raft.client_write(req))
             .map_err(|e| FluxError::Meta(format!("raft write: {e}")))?;
@@ -140,6 +142,7 @@ impl MetaStore for RaftMetaStore {
     fn register_worker(&self, registration: &WorkerRegistration) -> Result<WorkerMembership> {
         Self::map_worker_membership(self.write(MetaRaftRequest::RegisterWorker {
             request_id: Some(RequestOpId::random()),
+            ledger_now_unix_ms: 0,
             registration: registration.clone(),
         })?)
     }
@@ -164,6 +167,7 @@ impl MetaStore for RaftMetaStore {
     ) -> Result<Inode> {
         let resp = self.write(MetaRaftRequest::Create {
             request_id: Some(RequestOpId::random()),
+            ledger_now_unix_ms: 0,
             parent,
             name: name.to_string(),
             file_type,
@@ -182,6 +186,7 @@ impl MetaStore for RaftMetaStore {
     fn put_inode(&self, inode: &Inode) -> Result<()> {
         let resp = self.write(MetaRaftRequest::PutInode {
             request_id: Some(RequestOpId::random()),
+            ledger_now_unix_ms: 0,
             inode: Box::new(inode.clone()),
         })?;
         Self::map_empty(resp)
@@ -190,6 +195,7 @@ impl MetaStore for RaftMetaStore {
     fn put_manifest(&self, manifest: &Manifest) -> Result<ManifestId> {
         let resp = self.write(MetaRaftRequest::PutManifest {
             request_id: Some(RequestOpId::random()),
+            ledger_now_unix_ms: 0,
             manifest: Box::new(manifest.clone()),
         })?;
         Self::map_manifest_id(resp)
@@ -218,6 +224,7 @@ impl MetaStore for RaftMetaStore {
     ) -> Result<Inode> {
         let resp = self.write(MetaRaftRequest::CommitInodeManifest {
             request_id: Some(op_id),
+            ledger_now_unix_ms: 0,
             expected_generation,
             inode: Box::new(inode.clone()),
             manifest: Box::new(manifest.clone()),
@@ -234,6 +241,7 @@ impl MetaStore for RaftMetaStore {
     ) -> Result<()> {
         Self::map_empty(self.write(MetaRaftRequest::ReserveChunks {
             request_id: Some(RequestOpId::random()),
+            ledger_now_unix_ms: 0,
             ticket,
             inode,
             expected_generation,
@@ -245,6 +253,7 @@ impl MetaStore for RaftMetaStore {
     fn abort_chunk_reservation(&self, ticket: WriteTicketId) -> Result<()> {
         Self::map_empty(self.write(MetaRaftRequest::AbortChunkReservation {
             request_id: Some(RequestOpId::random()),
+            ledger_now_unix_ms: 0,
             ticket,
         })?)
     }
@@ -252,6 +261,7 @@ impl MetaStore for RaftMetaStore {
     fn expire_chunk_reservations(&self, max_to_expire: usize) -> Result<()> {
         Self::map_empty(self.write(MetaRaftRequest::ExpireChunkReservations {
             request_id: None,
+            ledger_now_unix_ms: 0,
             cutoff_unix_ms: crate::unix_time_millis(),
             max_to_expire: max_to_expire.try_into().unwrap_or(u64::MAX),
         })?)
@@ -260,6 +270,7 @@ impl MetaStore for RaftMetaStore {
     fn prune_client_requests(&self, max_to_prune: usize) -> Result<()> {
         Self::map_empty(self.write(MetaRaftRequest::PruneClientRequests {
             request_id: None,
+            ledger_now_unix_ms: 0,
             cutoff_unix_ms: crate::unix_time_millis(),
             max_to_prune: max_to_prune.try_into().unwrap_or(u64::MAX),
         })?)
@@ -275,6 +286,7 @@ impl MetaStore for RaftMetaStore {
     ) -> Result<Inode> {
         Self::map_inode(self.write(MetaRaftRequest::CommitInodeManifestReserved {
             request_id: Some(op_id),
+            ledger_now_unix_ms: 0,
             ticket,
             expected_generation,
             inode: Box::new(inode.clone()),
@@ -285,6 +297,7 @@ impl MetaStore for RaftMetaStore {
     fn tombstone_gc_batch(&self, candidates: &[ChunkId]) -> Result<GcBatch> {
         Self::map_gc_batch(self.write(MetaRaftRequest::TombstoneGcBatch {
             request_id: Some(RequestOpId::random()),
+            ledger_now_unix_ms: 0,
             candidates: candidates.to_vec(),
         })?)
     }
@@ -300,6 +313,7 @@ impl MetaStore for RaftMetaStore {
     ) -> Result<()> {
         Self::map_empty(self.write(MetaRaftRequest::InitializeGcDeleteTargets {
             request_id: None,
+            ledger_now_unix_ms: 0,
             chunks: chunks.to_vec(),
             targets: targets.to_vec(),
         })?)
@@ -308,6 +322,7 @@ impl MetaStore for RaftMetaStore {
     fn acknowledge_gc_deletes(&self, deleted: &[(ChunkId, WorkerTargetId)]) -> Result<()> {
         Self::map_empty(self.write(MetaRaftRequest::AcknowledgeGcDeletes {
             request_id: None,
+            ledger_now_unix_ms: 0,
             deleted: deleted.to_vec(),
         })?)
     }
@@ -315,6 +330,7 @@ impl MetaStore for RaftMetaStore {
     fn finalize_gc_tombstones(&self, chunks: &[ChunkId]) -> Result<()> {
         Self::map_empty(self.write(MetaRaftRequest::FinalizeGcTombstones {
             request_id: Some(RequestOpId::random()),
+            ledger_now_unix_ms: 0,
             chunks: chunks.to_vec(),
         })?)
     }
@@ -332,6 +348,7 @@ impl MetaStore for RaftMetaStore {
     ) -> Result<Inode> {
         Self::map_inode(self.write(MetaRaftRequest::BeginFlush {
             request_id: Some(op_id),
+            ledger_now_unix_ms: 0,
             expected_generation,
             inode,
             intent: Box::new(intent.clone()),
@@ -348,6 +365,7 @@ impl MetaStore for RaftMetaStore {
     ) -> Result<Inode> {
         Self::map_inode(self.write(MetaRaftRequest::CommitFlush {
             request_id: Some(op_id),
+            ledger_now_unix_ms: 0,
             expected_generation,
             inode,
             flush_id,
@@ -364,6 +382,7 @@ impl MetaStore for RaftMetaStore {
     ) -> Result<Inode> {
         Self::map_inode(self.write(MetaRaftRequest::FailFlushConflict {
             request_id: Some(RequestOpId::random()),
+            ledger_now_unix_ms: 0,
             expected_generation,
             inode,
             flush_id,
@@ -378,6 +397,7 @@ impl MetaStore for RaftMetaStore {
     fn begin_gc(&self, lease_id: GcLeaseId) -> Result<GcPlan> {
         Self::map_gc_plan(self.write(MetaRaftRequest::BeginGc {
             request_id: Some(RequestOpId::random()),
+            ledger_now_unix_ms: 0,
             lease_id,
         })?)
     }
@@ -389,6 +409,7 @@ impl MetaStore for RaftMetaStore {
     fn finish_gc(&self, lease_id: GcLeaseId) -> Result<()> {
         Self::map_empty(self.write(MetaRaftRequest::FinishGc {
             request_id: Some(RequestOpId::random()),
+            ledger_now_unix_ms: 0,
             lease_id,
         })?)
     }
@@ -404,6 +425,7 @@ impl MetaStore for RaftMetaStore {
     ) -> Result<Inode> {
         Self::map_inode(self.write(MetaRaftRequest::ImportExternal {
             request_id: Some(op_id),
+            ledger_now_unix_ms: 0,
             parent,
             name: name.to_string(),
             inode: Box::new(inode.clone()),
@@ -420,6 +442,7 @@ impl MetaStore for RaftMetaStore {
     ) -> Result<()> {
         let resp = self.write(MetaRaftRequest::Unlink {
             request_id: Some(RequestOpId::random()),
+            ledger_now_unix_ms: 0,
             parent,
             name: name.to_string(),
             expected_parent_generation,

@@ -102,6 +102,7 @@ mod tests {
         let resp = raft
             .client_write(MetaRaftRequest::Create {
                 request_id: None,
+                ledger_now_unix_ms: 0,
                 parent: ROOT_INODE,
                 name: "via-raft.txt".into(),
                 file_type: FileType::Regular,
@@ -125,6 +126,7 @@ mod tests {
         let duplicate = raft
             .client_write(MetaRaftRequest::Create {
                 request_id: None,
+                ledger_now_unix_ms: 0,
                 parent: ROOT_INODE,
                 name: "via-raft.txt".into(),
                 file_type: FileType::Regular,
@@ -154,6 +156,7 @@ mod tests {
                 .expect("start raft");
             raft.client_write(MetaRaftRequest::Create {
                 request_id: None,
+                ledger_now_unix_ms: 0,
                 parent: ROOT_INODE,
                 name: "persist.txt".into(),
                 file_type: FileType::Regular,
@@ -182,6 +185,7 @@ mod tests {
         let resp = raft
             .client_write(MetaRaftRequest::Create {
                 request_id: None,
+                ledger_now_unix_ms: 0,
                 parent: ROOT_INODE,
                 name: "after-restart.txt".into(),
                 file_type: FileType::Regular,
@@ -211,6 +215,7 @@ mod tests {
         let op_id = RequestOpId::random();
         let req = MetaRaftRequest::Create {
             request_id: Some(op_id),
+            ledger_now_unix_ms: 0,
             parent: ROOT_INODE,
             name: "once.txt".into(),
             file_type: FileType::Regular,
@@ -252,6 +257,7 @@ mod tests {
         let created = match raft
             .client_write(MetaRaftRequest::Create {
                 request_id: None,
+                ledger_now_unix_ms: 0,
                 parent: ROOT_INODE,
                 name: "cas.bin".into(),
                 file_type: FileType::Regular,
@@ -282,6 +288,7 @@ mod tests {
         let committed = match raft
             .client_write(MetaRaftRequest::CommitInodeManifest {
                 request_id: None,
+                ledger_now_unix_ms: 0,
                 expected_generation: base_gen,
                 inode: Box::new(next.clone()),
                 manifest: Box::new(manifest.clone()),
@@ -299,6 +306,7 @@ mod tests {
         let cas_fail = raft
             .client_write(MetaRaftRequest::CommitInodeManifest {
                 request_id: None,
+                ledger_now_unix_ms: 0,
                 expected_generation: base_gen,
                 inode: Box::new(next),
                 manifest: Box::new(manifest),
@@ -327,6 +335,7 @@ mod tests {
             .expect("start raft");
         raft.client_write(MetaRaftRequest::Create {
             request_id: None,
+            ledger_now_unix_ms: 0,
             parent: ROOT_INODE,
             name: "snap.txt".into(),
             file_type: FileType::Regular,
@@ -393,6 +402,7 @@ mod tests {
         };
         let request = MetaRaftRequest::RegisterWorker {
             request_id: Some(fluxfs_types::RequestOpId::random()),
+            ledger_now_unix_ms: 0,
             registration,
         };
         let first = raft.client_write(request.clone()).await.unwrap().data;

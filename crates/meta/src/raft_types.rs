@@ -32,11 +32,17 @@ pub enum MetaRaftRequest {
     RegisterWorker {
         #[serde(default)]
         request_id: Option<RequestOpId>,
+        /// Leader-sampled wall time for ledger created/expires (0 = legacy).
+        #[serde(default)]
+        ledger_now_unix_ms: u64,
         registration: WorkerRegistration,
     },
     Create {
         #[serde(default)]
         request_id: Option<RequestOpId>,
+        /// Leader-sampled wall time for ledger created/expires (0 = legacy).
+        #[serde(default)]
+        ledger_now_unix_ms: u64,
         parent: u64,
         name: String,
         file_type: FileType,
@@ -50,11 +56,17 @@ pub enum MetaRaftRequest {
     PutInode {
         #[serde(default)]
         request_id: Option<RequestOpId>,
+        /// Leader-sampled wall time for ledger created/expires (0 = legacy).
+        #[serde(default)]
+        ledger_now_unix_ms: u64,
         inode: Box<Inode>,
     },
     PutManifest {
         #[serde(default)]
         request_id: Option<RequestOpId>,
+        /// Leader-sampled wall time for ledger created/expires (0 = legacy).
+        #[serde(default)]
+        ledger_now_unix_ms: u64,
         manifest: Box<Manifest>,
     },
     /// Store `manifest`, CAS `inode.generation == expected_generation`, then
@@ -62,6 +74,9 @@ pub enum MetaRaftRequest {
     CommitInodeManifest {
         #[serde(default)]
         request_id: Option<RequestOpId>,
+        /// Leader-sampled wall time for ledger created/expires (0 = legacy).
+        #[serde(default)]
+        ledger_now_unix_ms: u64,
         expected_generation: u64,
         inode: Box<Inode>,
         manifest: Box<Manifest>,
@@ -69,6 +84,9 @@ pub enum MetaRaftRequest {
     ReserveChunks {
         #[serde(default)]
         request_id: Option<RequestOpId>,
+        /// Leader-sampled wall time for ledger created/expires (0 = legacy).
+        #[serde(default)]
+        ledger_now_unix_ms: u64,
         ticket: WriteTicketId,
         inode: u64,
         expected_generation: u64,
@@ -79,11 +97,17 @@ pub enum MetaRaftRequest {
     AbortChunkReservation {
         #[serde(default)]
         request_id: Option<RequestOpId>,
+        /// Leader-sampled wall time for ledger created/expires (0 = legacy).
+        #[serde(default)]
+        ledger_now_unix_ms: u64,
         ticket: WriteTicketId,
     },
     ExpireChunkReservations {
         #[serde(default)]
         request_id: Option<RequestOpId>,
+        /// Leader-sampled wall time for ledger created/expires (0 = legacy).
+        #[serde(default)]
+        ledger_now_unix_ms: u64,
         cutoff_unix_ms: u64,
         max_to_expire: u64,
     },
@@ -91,12 +115,18 @@ pub enum MetaRaftRequest {
     PruneClientRequests {
         #[serde(default)]
         request_id: Option<RequestOpId>,
+        /// Leader-sampled wall time for ledger created/expires (0 = legacy).
+        #[serde(default)]
+        ledger_now_unix_ms: u64,
         cutoff_unix_ms: u64,
         max_to_prune: u64,
     },
     CommitInodeManifestReserved {
         #[serde(default)]
         request_id: Option<RequestOpId>,
+        /// Leader-sampled wall time for ledger created/expires (0 = legacy).
+        #[serde(default)]
+        ledger_now_unix_ms: u64,
         ticket: WriteTicketId,
         expected_generation: u64,
         inode: Box<Inode>,
@@ -105,27 +135,42 @@ pub enum MetaRaftRequest {
     TombstoneGcBatch {
         #[serde(default)]
         request_id: Option<RequestOpId>,
+        /// Leader-sampled wall time for ledger created/expires (0 = legacy).
+        #[serde(default)]
+        ledger_now_unix_ms: u64,
         candidates: Vec<ChunkId>,
     },
     FinalizeGcTombstones {
         #[serde(default)]
         request_id: Option<RequestOpId>,
+        /// Leader-sampled wall time for ledger created/expires (0 = legacy).
+        #[serde(default)]
+        ledger_now_unix_ms: u64,
         chunks: Vec<ChunkId>,
     },
     InitializeGcDeleteTargets {
         #[serde(default)]
         request_id: Option<RequestOpId>,
+        /// Leader-sampled wall time for ledger created/expires (0 = legacy).
+        #[serde(default)]
+        ledger_now_unix_ms: u64,
         chunks: Vec<ChunkId>,
         targets: Vec<WorkerTargetId>,
     },
     AcknowledgeGcDeletes {
         #[serde(default)]
         request_id: Option<RequestOpId>,
+        /// Leader-sampled wall time for ledger created/expires (0 = legacy).
+        #[serde(default)]
+        ledger_now_unix_ms: u64,
         deleted: Vec<(ChunkId, WorkerTargetId)>,
     },
     BeginFlush {
         #[serde(default)]
         request_id: Option<RequestOpId>,
+        /// Leader-sampled wall time for ledger created/expires (0 = legacy).
+        #[serde(default)]
+        ledger_now_unix_ms: u64,
         expected_generation: u64,
         inode: u64,
         intent: Box<FlushIntent>,
@@ -133,6 +178,9 @@ pub enum MetaRaftRequest {
     CommitFlush {
         #[serde(default)]
         request_id: Option<RequestOpId>,
+        /// Leader-sampled wall time for ledger created/expires (0 = legacy).
+        #[serde(default)]
+        ledger_now_unix_ms: u64,
         expected_generation: u64,
         inode: u64,
         flush_id: FlushId,
@@ -141,6 +189,9 @@ pub enum MetaRaftRequest {
     FailFlushConflict {
         #[serde(default)]
         request_id: Option<RequestOpId>,
+        /// Leader-sampled wall time for ledger created/expires (0 = legacy).
+        #[serde(default)]
+        ledger_now_unix_ms: u64,
         expected_generation: u64,
         inode: u64,
         flush_id: FlushId,
@@ -149,11 +200,17 @@ pub enum MetaRaftRequest {
     BeginGc {
         #[serde(default)]
         request_id: Option<RequestOpId>,
+        /// Leader-sampled wall time for ledger created/expires (0 = legacy).
+        #[serde(default)]
+        ledger_now_unix_ms: u64,
         lease_id: GcLeaseId,
     },
     FinishGc {
         #[serde(default)]
         request_id: Option<RequestOpId>,
+        /// Leader-sampled wall time for ledger created/expires (0 = legacy).
+        #[serde(default)]
+        ledger_now_unix_ms: u64,
         lease_id: GcLeaseId,
     },
     /// Atomically allocate inode id, optional manifest, dentry, and External inode.
@@ -163,6 +220,9 @@ pub enum MetaRaftRequest {
     ImportExternal {
         #[serde(default)]
         request_id: Option<RequestOpId>,
+        /// Leader-sampled wall time for ledger created/expires (0 = legacy).
+        #[serde(default)]
+        ledger_now_unix_ms: u64,
         parent: u64,
         name: String,
         inode: Box<Inode>,
@@ -173,6 +233,9 @@ pub enum MetaRaftRequest {
     Unlink {
         #[serde(default)]
         request_id: Option<RequestOpId>,
+        /// Leader-sampled wall time for ledger created/expires (0 = legacy).
+        #[serde(default)]
+        ledger_now_unix_ms: u64,
         parent: u64,
         name: String,
         #[serde(default)]
@@ -231,6 +294,146 @@ impl MetaRaftRequest {
             | Self::ImportExternal { request_id, .. }
             | Self::Unlink { request_id, .. } => {
                 *request_id = Some(id);
+            }
+        }
+        self
+    }
+
+    /// Leader-sampled wall time carried in the log entry (0 on pre-stamp legacy).
+    pub fn ledger_now_unix_ms(&self) -> u64 {
+        match self {
+            Self::RegisterWorker {
+                ledger_now_unix_ms, ..
+            }
+            | Self::Create {
+                ledger_now_unix_ms, ..
+            }
+            | Self::PutInode {
+                ledger_now_unix_ms, ..
+            }
+            | Self::PutManifest {
+                ledger_now_unix_ms, ..
+            }
+            | Self::CommitInodeManifest {
+                ledger_now_unix_ms, ..
+            }
+            | Self::ReserveChunks {
+                ledger_now_unix_ms, ..
+            }
+            | Self::AbortChunkReservation {
+                ledger_now_unix_ms, ..
+            }
+            | Self::ExpireChunkReservations {
+                ledger_now_unix_ms, ..
+            }
+            | Self::PruneClientRequests {
+                ledger_now_unix_ms, ..
+            }
+            | Self::CommitInodeManifestReserved {
+                ledger_now_unix_ms, ..
+            }
+            | Self::TombstoneGcBatch {
+                ledger_now_unix_ms, ..
+            }
+            | Self::FinalizeGcTombstones {
+                ledger_now_unix_ms, ..
+            }
+            | Self::InitializeGcDeleteTargets {
+                ledger_now_unix_ms, ..
+            }
+            | Self::AcknowledgeGcDeletes {
+                ledger_now_unix_ms, ..
+            }
+            | Self::BeginFlush {
+                ledger_now_unix_ms, ..
+            }
+            | Self::CommitFlush {
+                ledger_now_unix_ms, ..
+            }
+            | Self::FailFlushConflict {
+                ledger_now_unix_ms, ..
+            }
+            | Self::BeginGc {
+                ledger_now_unix_ms, ..
+            }
+            | Self::FinishGc {
+                ledger_now_unix_ms, ..
+            }
+            | Self::ImportExternal {
+                ledger_now_unix_ms, ..
+            }
+            | Self::Unlink {
+                ledger_now_unix_ms, ..
+            } => *ledger_now_unix_ms,
+        }
+    }
+
+    pub fn with_ledger_now(mut self, now_unix_ms: u64) -> Self {
+        match &mut self {
+            Self::RegisterWorker {
+                ledger_now_unix_ms, ..
+            }
+            | Self::Create {
+                ledger_now_unix_ms, ..
+            }
+            | Self::PutInode {
+                ledger_now_unix_ms, ..
+            }
+            | Self::PutManifest {
+                ledger_now_unix_ms, ..
+            }
+            | Self::CommitInodeManifest {
+                ledger_now_unix_ms, ..
+            }
+            | Self::ReserveChunks {
+                ledger_now_unix_ms, ..
+            }
+            | Self::AbortChunkReservation {
+                ledger_now_unix_ms, ..
+            }
+            | Self::ExpireChunkReservations {
+                ledger_now_unix_ms, ..
+            }
+            | Self::PruneClientRequests {
+                ledger_now_unix_ms, ..
+            }
+            | Self::CommitInodeManifestReserved {
+                ledger_now_unix_ms, ..
+            }
+            | Self::TombstoneGcBatch {
+                ledger_now_unix_ms, ..
+            }
+            | Self::FinalizeGcTombstones {
+                ledger_now_unix_ms, ..
+            }
+            | Self::InitializeGcDeleteTargets {
+                ledger_now_unix_ms, ..
+            }
+            | Self::AcknowledgeGcDeletes {
+                ledger_now_unix_ms, ..
+            }
+            | Self::BeginFlush {
+                ledger_now_unix_ms, ..
+            }
+            | Self::CommitFlush {
+                ledger_now_unix_ms, ..
+            }
+            | Self::FailFlushConflict {
+                ledger_now_unix_ms, ..
+            }
+            | Self::BeginGc {
+                ledger_now_unix_ms, ..
+            }
+            | Self::FinishGc {
+                ledger_now_unix_ms, ..
+            }
+            | Self::ImportExternal {
+                ledger_now_unix_ms, ..
+            }
+            | Self::Unlink {
+                ledger_now_unix_ms, ..
+            } => {
+                *ledger_now_unix_ms = now_unix_ms;
             }
         }
         self

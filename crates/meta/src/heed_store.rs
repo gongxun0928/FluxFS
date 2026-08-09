@@ -363,12 +363,28 @@ impl HeedMetaStore {
             .write_txn()
             .map_err(|e| FluxError::Meta(e.to_string()))?;
 
+        // Leader-stamped time only; never sample wall clock inside apply.
+        let ledger_now = req.ledger_now_unix_ms();
+
         if let Some(op_id) = req.request_id().filter(|id| !id.is_none()) {
-            if let Some(cached) = self.get_client_request_in_txn(&wtxn, &op_id.to_hex())? {
+            if let Some(cached) =
+                self.get_client_request_in_txn(&wtxn, &op_id.to_hex(), ledger_now)?
+            {
                 // Still advance SM markers so the Raft log entry is durable.
                 self.put_sm_meta_raw(&mut wtxn, sm)?;
                 wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
                 return Ok(cached);
+            }
+            // TTL prune only (never drop in-window rows). Soft-cap is fail-fast.
+            let _ = self.prune_client_requests_in_txn(
+                &mut wtxn,
+                ledger_now,
+                fluxfs_types::CLIENT_REQUEST_PRUNE_BATCH,
+            )?;
+            if self.client_request_count_in_txn(&wtxn)? >= Self::client_request_ledger_soft_cap() {
+                self.put_sm_meta_raw(&mut wtxn, sm)?;
+                wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
+                return Ok(MetaRaftResponse::Err(FluxError::Busy));
             }
         }
 
@@ -630,14 +646,9 @@ impl HeedMetaStore {
         };
 
         if let Some(op_id) = req.request_id().filter(|id| !id.is_none()) {
-            // Keep ledger bounded before retaining this result.
-            let _ = self.prune_client_requests_in_txn(
-                &mut wtxn,
-                crate::unix_time_millis(),
-                fluxfs_types::CLIENT_REQUEST_PRUNE_BATCH,
-            )?;
             // Retain successes and typed application errors so retries are stable.
-            self.put_client_request_in_txn(&mut wtxn, &op_id.to_hex(), &resp)?;
+            // created/expires come from the replicated ledger_now stamp.
+            self.put_client_request_in_txn(&mut wtxn, &op_id.to_hex(), &resp, ledger_now)?;
         }
 
         // Always advance applied markers with the mutation attempt (including typed Err).
@@ -650,14 +661,13 @@ impl HeedMetaStore {
         if let Ok(entry) = serde_json::from_slice::<ClientRequestLedgerEntry>(bytes) {
             return Ok(entry);
         }
-        // Legacy bare MetaRaftResponse rows (pre-#13 TTL): treat as already-expired
-        // for prune, but still serve one last retry until pruned (expires far future
-        // is wrong — use max so they remain until explicit prune-by-cap).
+        // Legacy bare MetaRaftResponse rows (pre-#13 TTL): already-expired so the
+        // next prune pass drops them (finite upgrade window; no permanent residue).
         let resp: MetaRaftResponse =
             serde_json::from_slice(bytes).map_err(|e| FluxError::Meta(e.to_string()))?;
         Ok(ClientRequestLedgerEntry {
             created_at_unix_ms: 0,
-            expires_at_unix_ms: u64::MAX,
+            expires_at_unix_ms: 0,
             response: resp,
         })
     }
@@ -666,6 +676,7 @@ impl HeedMetaStore {
         &self,
         txn: &heed::RwTxn<'_>,
         op_id: &str,
+        now_unix_ms: u64,
     ) -> Result<Option<MetaRaftResponse>> {
         let Some(bytes) = self
             .client_requests
@@ -675,8 +686,8 @@ impl HeedMetaStore {
             return Ok(None);
         };
         let entry = Self::decode_client_request_bytes(bytes)?;
-        if entry.expires_at_unix_ms <= crate::unix_time_millis() {
-            // Lazy miss; durable prune happens via PruneClientRequests / soft-cap.
+        if entry.expires_at_unix_ms <= now_unix_ms {
+            // Lazy miss; durable prune happens via PruneClientRequests / expire.
             return Ok(None);
         }
         Ok(Some(entry.response))
@@ -687,11 +698,12 @@ impl HeedMetaStore {
         txn: &mut heed::RwTxn<'_>,
         op_id: &str,
         resp: &MetaRaftResponse,
+        created_at_unix_ms: u64,
     ) -> Result<()> {
-        let created = crate::unix_time_millis();
         let entry = ClientRequestLedgerEntry {
-            created_at_unix_ms: created,
-            expires_at_unix_ms: created.saturating_add(fluxfs_types::CLIENT_REQUEST_RETENTION_MS),
+            created_at_unix_ms,
+            expires_at_unix_ms: created_at_unix_ms
+                .saturating_add(fluxfs_types::CLIENT_REQUEST_RETENTION_MS),
             response: resp.clone(),
         };
         self.put_client_request_entry_in_txn(txn, op_id, &entry)
@@ -710,7 +722,6 @@ impl HeedMetaStore {
         Ok(())
     }
 
-    #[cfg(test)]
     fn client_request_count_in_txn(&self, txn: &heed::RoTxn<'_>) -> Result<usize> {
         let mut n = 0usize;
         let iter = self
@@ -736,8 +747,10 @@ impl HeedMetaStore {
         fluxfs_types::CLIENT_REQUEST_LEDGER_SOFT_CAP
     }
 
-    /// Drop expired ledger rows (and oldest rows when over soft cap). Deterministic:
-    /// sort by `(expires_at_unix_ms, op_id)` then take up to `max_to_prune`.
+    /// Drop only expired ledger rows. Deterministic: sort by
+    /// `(expires_at_unix_ms, op_id)` then take up to `max_to_prune`.
+    /// Soft-cap never shortens the promised retention window — callers fail-fast
+    /// with Busy when the ledger is full of in-window rows.
     fn prune_client_requests_in_txn(
         &self,
         txn: &mut heed::RwTxn<'_>,
@@ -748,7 +761,6 @@ impl HeedMetaStore {
             return Ok(0);
         }
         let mut expired = Vec::new();
-        let mut all = Vec::new();
         let iter = self
             .client_requests
             .iter(txn)
@@ -756,43 +768,19 @@ impl HeedMetaStore {
         for item in iter {
             let (k, v) = item.map_err(|e| FluxError::Meta(e.to_string()))?;
             let entry = Self::decode_client_request_bytes(v)?;
-            let key = k.to_string();
             if entry.expires_at_unix_ms <= cutoff_unix_ms {
-                expired.push((entry.expires_at_unix_ms, key.clone()));
+                expired.push((entry.expires_at_unix_ms, k.to_string()));
             }
-            all.push((entry.expires_at_unix_ms, key));
         }
         expired.sort();
-        let mut to_delete = expired;
-        to_delete.truncate(max_to_prune);
+        expired.truncate(max_to_prune);
 
-        // Soft cap: if still over budget after TTL prune, drop oldest remaining.
-        let remaining_budget = max_to_prune.saturating_sub(to_delete.len());
-        if remaining_budget > 0 {
-            let delete_set: std::collections::BTreeSet<_> =
-                to_delete.iter().map(|(_, k)| k.clone()).collect();
-            let live = all.len().saturating_sub(delete_set.len());
-            let soft_cap = Self::client_request_ledger_soft_cap();
-            if live > soft_cap {
-                let overflow = live - soft_cap;
-                let take = overflow.min(remaining_budget);
-                let mut candidates = all
-                    .into_iter()
-                    .filter(|(_, k)| !delete_set.contains(k))
-                    .collect::<Vec<_>>();
-                candidates.sort();
-                for item in candidates.into_iter().take(take) {
-                    to_delete.push(item);
-                }
-            }
-        }
-
-        for (_, key) in &to_delete {
+        for (_, key) in &expired {
             self.client_requests
                 .delete(txn, key.as_str())
                 .map_err(|e| FluxError::Meta(e.to_string()))?;
         }
-        Ok(to_delete.len())
+        Ok(expired.len())
     }
 
     pub fn save_sm_meta_only(&self, sm: &SmAppliedMeta) -> Result<()> {
@@ -990,8 +978,11 @@ impl HeedMetaStore {
                     .map_err(|e| FluxError::Meta(e.to_string()))?;
             }
         }
+        let install_now = crate::unix_time_millis();
         for (op_id, resp) in &snap.client_requests {
-            self.put_client_request_in_txn(&mut wtxn, op_id, resp)?;
+            // Legacy JSON snapshots lack expires; stamp a fresh retention window
+            // at install time (streaming path preserves explicit expires).
+            self.put_client_request_in_txn(&mut wtxn, op_id, resp, install_now)?;
         }
         self.meta
             .put(&mut wtxn, "next_inode", &u64_bytes(snap.next_inode))
@@ -2406,8 +2397,12 @@ impl MetaStore for HeedMetaStore {
         if self.gc_lease_in_txn(&wtxn)?.is_some() {
             return Err(FluxError::Busy);
         }
+        // Direct Heed path: sample once at the call boundary (not mid-txn).
+        let ledger_now = crate::unix_time_millis();
         if !op_id.is_none() {
-            if let Some(cached) = self.get_client_request_in_txn(&wtxn, &op_id.to_hex())? {
+            if let Some(cached) =
+                self.get_client_request_in_txn(&wtxn, &op_id.to_hex(), ledger_now)?
+            {
                 return match cached {
                     MetaRaftResponse::Inode(inode) => Ok(*inode),
                     MetaRaftResponse::Err(err) => Err(err),
@@ -2415,6 +2410,14 @@ impl MetaStore for HeedMetaStore {
                         "bad retained commit response: {other:?}"
                     ))),
                 };
+            }
+            let _ = self.prune_client_requests_in_txn(
+                &mut wtxn,
+                ledger_now,
+                fluxfs_types::CLIENT_REQUEST_PRUNE_BATCH,
+            )?;
+            if self.client_request_count_in_txn(&wtxn)? >= Self::client_request_ledger_soft_cap() {
+                return Err(FluxError::Busy);
             }
         }
         let next = match self.commit_inode_manifest_in_txn(
@@ -2429,6 +2432,7 @@ impl MetaStore for HeedMetaStore {
                         &mut wtxn,
                         &op_id.to_hex(),
                         &MetaRaftResponse::Inode(Box::new(inode.clone())),
+                        ledger_now,
                     )?;
                 }
                 inode
@@ -2439,6 +2443,7 @@ impl MetaStore for HeedMetaStore {
                         &mut wtxn,
                         &op_id.to_hex(),
                         &MetaRaftResponse::Err(err.clone()),
+                        ledger_now,
                     )?;
                 }
                 wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
@@ -2661,8 +2666,11 @@ impl MetaStore for HeedMetaStore {
         if self.gc_lease_in_txn(&wtxn)?.is_some() {
             return Err(FluxError::Busy);
         }
+        let ledger_now = crate::unix_time_millis();
         if !op_id.is_none() {
-            if let Some(cached) = self.get_client_request_in_txn(&wtxn, &op_id.to_hex())? {
+            if let Some(cached) =
+                self.get_client_request_in_txn(&wtxn, &op_id.to_hex(), ledger_now)?
+            {
                 return match cached {
                     MetaRaftResponse::Inode(inode) => Ok(*inode),
                     MetaRaftResponse::Err(err) => Err(err),
@@ -2670,6 +2678,14 @@ impl MetaStore for HeedMetaStore {
                         "bad retained import response: {other:?}"
                     ))),
                 };
+            }
+            let _ = self.prune_client_requests_in_txn(
+                &mut wtxn,
+                ledger_now,
+                fluxfs_types::CLIENT_REQUEST_PRUNE_BATCH,
+            )?;
+            if self.client_request_count_in_txn(&wtxn)? >= Self::client_request_ledger_soft_cap() {
+                return Err(FluxError::Busy);
             }
         }
         let next = match self.import_external_in_txn(
@@ -2686,6 +2702,7 @@ impl MetaStore for HeedMetaStore {
                         &mut wtxn,
                         &op_id.to_hex(),
                         &MetaRaftResponse::Inode(Box::new(inode.clone())),
+                        ledger_now,
                     )?;
                 }
                 inode
@@ -2696,6 +2713,7 @@ impl MetaStore for HeedMetaStore {
                         &mut wtxn,
                         &op_id.to_hex(),
                         &MetaRaftResponse::Err(err.clone()),
+                        ledger_now,
                     )?;
                 }
                 wtxn.commit().map_err(|e| FluxError::Meta(e.to_string()))?;
@@ -3740,10 +3758,10 @@ mod tests {
     }
 
     #[test]
-    fn client_request_ledger_ttl_lazy_miss_prune_and_soft_cap() {
+    fn client_request_ledger_ttl_lazy_miss_and_prune() {
         let dir = tempfile::tempdir().unwrap();
         let store = HeedMetaStore::open(dir.path()).unwrap();
-        let now = crate::unix_time_millis();
+        let now = 1_000_000u64;
         let alive = "op-alive";
         let expired_a = "op-expired-a";
         let expired_b = "op-expired-b";
@@ -3782,13 +3800,16 @@ mod tests {
             })
             .unwrap();
 
-        // Wall clock is far past 10/20 → lazy miss for expired rows.
         store
             .with_write_txn(|store, txn| {
-                assert!(store.get_client_request_in_txn(txn, expired_a)?.is_none());
-                assert!(store.get_client_request_in_txn(txn, expired_b)?.is_none());
+                assert!(store
+                    .get_client_request_in_txn(txn, expired_a, now)?
+                    .is_none());
+                assert!(store
+                    .get_client_request_in_txn(txn, expired_b, now)?
+                    .is_none());
                 assert!(matches!(
-                    store.get_client_request_in_txn(txn, alive)?,
+                    store.get_client_request_in_txn(txn, alive, now)?,
                     Some(MetaRaftResponse::Empty)
                 ));
                 Ok(())
@@ -3796,22 +3817,139 @@ mod tests {
             .unwrap();
 
         // Deterministic prune: cutoff 15 drops only expired_a; batch=1.
+        // Soft-cap must NOT delete in-window rows.
         store
             .with_write_txn(|store, txn| {
                 assert_eq!(store.prune_client_requests_in_txn(txn, 15, 1)?, 1);
                 assert_eq!(store.client_request_count_in_txn(txn)?, 2);
+                assert_eq!(store.prune_client_requests_in_txn(txn, 0, 10)?, 0);
+                assert!(store.get_client_request_in_txn(txn, alive, now)?.is_some());
                 Ok(())
             })
             .unwrap();
+    }
 
-        // Soft-cap overflow drops oldest remaining first (expires_at, then op_id).
+    #[test]
+    fn soft_cap_preserves_in_window_op_and_fails_new_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HeedMetaStore::open(dir.path()).unwrap();
+        let stamp = 5_000_000u64;
+        let old_op = RequestOpId::random();
+        let new_op = RequestOpId::random();
+
         TEST_CLIENT_REQUEST_SOFT_CAP.store(1, std::sync::atomic::Ordering::Relaxed);
         let _guard = SoftCapGuard;
+
+        // Fill soft-cap with one in-window retained create.
+        let created = store
+            .apply_raft_request(
+                &MetaRaftRequest::Create {
+                    request_id: Some(old_op),
+                    ledger_now_unix_ms: stamp,
+                    parent: ROOT_INODE,
+                    name: "kept".into(),
+                    file_type: FileType::Regular,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    expected_parent_generation: None,
+                },
+                &SmAppliedMeta::default(),
+            )
+            .unwrap();
+        assert!(matches!(created, MetaRaftResponse::Inode(_)));
+        assert!(store.lookup(ROOT_INODE, "kept").is_ok());
+
+        // Cap full + no expired → new mutation Busy, no side effect.
+        let blocked = store
+            .apply_raft_request(
+                &MetaRaftRequest::Create {
+                    request_id: Some(new_op),
+                    ledger_now_unix_ms: stamp + 1,
+                    parent: ROOT_INODE,
+                    name: "should-not-exist".into(),
+                    file_type: FileType::Regular,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    expected_parent_generation: None,
+                },
+                &SmAppliedMeta::default(),
+            )
+            .unwrap();
+        assert!(matches!(blocked, MetaRaftResponse::Err(FluxError::Busy)));
+        assert!(store.lookup(ROOT_INODE, "should-not-exist").is_err());
+
+        // Old op still replays within TTL (same stamp window).
+        let replay = store
+            .apply_raft_request(
+                &MetaRaftRequest::Create {
+                    request_id: Some(old_op),
+                    ledger_now_unix_ms: stamp + 2,
+                    parent: ROOT_INODE,
+                    name: "kept".into(),
+                    file_type: FileType::Regular,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    expected_parent_generation: None,
+                },
+                &SmAppliedMeta::default(),
+            )
+            .unwrap();
+        assert!(matches!(replay, MetaRaftResponse::Inode(_)));
+        // Still a single dentry — replay had no second create side effect.
+        assert_eq!(store.readdir(ROOT_INODE).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ledger_row_uses_replicated_stamp_not_local_wall_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HeedMetaStore::open(dir.path()).unwrap();
+        let stamp = 42_000u64;
+        let op = RequestOpId::random();
+        store
+            .apply_raft_request(
+                &MetaRaftRequest::Create {
+                    request_id: Some(op),
+                    ledger_now_unix_ms: stamp,
+                    parent: ROOT_INODE,
+                    name: "stamped.txt".into(),
+                    file_type: FileType::Regular,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    expected_parent_generation: None,
+                },
+                &SmAppliedMeta::default(),
+            )
+            .unwrap();
+
         store
             .with_write_txn(|store, txn| {
-                assert_eq!(store.prune_client_requests_in_txn(txn, 0, 10)?, 1);
-                assert_eq!(store.client_request_count_in_txn(txn)?, 1);
-                assert!(store.get_client_request_in_txn(txn, alive)?.is_some());
+                let bytes = store
+                    .client_requests
+                    .get(txn, &op.to_hex())
+                    .map_err(|e| FluxError::Meta(e.to_string()))?
+                    .expect("ledger row");
+                let entry = HeedMetaStore::decode_client_request_bytes(bytes)?;
+                assert_eq!(entry.created_at_unix_ms, stamp);
+                assert_eq!(
+                    entry.expires_at_unix_ms,
+                    stamp + fluxfs_types::CLIENT_REQUEST_RETENTION_MS
+                );
+                // A follower with a wildly different local wall clock still sees
+                // the same expires when evaluating with the stamped "now".
+                assert!(store
+                    .get_client_request_in_txn(txn, &op.to_hex(), stamp)?
+                    .is_some());
+                assert!(store
+                    .get_client_request_in_txn(
+                        txn,
+                        &op.to_hex(),
+                        stamp + fluxfs_types::CLIENT_REQUEST_RETENTION_MS
+                    )?
+                    .is_none());
                 Ok(())
             })
             .unwrap();
@@ -3821,7 +3959,7 @@ mod tests {
     fn client_request_expires_survive_streaming_snapshot_restore() {
         let dir = tempfile::tempdir().unwrap();
         let store = HeedMetaStore::open(dir.path()).unwrap();
-        let now = crate::unix_time_millis();
+        let now = 9_000_000u64;
         let expires = now.saturating_add(fluxfs_types::CLIENT_REQUEST_RETENTION_MS);
         store
             .with_write_txn(|store, txn| {
@@ -3858,7 +3996,7 @@ mod tests {
                 assert_eq!(entry.created_at_unix_ms, now);
                 assert_eq!(entry.expires_at_unix_ms, expires);
                 assert!(matches!(
-                    store.get_client_request_in_txn(txn, "snap-op")?,
+                    store.get_client_request_in_txn(txn, "snap-op", now)?,
                     Some(MetaRaftResponse::Empty)
                 ));
                 Ok(())

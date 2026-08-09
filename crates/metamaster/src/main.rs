@@ -114,6 +114,8 @@ impl MetaSvc {
         let span = tracing::info_span!("meta_rpc", op, request_id = %request_id);
         async move {
             FluxMetrics::inc(&self.metrics.meta_rpc_total);
+            // Sample wall time once before propose; apply never reads a clock.
+            let req = req.with_ledger_now(fluxfs_meta::unix_time_millis());
             let resp = self.raft.client_write(req).await.map_err(|e| {
                 FluxMetrics::inc(&self.metrics.meta_rpc_error_total);
                 Status::unavailable(format!("raft write: {e}"))
@@ -231,6 +233,7 @@ impl MetaService for MetaSvc {
         let response = self
             .write(MetaRaftRequest::RegisterWorker {
                 request_id: parse_request_op_id(&request.request_id),
+                ledger_now_unix_ms: 0,
                 registration,
             })
             .await?;
@@ -337,6 +340,7 @@ impl MetaService for MetaSvc {
         let resp = self
             .write(MetaRaftRequest::PutInode {
                 request_id: Some(RequestOpId::random()),
+                ledger_now_unix_ms: 0,
                 inode: Box::new(inode),
             })
             .await?;
@@ -354,6 +358,7 @@ impl MetaService for MetaSvc {
         let resp = self
             .write(MetaRaftRequest::PutManifest {
                 request_id: Some(RequestOpId::random()),
+                ledger_now_unix_ms: 0,
                 manifest: Box::new(manifest),
             })
             .await?;
@@ -398,6 +403,7 @@ impl MetaService for MetaSvc {
         let response = self
             .write(MetaRaftRequest::ReserveChunks {
                 request_id: parse_request_op_id(&r.request_id),
+                ledger_now_unix_ms: 0,
                 ticket: WriteTicketId(r.ticket),
                 inode: r.inode,
                 expected_generation: r.expected_generation,
@@ -418,6 +424,7 @@ impl MetaService for MetaSvc {
         let response = self
             .write(MetaRaftRequest::AbortChunkReservation {
                 request_id: parse_request_op_id(&r.request_id),
+                ledger_now_unix_ms: 0,
                 ticket: WriteTicketId(r.ticket),
             })
             .await?;
@@ -434,6 +441,7 @@ impl MetaService for MetaSvc {
         let response = self
             .write(MetaRaftRequest::ExpireChunkReservations {
                 request_id: None,
+                ledger_now_unix_ms: 0,
                 cutoff_unix_ms: fluxfs_meta::unix_time_millis(),
                 max_to_expire: r.max_to_expire,
             })
@@ -451,6 +459,7 @@ impl MetaService for MetaSvc {
         let response = self
             .write(MetaRaftRequest::CommitInodeManifestReserved {
                 request_id: parse_request_op_id(&r.request_id),
+                ledger_now_unix_ms: 0,
                 ticket: WriteTicketId(r.ticket),
                 expected_generation: r.expected_generation,
                 inode: Box::new(decode_inode(&r.inode_json).map_err(status_from_flux)?),
@@ -477,6 +486,7 @@ impl MetaService for MetaSvc {
         let response = self
             .write(MetaRaftRequest::TombstoneGcBatch {
                 request_id: parse_request_op_id(&r.request_id),
+                ledger_now_unix_ms: 0,
                 candidates: decode_chunk_ids(&r.chunks_json).map_err(status_from_flux)?,
             })
             .await?;
@@ -507,6 +517,7 @@ impl MetaService for MetaSvc {
         let response = self
             .write(MetaRaftRequest::InitializeGcDeleteTargets {
                 request_id: None,
+                ledger_now_unix_ms: 0,
                 chunks: decode_chunk_ids(&r.chunks_json).map_err(status_from_flux)?,
                 targets: decode_worker_targets(&r.targets_json).map_err(status_from_flux)?,
             })
@@ -524,6 +535,7 @@ impl MetaService for MetaSvc {
         let response = self
             .write(MetaRaftRequest::AcknowledgeGcDeletes {
                 request_id: None,
+                ledger_now_unix_ms: 0,
                 deleted: decode_gc_delete_acks(&r.deleted_json).map_err(status_from_flux)?,
             })
             .await?;
@@ -540,6 +552,7 @@ impl MetaService for MetaSvc {
         let response = self
             .write(MetaRaftRequest::FinalizeGcTombstones {
                 request_id: parse_request_op_id(&r.request_id),
+                ledger_now_unix_ms: 0,
                 chunks: decode_chunk_ids(&r.chunks_json).map_err(status_from_flux)?,
             })
             .await?;
@@ -569,6 +582,7 @@ impl MetaService for MetaSvc {
         let response = self
             .write(MetaRaftRequest::BeginFlush {
                 request_id: parse_request_op_id(&r.request_id),
+                ledger_now_unix_ms: 0,
                 expected_generation: r.expected_generation,
                 inode: r.inode,
                 intent: Box::new(intent),
@@ -590,6 +604,7 @@ impl MetaService for MetaSvc {
         let response = self
             .write(MetaRaftRequest::CommitFlush {
                 request_id: parse_request_op_id(&r.request_id),
+                ledger_now_unix_ms: 0,
                 expected_generation: r.expected_generation,
                 inode: r.inode,
                 flush_id: FlushId(r.flush_id),
@@ -611,6 +626,7 @@ impl MetaService for MetaSvc {
         let response = self
             .write(MetaRaftRequest::FailFlushConflict {
                 request_id: parse_request_op_id(&r.request_id),
+                ledger_now_unix_ms: 0,
                 expected_generation: r.expected_generation,
                 inode: r.inode,
                 flush_id: FlushId(r.flush_id),
@@ -644,6 +660,7 @@ impl MetaService for MetaSvc {
         let response = self
             .write(MetaRaftRequest::BeginGc {
                 request_id: parse_request_op_id(&r.request_id),
+                ledger_now_unix_ms: 0,
                 lease_id: GcLeaseId(r.lease_id),
             })
             .await?;
@@ -675,6 +692,7 @@ impl MetaService for MetaSvc {
         let response = self
             .write(MetaRaftRequest::FinishGc {
                 request_id: parse_request_op_id(&r.request_id),
+                ledger_now_unix_ms: 0,
                 lease_id: GcLeaseId(r.lease_id),
             })
             .await?;
@@ -697,6 +715,7 @@ impl MetaService for MetaSvc {
         let resp = self
             .write(MetaRaftRequest::ImportExternal {
                 request_id: parse_request_op_id(&r.request_id),
+                ledger_now_unix_ms: 0,
                 parent: r.parent,
                 name: r.name,
                 inode: Box::new(inode),
@@ -719,6 +738,7 @@ impl MetaService for MetaSvc {
         let resp = self
             .write(MetaRaftRequest::Unlink {
                 request_id: Some(RequestOpId::random()),
+                ledger_now_unix_ms: 0,
                 parent: r.parent,
                 name: r.name,
                 expected_parent_generation: parent_gen_cas(r.expected_parent_generation),
