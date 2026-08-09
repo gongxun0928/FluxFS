@@ -67,6 +67,30 @@ printf 'XY' | dd of="$mount_dir/hello.txt" bs=1 seek=6 conv=notrunc status=none
 test "$(cat "$mount_dir/hello.txt")" = "hello XYuxfs"
 truncate -s 8 "$mount_dir/hello.txt"
 test "$(cat "$mount_dir/hello.txt")" = "hello XY"
+
+# Core POSIX file-descriptor path: pwrite, ftruncate sparse growth, fchmod,
+# futimens/utime, fdatasync, and close/flush must all succeed and persist.
+python3 - "$mount_dir/posix.bin" <<'PY'
+import os, stat, sys
+
+path = sys.argv[1]
+fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o644)
+try:
+    assert os.write(fd, b"abcdefgh") == 8
+    assert os.pwrite(fd, b"XY", 2) == 2
+    os.ftruncate(fd, 12)
+    os.fchmod(fd, 0o600)
+    os.utime(fd, ns=(1_234_567_890_000_000_000, 1_234_567_890_000_000_000))
+    os.fdatasync(fd)
+finally:
+    os.close(fd)
+
+st = os.stat(path)
+assert stat.S_IMODE(st.st_mode) == 0o600
+assert st.st_size == 12
+assert int(st.st_mtime) == 1_234_567_890
+assert open(path, "rb").read() == b"abXYefgh" + b"\0" * 4
+PY
 rm "$mount_dir/remove.txt"
 test ! -e "$mount_dir/remove.txt"
 stop_mount
@@ -76,6 +100,16 @@ start_mount
 test "$(cat "$mount_dir/hello.txt")" = "hello XY"
 test "$(cat "$mount_dir/dir/nested.txt")" = "nested"
 test ! -e "$mount_dir/remove.txt"
+python3 - "$mount_dir/posix.bin" <<'PY'
+import os, stat, sys
+
+path = sys.argv[1]
+st = os.stat(path)
+assert stat.S_IMODE(st.st_mode) == 0o600
+assert st.st_size == 12
+assert int(st.st_mtime) == 1_234_567_890
+assert open(path, "rb").read() == b"abXYefgh" + b"\0" * 4
+PY
 printf '\nrestart-ok\n' >>"$mount_dir/hello.txt"
 test "$(tail -n 1 "$mount_dir/hello.txt")" = "restart-ok"
 stop_mount

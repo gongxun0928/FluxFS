@@ -188,6 +188,33 @@ PY
 cmp "$test_root/expected.bin" "$mount_dir/large.bin"
 test "$(count_chunks "$test_root/worker-2")" -ge 2
 
+# One descriptor exercises UFS-backed setattr through real FUSE: shrink then
+# sparse-grow, chmod, timestamp update, and close/flush. None of these may
+# publish the backing object before the explicit fsync below.
+python3 - "$mount_dir/large.bin" "$test_root/expected.bin" <<'PY'
+import os, stat, sys
+
+shrink = 9 * 1024 * 1024 + 123
+grow = 10 * 1024 * 1024 + 257
+for path in sys.argv[1:]:
+    fd = os.open(path, os.O_RDWR)
+    try:
+        os.ftruncate(fd, shrink)
+        os.ftruncate(fd, grow)
+        os.fchmod(fd, 0o600)
+        os.utime(fd, ns=(1_234_567_890_000_000_000, 1_234_567_890_000_000_000))
+    finally:
+        os.close(fd)
+
+mounted = os.stat(sys.argv[1])
+assert stat.S_IMODE(mounted.st_mode) == 0o600
+assert mounted.st_size == grow
+assert int(mounted.st_mtime) == 1_234_567_890
+PY
+cmp "$test_root/expected.bin" "$mount_dir/large.bin"
+mc_sh "mc cat local/${minio_bucket}/${prefix}/large.bin" >"$test_root/backing-after-setattr.bin"
+cmp "$test_root/original.bin" "$test_root/backing-after-setattr.bin"
+
 # fsync is the explicit write-back boundary: durable intent, conditional Put,
 # HEAD digest verification, and metadata CAS to a clean UFS-only manifest.
 python3 - "$mount_dir/large.bin" <<'PY'
@@ -213,6 +240,14 @@ wait "$mount_pid"
 mount_pid=""
 start_mount
 cmp "$test_root/expected.bin" "$mount_dir/large.bin"
+python3 - "$mount_dir/large.bin" <<'PY'
+import os, stat, sys
+
+st = os.stat(sys.argv[1])
+assert stat.S_IMODE(st.st_mode) == 0o600
+assert st.st_size == 10 * 1024 * 1024 + 257
+assert int(st.st_mtime) == 1_234_567_890
+PY
 mc_sh "mc cat local/${minio_bucket}/${prefix}/large.bin" >"$test_root/backing-after-remount.bin"
 cmp "$test_root/expected.bin" "$test_root/backing-after-remount.bin"
 # Mount no longer stop-the-world GC's. Explicit quiesced reclaim (admin/test)

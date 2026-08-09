@@ -7,9 +7,9 @@ use fluxfs_proto::meta::v1::{
     CreateRequest, CurrentGcPlanRequest, ExpireChunkReservationsRequest, FailFlushConflictRequest,
     FinalizeGcTombstonesRequest, FinishGcRequest, GetInodeRequest, GetManifestRequest,
     GetWorkerMembershipRequest, ImportExternalRequest, InitializeGcDeleteTargetsRequest,
-    ListFlushIntentsRequest, ListGcTombstonesRequest, LookupRequest, PutInodeRequest,
-    PutManifestRequest, ReaddirRequest, RegisterWorkerRequest, ReserveChunksRequest,
-    TombstoneGcBatchRequest, UnlinkRequest,
+    ListFlushIntentsRequest, ListGcTombstonesRequest, LookupRequest, PutInodeCasRequest,
+    PutInodeRequest, PutManifestRequest, ReaddirRequest, RegisterWorkerRequest,
+    ReserveChunksRequest, TombstoneGcBatchRequest, UnlinkRequest,
 };
 use fluxfs_proto::meta_codec::{
     decode_dentries, decode_flush_intents, decode_gc_batch, decode_gc_plan, decode_gc_tombstones,
@@ -232,6 +232,23 @@ impl MetaStore for RemoteMetaStore {
         self.block_on(async { c.put_inode(PutInodeRequest { inode_json }).await })
             .map_err(flux_from_status)?;
         Ok(())
+    }
+
+    fn put_inode_cas(&self, expected_generation: u64, inode: &Inode) -> Result<Inode> {
+        let inode_json = encode_inode(inode)?;
+        let mut c = self.client()?;
+        let resp = self
+            .block_on(async {
+                c.put_inode_cas(PutInodeCasRequest {
+                    expected_generation,
+                    inode_json,
+                    request_id: RequestOpId::random().to_hex(),
+                })
+                .await
+            })
+            .map_err(flux_from_status)?
+            .into_inner();
+        decode_inode(&resp.inode_json)
     }
 
     fn put_manifest(&self, manifest: &Manifest) -> Result<ManifestId> {

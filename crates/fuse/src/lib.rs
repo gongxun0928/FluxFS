@@ -1,7 +1,7 @@
 //! Minimal FUSE filesystem for Ephemeral (`--no-ufs`) and UFS-backed MVP mounts.
 
 use fluxfs_chunk::ChunkStore;
-use fluxfs_client::FluxClient;
+use fluxfs_client::{FluxClient, InodeSetAttr};
 use fluxfs_meta::MetaStore;
 use fluxfs_types::{FileType as FluxFileType, FluxError, Inode};
 use fuser::{
@@ -91,48 +91,16 @@ impl<M: MetaStore + 'static, C: ChunkStore + 'static> Filesystem for FluxFs<M, C
         _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        // Size changes use Dirty copy-up on UFS-backed mounts (same as write).
-        if let Some(sz) = size {
-            if let Err(e) = self.client.truncate(ino.0, sz) {
-                reply.error(map_err(e));
-                return;
-            }
-        }
-
-        let meta_touch =
-            mode.is_some() || uid.is_some() || gid.is_some() || atime.is_some() || mtime.is_some();
-        if !meta_touch {
-            match self.client.get_inode(ino.0) {
-                Ok(inode) => reply.attr(&TTL, &self.attr(&inode)),
-                Err(e) => reply.error(map_err(e)),
-            }
-            return;
-        }
-
-        match self.client.get_inode(ino.0) {
-            Ok(mut inode) => {
-                if let Some(m) = mode {
-                    inode.mode = m;
-                }
-                if let Some(u) = uid {
-                    inode.uid = u;
-                }
-                if let Some(g) = gid {
-                    inode.gid = g;
-                }
-                if let Some(t) = atime {
-                    inode.atime_ms = time_or_now_to_ms(t);
-                }
-                if let Some(t) = mtime {
-                    inode.mtime_ms = time_or_now_to_ms(t);
-                }
-                inode.ctime_ms = now_ms();
-                if let Err(e) = self.client.meta.put_inode(&inode) {
-                    reply.error(map_err(e));
-                    return;
-                }
-                reply.attr(&TTL, &self.attr(&inode));
-            }
+        let attrs = InodeSetAttr {
+            mode,
+            uid,
+            gid,
+            size,
+            atime_ms: atime.map(time_or_now_to_ms),
+            mtime_ms: mtime.map(time_or_now_to_ms),
+        };
+        match self.client.setattr(ino.0, attrs) {
+            Ok(inode) => reply.attr(&TTL, &self.attr(&inode)),
             Err(e) => reply.error(map_err(e)),
         }
     }
@@ -344,7 +312,10 @@ pub fn mount_ephemeral<M: MetaStore + 'static, C: ChunkStore + 'static>(
     let mut config = Config::default();
     // Avoid AutoUnmount/allow_other — many hosts lack user_allow_other in fuse.conf.
     // Unmount with: fusermount3 -u <mountpoint>
-    config.mount_options = vec![MountOption::FSName("fluxfs".into())];
+    // Reads intentionally do not issue metadata writes. Advertise noatime so
+    // the kernel-visible contract matches the persisted inode behavior; an
+    // explicit utimens/setattr request is still stored normally.
+    config.mount_options = vec![MountOption::FSName("fluxfs".into()), MountOption::NoAtime];
     config.acl = SessionACL::Owner;
     mount(fs, mountpoint.as_ref(), &config)
 }
@@ -359,35 +330,40 @@ fn map_err(e: FluxError) -> Errno {
         FluxError::AlreadyExists => Errno::EEXIST,
         FluxError::NotDirectory => Errno::ENOTDIR,
         FluxError::IsDirectory => Errno::EISDIR,
-        FluxError::Capability(_) => Errno::ENOSPC,
+        FluxError::Capability(_) => Errno::EOPNOTSUPP,
         FluxError::Busy => Errno::EAGAIN,
+        FluxError::CasFailed { .. } => Errno::EAGAIN,
         FluxError::ReadOnly => Errno::EROFS,
-        FluxError::InvalidArg(_) => Errno::EPERM,
+        FluxError::InvalidArg(_) => Errno::EINVAL,
+        FluxError::Unauthenticated(_) | FluxError::Unauthorized(_) => Errno::EACCES,
         _ => Errno::EIO,
     }
 }
 
 fn ms_to_systime(ms: i64) -> SystemTime {
-    if ms <= 0 {
-        return UNIX_EPOCH;
+    if ms >= 0 {
+        UNIX_EPOCH + Duration::from_millis(ms as u64)
+    } else {
+        UNIX_EPOCH
+            .checked_sub(Duration::from_millis(ms.unsigned_abs()))
+            .unwrap_or(UNIX_EPOCH)
     }
-    UNIX_EPOCH + Duration::from_millis(ms as u64)
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 fn time_or_now_to_ms(t: TimeOrNow) -> i64 {
     match t {
-        TimeOrNow::Now => now_ms(),
-        TimeOrNow::SpecificTime(st) => st
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0),
+        TimeOrNow::Now => system_time_to_ms(SystemTime::now()),
+        TimeOrNow::SpecificTime(st) => system_time_to_ms(st),
+    }
+}
+
+fn system_time_to_ms(time: SystemTime) -> i64 {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
+        Err(error) => {
+            let millis = i64::try_from(error.duration().as_millis()).unwrap_or(i64::MAX);
+            -millis
+        }
     }
 }
 
@@ -403,5 +379,24 @@ mod tests {
     #[test]
     fn readonly_is_erofs() {
         assert_eq!(map_err(FluxError::ReadOnly), Errno::EROFS);
+    }
+
+    #[test]
+    fn invalid_and_capability_errors_have_posix_errno() {
+        assert_eq!(
+            map_err(FluxError::InvalidArg("bad offset".into())),
+            Errno::EINVAL
+        );
+        assert_eq!(
+            map_err(FluxError::Capability("unsupported".into())),
+            Errno::EOPNOTSUPP
+        );
+    }
+
+    #[test]
+    fn timestamps_round_trip_before_and_after_epoch() {
+        for millis in [-1_234_i64, 0, 9_876] {
+            assert_eq!(system_time_to_ms(ms_to_systime(millis)), millis);
+        }
     }
 }

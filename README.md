@@ -13,8 +13,11 @@ via `scripts/dev-minio.sh` / `fluxfs ufs-check`); External objects are lazily
 imported into FUSE and read with pinned, bounded Range GETs. Random writes copy
 up only touched 4 MiB windows into RF=2 Local extents, keep untouched bytes as
 pinned UFS ranges, then atomically CAS the inode to Dirty. Basic create/read/write, random write,
-truncate, mkdir/readdir, unlink, unmount/remount, process-crash recovery, and
-single-replica read fallback are executable. `fsync` performs conditional,
+truncate, chmod/chown, explicit timestamp updates, mkdir/readdir, unlink,
+unmount/remount, process-crash recovery, and single-replica read fallback are
+executable. A combined size/attribute update uses one generation CAS, including
+for an imported UFS object; ordinary reads follow an explicit `noatime` mount
+policy. `fsync` performs conditional,
 digest-verified UFS write-back; startup reconciles durable flush intents without
 waiting for a full GC sweep. Chunk writes reserve their content addresses in
 Meta before RF Put, and GC uses bounded durable tombstone batches so physical

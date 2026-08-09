@@ -89,6 +89,14 @@ Writing an External file uses the same path and changes only touched windows to
 Local extents, producing a sparse Dirty copy-up. Untouched extents keep the
 imported UFS version pin.
 
+FUSE `setattr` sends size, mode, owner, and explicit timestamps through one
+client operation. Size-changing requests publish the new manifest and POSIX
+attributes in one inode generation CAS; metadata-only requests use a restricted
+CAS that cannot replace data or lifecycle fields. Writes and size changes are
+rejected once an inode is in `DirtyConflict`, while a metadata-only update may
+still proceed. The mount advertises `noatime`: reads do not create metadata
+writes, but explicit `utimens` updates persist.
+
 `fsync` performs crash-recoverable write-back:
 
 1. Persist a `FlushIntent` for an immutable head generation.
@@ -191,5 +199,6 @@ than a capability claimed by the current implementation.
 - `available_bytes` is administrative rather than live disk telemetry.
 - Very large fragmented manifests and global metadata snapshots still have
   scale costs despite indexed extents and streaming transfer.
-- POSIX scope, multi-machine chaos/soak, operational upgrades/DR, complete
+- Remaining POSIX scope (including links, xattrs, locking, open-unlink lifetime,
+  and permission enforcement), multi-machine chaos/soak, operational upgrades/DR, complete
   capacity control, and positional/async local I/O remain production work.

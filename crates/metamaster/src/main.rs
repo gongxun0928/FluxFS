@@ -17,10 +17,11 @@ use fluxfs_proto::meta::v1::{
     GetWorkerMembershipRequest, ImportExternalRequest, ImportExternalResponse,
     InitializeGcDeleteTargetsRequest, InitializeGcDeleteTargetsResponse, ListFlushIntentsRequest,
     ListFlushIntentsResponse, ListGcTombstonesRequest, ListGcTombstonesResponse, LookupRequest,
-    LookupResponse, PingRequest, PingResponse, PutInodeRequest, PutInodeResponse,
-    PutManifestRequest, PutManifestResponse, ReaddirRequest, ReaddirResponse,
-    RegisterWorkerRequest, ReserveChunksRequest, ReserveChunksResponse, TombstoneGcBatchRequest,
-    TombstoneGcBatchResponse, UnlinkRequest, UnlinkResponse, WorkerMembershipResponse,
+    LookupResponse, PingRequest, PingResponse, PutInodeCasRequest, PutInodeCasResponse,
+    PutInodeRequest, PutInodeResponse, PutManifestRequest, PutManifestResponse, ReaddirRequest,
+    ReaddirResponse, RegisterWorkerRequest, ReserveChunksRequest, ReserveChunksResponse,
+    TombstoneGcBatchRequest, TombstoneGcBatchResponse, UnlinkRequest, UnlinkResponse,
+    WorkerMembershipResponse,
 };
 use fluxfs_proto::meta_codec::{
     decode_chunk_ids, decode_flush_intent, decode_gc_delete_acks, decode_inode, decode_manifest,
@@ -374,6 +375,31 @@ impl MetaService for MetaSvc {
             .await?;
         self.map_resp_empty(resp)?;
         Ok(Response::new(PutInodeResponse {}))
+    }
+
+    async fn put_inode_cas(
+        &self,
+        req: Request<PutInodeCasRequest>,
+    ) -> Result<Response<PutInodeCasResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
+        let corr_id = fluxfs_proto::request_id::extract_request_id(&req);
+        let r = req.into_inner();
+        let inode = decode_inode(&r.inode_json).map_err(status_from_flux)?;
+        let resp = self
+            .write(
+                &corr_id,
+                MetaRaftRequest::PutInodeCas {
+                    request_id: parse_request_op_id(&r.request_id),
+                    ledger_now_unix_ms: 0,
+                    expected_generation: r.expected_generation,
+                    inode: Box::new(inode),
+                },
+            )
+            .await?;
+        let inode = self.map_resp_inode(resp)?;
+        Ok(Response::new(PutInodeCasResponse {
+            inode_json: encode_inode(&inode).map_err(status_from_flux)?,
+        }))
     }
 
     async fn put_manifest(

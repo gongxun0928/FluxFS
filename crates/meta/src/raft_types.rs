@@ -61,6 +61,16 @@ pub enum MetaRaftRequest {
         ledger_now_unix_ms: u64,
         inode: Box<Inode>,
     },
+    /// CAS-update inode metadata without allocating/replacing a manifest.
+    PutInodeCas {
+        #[serde(default)]
+        request_id: Option<RequestOpId>,
+        /// Leader-sampled wall time for ledger created/expires (0 = legacy).
+        #[serde(default)]
+        ledger_now_unix_ms: u64,
+        expected_generation: u64,
+        inode: Box<Inode>,
+    },
     PutManifest {
         #[serde(default)]
         request_id: Option<RequestOpId>,
@@ -249,6 +259,7 @@ impl MetaRaftRequest {
             Self::RegisterWorker { request_id, .. }
             | Self::Create { request_id, .. }
             | Self::PutInode { request_id, .. }
+            | Self::PutInodeCas { request_id, .. }
             | Self::PutManifest { request_id, .. }
             | Self::CommitInodeManifest { request_id, .. }
             | Self::ReserveChunks { request_id, .. }
@@ -275,6 +286,7 @@ impl MetaRaftRequest {
             Self::RegisterWorker { request_id, .. }
             | Self::Create { request_id, .. }
             | Self::PutInode { request_id, .. }
+            | Self::PutInodeCas { request_id, .. }
             | Self::PutManifest { request_id, .. }
             | Self::CommitInodeManifest { request_id, .. }
             | Self::ReserveChunks { request_id, .. }
@@ -309,6 +321,9 @@ impl MetaRaftRequest {
                 ledger_now_unix_ms, ..
             }
             | Self::PutInode {
+                ledger_now_unix_ms, ..
+            }
+            | Self::PutInodeCas {
                 ledger_now_unix_ms, ..
             }
             | Self::PutManifest {
@@ -379,6 +394,9 @@ impl MetaRaftRequest {
             | Self::PutInode {
                 ledger_now_unix_ms, ..
             }
+            | Self::PutInodeCas {
+                ledger_now_unix_ms, ..
+            }
             | Self::PutManifest {
                 ledger_now_unix_ms, ..
             }
@@ -445,6 +463,7 @@ impl MetaRaftRequest {
             Self::RegisterWorker { .. } => "register_worker",
             Self::Create { .. } => "create",
             Self::PutInode { .. } => "put_inode",
+            Self::PutInodeCas { .. } => "put_inode_cas",
             Self::PutManifest { .. } => "put_manifest",
             Self::CommitInodeManifest { .. } => "commit_inode_manifest",
             Self::ReserveChunks { .. } => "reserve_chunks",

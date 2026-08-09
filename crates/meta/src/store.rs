@@ -59,6 +59,13 @@ pub trait MetaStore: Send + Sync {
     /// Update durable inode fields (locality, size, ufs pointer, generation, …).
     fn put_inode(&self, inode: &Inode) -> Result<()>;
 
+    /// CAS-update one inode without replacing its manifest.
+    ///
+    /// This is the metadata-only counterpart to [`Self::commit_inode_manifest`]
+    /// and prevents chmod/chown/timestamp updates from overwriting a concurrent
+    /// data-head or directory-generation change.
+    fn put_inode_cas(&self, expected_generation: u64, inode: &Inode) -> Result<Inode>;
+
     /// Persist an immutable manifest snapshot; returns its allocated id.
     fn put_manifest(&self, manifest: &Manifest) -> Result<ManifestId>;
 

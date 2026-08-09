@@ -192,6 +192,16 @@ impl MetaStore for RaftMetaStore {
         Self::map_empty(resp)
     }
 
+    fn put_inode_cas(&self, expected_generation: u64, inode: &Inode) -> Result<Inode> {
+        let resp = self.write(MetaRaftRequest::PutInodeCas {
+            request_id: Some(RequestOpId::random()),
+            ledger_now_unix_ms: 0,
+            expected_generation,
+            inode: Box::new(inode.clone()),
+        })?;
+        Self::map_inode(resp)
+    }
+
     fn put_manifest(&self, manifest: &Manifest) -> Result<ManifestId> {
         let resp = self.write(MetaRaftRequest::PutManifest {
             request_id: Some(RequestOpId::random()),

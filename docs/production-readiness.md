@@ -80,9 +80,12 @@ network-partition tests rather than only localhost scripts.
 
 - Lazy External namespace entries lack a complete TTL/event invalidation model.
   Open handles need explicit identity and refresh rules.
-- External create/unlink/truncate and many POSIX operations (locks, links,
-  symlinks, xattrs, mmap, ACLs, and complete errno behavior) are not supported.
-  Freeze and test the advertised POSIX contract before general use.
+- External create/unlink and many POSIX operations (locks, links, symlinks,
+  xattrs, mmap, ACLs, kernel permission enforcement, open-unlink lifetime, and
+  complete errno behavior) are not supported. External truncate, mode/owner,
+  and explicit timestamp updates do use generation-CAS Dirty copy-up semantics;
+  ordinary reads are mounted `noatime`. Freeze and test the wider advertised
+  POSIX contract before general use.
 - The synchronous FUSE bridge and owned `Vec<u8>` data path add copies and
   blocking transitions. Add batching/coalescing, deadlines/cancellation, buffer
   pools, and end-to-end adaptive admission based on measurement.

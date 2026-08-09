@@ -435,6 +435,17 @@ impl HeedMetaStore {
                         Err(e) => MetaRaftResponse::Err(e),
                     }
                 }
+                MetaRaftRequest::PutInodeCas {
+                    expected_generation,
+                    inode,
+                    ..
+                } => {
+                    match self.put_inode_cas_in_txn(&mut wtxn, *expected_generation, inode.as_ref())
+                    {
+                        Ok(inode) => MetaRaftResponse::Inode(Box::new(inode)),
+                        Err(e) => MetaRaftResponse::Err(e),
+                    }
+                }
                 MetaRaftRequest::PutManifest { manifest, .. } => {
                     match self.put_manifest_in_txn(&mut wtxn, manifest.as_ref()) {
                         Ok(id) => MetaRaftResponse::ManifestId(id.0),
@@ -1548,6 +1559,46 @@ impl HeedMetaStore {
         Ok(next)
     }
 
+    fn put_inode_cas_in_txn(
+        &self,
+        wtxn: &mut heed::RwTxn,
+        expected_generation: u64,
+        inode: &Inode,
+    ) -> Result<Inode> {
+        let current = get_inode_raw(&self.inodes, wtxn, inode.id)?;
+        check_generation(&current, expected_generation)?;
+        let next_generation = expected_generation
+            .checked_add(1)
+            .ok_or_else(|| FluxError::InvalidArg("inode generation overflow".into()))?;
+        if inode.generation != next_generation {
+            return Err(FluxError::InvalidArg(format!(
+                "CAS inode generation must advance exactly once: expected {next_generation}, got {}",
+                inode.generation
+            )));
+        }
+        let data_or_lifecycle_changed = current.id != inode.id
+            || current.file_type != inode.file_type
+            || current.size != inode.size
+            || current.link_count != inode.link_count
+            || current.head_gen != inode.head_gen
+            || current.ufs_gen != inode.ufs_gen
+            || current.ufs_base_version != inode.ufs_base_version
+            || current.locality != inode.locality
+            || current.locality_fields != inode.locality_fields
+            || current.ufs != inode.ufs
+            || current.extent_root != inode.extent_root
+            || current.manifest_id != inode.manifest_id
+            || current.flush_intent != inode.flush_intent
+            || current.last_error != inode.last_error;
+        if data_or_lifecycle_changed {
+            return Err(FluxError::InvalidArg(
+                "put_inode_cas may only change POSIX mode/owner/timestamps".into(),
+            ));
+        }
+        put_inode_raw(&self.inodes, wtxn, inode)?;
+        Ok(inode.clone())
+    }
+
     fn begin_flush_in_txn(
         &self,
         wtxn: &mut heed::RwTxn,
@@ -2356,6 +2407,12 @@ impl MetaStore for HeedMetaStore {
         Ok(())
     }
 
+    fn put_inode_cas(&self, expected_generation: u64, inode: &Inode) -> Result<Inode> {
+        self.with_write_txn(|store, txn| {
+            store.put_inode_cas_in_txn(txn, expected_generation, inode)
+        })
+    }
+
     fn put_manifest(&self, manifest: &Manifest) -> Result<ManifestId> {
         manifest.validate()?;
         let _guard = self
@@ -2962,6 +3019,46 @@ mod tests {
         let entries = store.readdir(ROOT_INODE).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "hello.txt");
+    }
+
+    #[test]
+    fn put_inode_cas_rejects_stale_setattr_without_overwriting_new_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HeedMetaStore::open(dir.path()).unwrap();
+        let original = store
+            .create(ROOT_INODE, "attrs.bin", FileType::Regular, 0o644, 10, 20)
+            .unwrap();
+
+        let mut first = original.clone();
+        first.mode = 0o600;
+        first.generation += 1;
+        let committed = store.put_inode_cas(original.generation, &first).unwrap();
+        assert_eq!(committed.mode, 0o600);
+
+        let mut stale = original.clone();
+        stale.uid = 99;
+        stale.generation += 1;
+        assert_eq!(
+            store
+                .put_inode_cas(original.generation, &stale)
+                .unwrap_err(),
+            FluxError::CasFailed {
+                expected: original.generation,
+                actual: committed.generation,
+            }
+        );
+        let durable = store.get_inode(original.id).unwrap();
+        assert_eq!(durable.mode, 0o600);
+        assert_eq!(durable.uid, 10);
+
+        let mut bypass = durable.clone();
+        bypass.size = 123;
+        bypass.generation += 1;
+        assert!(matches!(
+            store.put_inode_cas(durable.generation, &bypass),
+            Err(FluxError::InvalidArg(_))
+        ));
+        assert_eq!(store.get_inode(original.id).unwrap().size, 0);
     }
 
     #[test]

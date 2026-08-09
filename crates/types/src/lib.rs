@@ -377,7 +377,7 @@ pub struct FlushIntent {
 
 // ===== UFS object reference =====
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UfsObject {
     pub key: String,
     pub size: u64,

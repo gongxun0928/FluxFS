@@ -13,6 +13,8 @@ service MetaService {
   rpc Create(CreateRequest) returns (CreateResponse);
   rpc Readdir(ReaddirRequest) returns (ReaddirResponse);
   rpc PutInode(PutInodeRequest) returns (PutInodeResponse);
+  // CAS-update one inode without replacing its manifest. Used by POSIX setattr.
+  rpc PutInodeCas(PutInodeCasRequest) returns (PutInodeCasResponse);
   rpc PutManifest(PutManifestRequest) returns (PutManifestResponse);
   // Atomically store a new manifest and CAS-update the inode head.
   rpc CommitInodeManifest(CommitInodeManifestRequest) returns (CommitInodeManifestResponse);
@@ -72,6 +74,13 @@ message ReaddirResponse { bytes dentries_json = 1; }
 
 message PutInodeRequest { bytes inode_json = 1; }
 message PutInodeResponse {}
+
+message PutInodeCasRequest {
+  uint64 expected_generation = 1;
+  bytes inode_json = 2;
+  string request_id = 3;
+}
+message PutInodeCasResponse { bytes inode_json = 1; }
 
 message PutManifestRequest { bytes manifest_json = 1; }
 message PutManifestResponse { uint64 manifest_id = 1; }

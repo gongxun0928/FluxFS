@@ -96,6 +96,20 @@ pub struct OrphanGcReport {
     pub removed_chunks: usize,
 }
 
+/// POSIX inode attributes supplied by one FUSE `setattr` request.
+///
+/// Keeping the fields together lets size and metadata changes share one inode
+/// generation CAS instead of a truncate followed by an unsafe whole-inode put.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InodeSetAttr {
+    pub mode: Option<u32>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub size: Option<u64>,
+    pub atime_ms: Option<i64>,
+    pub mtime_ms: Option<i64>,
+}
+
 impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
     pub fn new(meta: M, chunks: C) -> Self {
         Self {
@@ -599,6 +613,13 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         if inode.file_type != FileType::Regular {
             return Err(FluxError::IsDirectory);
         }
+        if inode
+            .locality_fields
+            .as_ref()
+            .is_some_and(|fields| fields.data_state == DataState::DirtyConflict)
+        {
+            return Err(FluxError::DirtyConflict);
+        }
         let end = offset
             .checked_add(data.len() as u64)
             .ok_or_else(|| FluxError::InvalidArg("offset overflow".into()))?;
@@ -671,26 +692,62 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         Ok(data.len() as u32)
     }
 
-    /// Truncate (or sparse-extend) a regular file. On UFS-backed mounts this is
-    /// Dirty copy-up, matching [`Self::write_at`]: touched Local windows are
-    /// reconstructed, untouched `UfsRange`s stay pinned.
     pub fn truncate(&self, ino: InodeId, size: u64) -> Result<Inode> {
+        self.setattr(
+            ino,
+            InodeSetAttr {
+                size: Some(size),
+                ..InodeSetAttr::default()
+            },
+        )
+    }
+
+    /// Apply one POSIX setattr operation under the data-path lock and one inode
+    /// generation CAS. A size change publishes its new manifest and all other
+    /// supplied fields atomically with that head; metadata-only updates use the
+    /// lighter `put_inode_cas` Raft mutation.
+    pub fn setattr(&self, ino: InodeId, attrs: InodeSetAttr) -> Result<Inode> {
         let _guard = self
             .io_lock
             .lock()
             .map_err(|_| FluxError::Io("io lock poisoned".into()))?;
         let mut inode = self.meta.get_inode(ino)?;
-        if inode.file_type != FileType::Regular {
-            return Err(FluxError::IsDirectory);
+
+        if let Some(size) = attrs.size {
+            if inode.file_type != FileType::Regular {
+                return Err(FluxError::IsDirectory);
+            }
+            if size != inode.size {
+                return self.truncate_locked(&mut inode, size, &attrs);
+            }
         }
-        if inode.size == size {
+
+        if !apply_inode_attrs(&mut inode, &attrs) {
             return Ok(inode);
+        }
+
+        let expected_generation = inode.generation;
+        inode.generation = inode.generation.saturating_add(1);
+        inode.ctime_ms = now_ms();
+        self.meta.put_inode_cas(expected_generation, &inode)
+    }
+
+    /// Truncate (or sparse-extend) a regular file. On UFS-backed mounts this is
+    /// Dirty copy-up, matching [`Self::write_at`]: touched Local windows are
+    /// reconstructed, untouched `UfsRange`s stay pinned.
+    fn truncate_locked(&self, inode: &mut Inode, size: u64, attrs: &InodeSetAttr) -> Result<Inode> {
+        if inode
+            .locality_fields
+            .as_ref()
+            .is_some_and(|fields| fields.data_state == DataState::DirtyConflict)
+        {
+            return Err(FluxError::DirtyConflict);
         }
         let expected_generation = inode.generation;
         let gen = DataGen(inode.head_gen.0.saturating_add(1));
         let current = match inode.manifest_id {
             Some(id) => self.meta.get_manifest(id)?,
-            None => Manifest::empty(ino, inode.head_gen),
+            None => Manifest::empty(inode.id, inode.head_gen),
         };
         let mut extents = Vec::new();
         let mut staged = Vec::new();
@@ -740,7 +797,7 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
             }
         }
         let manifest = Manifest {
-            inode: ino,
+            inode: inode.id,
             gen,
             size,
             extents: ExtentTree::try_from(extents)?,
@@ -749,10 +806,11 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         let now = now_ms();
         inode.size = size;
         inode.generation = inode.generation.saturating_add(1);
-        mark_data_mutated(&mut inode);
+        mark_data_mutated(inode);
         inode.mtime_ms = now;
         inode.ctime_ms = now;
-        self.commit_staged_manifest(expected_generation, &inode, &manifest, &staged)
+        apply_inode_attrs(inode, attrs);
+        self.commit_staged_manifest(expected_generation, inode, &manifest, &staged)
     }
 
     fn for_each_inode_chunk(
@@ -1176,6 +1234,31 @@ fn mark_data_mutated(inode: &mut Inode) {
     );
 }
 
+fn apply_inode_attrs(inode: &mut Inode, attrs: &InodeSetAttr) -> bool {
+    let mut touched = false;
+    if let Some(mode) = attrs.mode {
+        inode.mode = mode & 0o7777;
+        touched = true;
+    }
+    if let Some(uid) = attrs.uid {
+        inode.uid = uid;
+        touched = true;
+    }
+    if let Some(gid) = attrs.gid {
+        inode.gid = gid;
+        touched = true;
+    }
+    if let Some(atime_ms) = attrs.atime_ms {
+        inode.atime_ms = atime_ms;
+        touched = true;
+    }
+    if let Some(mtime_ms) = attrs.mtime_ms {
+        inode.mtime_ms = mtime_ms;
+        touched = true;
+    }
+    touched
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1574,8 +1657,23 @@ mod tests {
         assert_eq!(inode.locality, LocalityLabel::External);
 
         let new_size = CHUNK_SIZE + 10;
-        let truncated = client.truncate(inode.id, new_size).unwrap();
+        let truncated = client
+            .setattr(
+                inode.id,
+                InodeSetAttr {
+                    size: Some(new_size),
+                    mode: Some(0o600),
+                    atime_ms: Some(1_234),
+                    mtime_ms: Some(5_678),
+                    ..InodeSetAttr::default()
+                },
+            )
+            .unwrap();
         assert_eq!(truncated.size, new_size);
+        assert_eq!(truncated.mode, 0o600);
+        assert_eq!(truncated.atime_ms, 1_234);
+        assert_eq!(truncated.mtime_ms, 5_678);
+        assert_eq!(truncated.generation, inode.generation + 1);
         assert_eq!(truncated.locality, LocalityLabel::Dirty);
         let fields = truncated.locality_fields.as_ref().unwrap();
         assert_eq!(fields.data_state, DataState::Dirty);
@@ -1603,11 +1701,18 @@ mod tests {
         let again = client.truncate(truncated.id, new_size).unwrap();
         assert_eq!(again.generation, truncated.generation);
 
-        // chmod-style metadata update must work while UFS is attached.
-        let mut meta_inode = client.get_inode(truncated.id).unwrap();
-        meta_inode.mode = 0o600;
-        client.meta.put_inode(&meta_inode).unwrap();
-        assert_eq!(client.get_inode(truncated.id).unwrap().mode, 0o600);
+        // Metadata-only setattr is also a single generation CAS on UFS mounts.
+        let chmod = client
+            .setattr(
+                truncated.id,
+                InodeSetAttr {
+                    mode: Some(0o640),
+                    ..InodeSetAttr::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(chmod.mode, 0o640);
+        assert_eq!(chmod.generation, truncated.generation + 1);
 
         // After a Dirty Local window exists, truncate must keep Dirty fields.
         client
@@ -1630,6 +1735,48 @@ mod tests {
         assert_eq!(zeroed.size, 0);
         assert_eq!(zeroed.locality, LocalityLabel::Dirty);
         assert!(client.read_all(zeroed.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn dirty_conflict_rejects_data_mutation_but_allows_metadata_setattr() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = HeedMetaStore::open(dir.path().join("meta")).unwrap();
+        let chunks = DiskChunkStore::open(dir.path().join("chunks")).unwrap();
+        let mut inode = meta
+            .create(ROOT_INODE, "conflict.bin", FileType::Regular, 0o644, 0, 0)
+            .unwrap();
+        inode.locality_fields = Some(LocalityFields {
+            backing_mode: BackingMode::UfsBacked,
+            data_state: DataState::DirtyConflict,
+            op_state: OpState::None,
+            origin: Origin::Imported,
+        });
+        inode.locality = LocalityLabel::Dirty;
+        meta.put_inode(&inode).unwrap();
+        let client = FluxClient::new(meta, chunks);
+
+        assert_eq!(
+            client.write_at(inode.id, 0, b"blocked"),
+            Err(FluxError::DirtyConflict)
+        );
+        assert_eq!(
+            client.truncate(inode.id, 10).unwrap_err(),
+            FluxError::DirtyConflict
+        );
+        let chmod = client
+            .setattr(
+                inode.id,
+                InodeSetAttr {
+                    mode: Some(0o600),
+                    ..InodeSetAttr::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(chmod.mode, 0o600);
+        assert_eq!(
+            chmod.locality_fields.unwrap().data_state,
+            DataState::DirtyConflict
+        );
     }
 
     #[test]
