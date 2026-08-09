@@ -664,34 +664,17 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         inode.size = new_size;
         inode.head_gen = gen;
         inode.generation = inode.generation.saturating_add(1);
-        let old_fields = inode.locality_fields.clone().unwrap_or_default();
-        inode.locality_fields = Some(match old_fields.backing_mode {
-            BackingMode::UfsBacked => LocalityFields {
-                backing_mode: BackingMode::UfsBacked,
-                data_state: DataState::Dirty,
-                op_state: OpState::None,
-                origin: old_fields.origin,
-            },
-            BackingMode::Ephemeral => LocalityFields {
-                backing_mode: BackingMode::Ephemeral,
-                data_state: DataState::Ephemeral,
-                op_state: OpState::None,
-                origin: old_fields.origin,
-            },
-        });
-        inode.locality = LocalityLabel::derive(
-            inode.locality_fields.as_ref().expect("just assigned"),
-            inode.head_gen,
-            inode.ufs_gen,
-        );
+        mark_data_mutated(inode);
         inode.mtime_ms = now;
         inode.ctime_ms = now;
         self.commit_staged_manifest(expected_generation, inode, &manifest, &staged)?;
         Ok(data.len() as u32)
     }
 
+    /// Truncate (or sparse-extend) a regular file. On UFS-backed mounts this is
+    /// Dirty copy-up, matching [`Self::write_at`]: touched Local windows are
+    /// reconstructed, untouched `UfsRange`s stay pinned.
     pub fn truncate(&self, ino: InodeId, size: u64) -> Result<Inode> {
-        self.reject_ufs_mutation()?;
         let _guard = self
             .io_lock
             .lock()
@@ -699,6 +682,9 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         let mut inode = self.meta.get_inode(ino)?;
         if inode.file_type != FileType::Regular {
             return Err(FluxError::IsDirectory);
+        }
+        if inode.size == size {
+            return Ok(inode);
         }
         let expected_generation = inode.generation;
         let gen = DataGen(inode.head_gen.0.saturating_add(1));
@@ -763,6 +749,7 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         let now = now_ms();
         inode.size = size;
         inode.generation = inode.generation.saturating_add(1);
+        mark_data_mutated(&mut inode);
         inode.mtime_ms = now;
         inode.ctime_ms = now;
         self.commit_staged_manifest(expected_generation, &inode, &manifest, &staged)
@@ -1164,6 +1151,31 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// After a data-plane mutation, persist Dirty/Ephemeral locality fields and the
+/// derived product label. Keeps `head_gen > ufs_gen ⇒ Dirty` coherent on disk.
+fn mark_data_mutated(inode: &mut Inode) {
+    let old_fields = inode.locality_fields.clone().unwrap_or_default();
+    inode.locality_fields = Some(match old_fields.backing_mode {
+        BackingMode::UfsBacked => LocalityFields {
+            backing_mode: BackingMode::UfsBacked,
+            data_state: DataState::Dirty,
+            op_state: OpState::None,
+            origin: old_fields.origin,
+        },
+        BackingMode::Ephemeral => LocalityFields {
+            backing_mode: BackingMode::Ephemeral,
+            data_state: DataState::Ephemeral,
+            op_state: OpState::None,
+            origin: old_fields.origin,
+        },
+    });
+    inode.locality = LocalityLabel::derive(
+        inode.locality_fields.as_ref().expect("just assigned"),
+        inode.head_gen,
+        inode.ufs_gen,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1540,6 +1552,84 @@ mod tests {
         assert!(matches!(extents[0], Extent::UfsRange { .. }));
         assert!(matches!(extents[1], Extent::Local { .. }));
         assert!(matches!(extents[2], Extent::UfsRange { .. }));
+    }
+
+    #[test]
+    fn external_truncate_marks_dirty_and_preserves_pinned_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let ufs_root = dir.path().join("ufs");
+        std::fs::create_dir_all(&ufs_root).unwrap();
+        let mut original = vec![0u8; (2 * CHUNK_SIZE + 50) as usize];
+        for (index, byte) in original.iter_mut().enumerate() {
+            *byte = (index % 251) as u8;
+        }
+        std::fs::write(ufs_root.join("trunc.bin"), &original).unwrap();
+
+        let meta = HeedMetaStore::open(dir.path().join("meta")).unwrap();
+        let chunks = DiskChunkStore::open(dir.path().join("chunks")).unwrap();
+        let client = FluxClient::new(meta, chunks)
+            .with_ufs(Ufs::local(&ufs_root).unwrap())
+            .unwrap();
+        let inode = client.lookup(ROOT_INODE, "trunc.bin").unwrap();
+        assert_eq!(inode.locality, LocalityLabel::External);
+
+        let new_size = CHUNK_SIZE + 10;
+        let truncated = client.truncate(inode.id, new_size).unwrap();
+        assert_eq!(truncated.size, new_size);
+        assert_eq!(truncated.locality, LocalityLabel::Dirty);
+        let fields = truncated.locality_fields.as_ref().unwrap();
+        assert_eq!(fields.data_state, DataState::Dirty);
+        assert_eq!(fields.backing_mode, BackingMode::UfsBacked);
+
+        let expected = original[..new_size as usize].to_vec();
+        assert_eq!(client.read_all(truncated.id).unwrap(), expected);
+        // Backing object unchanged until fsync publish.
+        assert_eq!(std::fs::read(ufs_root.join("trunc.bin")).unwrap(), original);
+
+        let manifest = client
+            .meta
+            .get_manifest(truncated.manifest_id.unwrap())
+            .unwrap();
+        // Pure External shrink keeps a shorter pinned UfsRange (no Local copy-up
+        // needed); Dirty comes from head_gen / data_state.
+        let extents: Vec<_> = manifest.extents.iter().collect();
+        assert_eq!(extents.len(), 1);
+        assert!(matches!(
+            extents[0],
+            Extent::UfsRange { offset: 0, len, .. } if *len == new_size
+        ));
+
+        // Same-size truncate is a no-op (no generation bump).
+        let again = client.truncate(truncated.id, new_size).unwrap();
+        assert_eq!(again.generation, truncated.generation);
+
+        // chmod-style metadata update must work while UFS is attached.
+        let mut meta_inode = client.get_inode(truncated.id).unwrap();
+        meta_inode.mode = 0o600;
+        client.meta.put_inode(&meta_inode).unwrap();
+        assert_eq!(client.get_inode(truncated.id).unwrap().mode, 0o600);
+
+        // After a Dirty Local window exists, truncate must keep Dirty fields.
+        client
+            .write_at(truncated.id, CHUNK_SIZE / 2, b"mid")
+            .unwrap();
+        let after_write = client.get_inode(truncated.id).unwrap();
+        assert_eq!(
+            after_write.locality_fields.as_ref().unwrap().data_state,
+            DataState::Dirty
+        );
+        let shrunk = client.truncate(after_write.id, 4).unwrap();
+        assert_eq!(shrunk.size, 4);
+        assert_eq!(
+            shrunk.locality_fields.as_ref().unwrap().data_state,
+            DataState::Dirty
+        );
+        assert_eq!(shrunk.locality, LocalityLabel::Dirty);
+
+        let zeroed = client.truncate(shrunk.id, 0).unwrap();
+        assert_eq!(zeroed.size, 0);
+        assert_eq!(zeroed.locality, LocalityLabel::Dirty);
+        assert!(client.read_all(zeroed.id).unwrap().is_empty());
     }
 
     #[test]

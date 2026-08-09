@@ -1,4 +1,4 @@
-//! Minimal FUSE filesystem for Ephemeral (`--no-ufs`) MVP mounts.
+//! Minimal FUSE filesystem for Ephemeral (`--no-ufs`) and UFS-backed MVP mounts.
 
 use fluxfs_chunk::ChunkStore;
 use fluxfs_client::FluxClient;
@@ -6,8 +6,8 @@ use fluxfs_meta::MetaStore;
 use fluxfs_types::{FileType as FluxFileType, FluxError, Inode};
 use fuser::{
     mount, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
-    INodeNo, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyWrite, Request, SessionACL, TimeOrNow,
+    INodeNo, LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, SessionACL, TimeOrNow,
 }; // SessionACL used in mount_ephemeral
 use std::ffi::OsStr;
 use std::path::Path;
@@ -81,8 +81,8 @@ impl<M: MetaStore + 'static, C: ChunkStore + 'static> Filesystem for FluxFs<M, C
         uid: Option<u32>,
         gid: Option<u32>,
         size: Option<u64>,
-        _atime: Option<TimeOrNow>,
-        _mtime: Option<TimeOrNow>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
         _fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
@@ -91,16 +91,24 @@ impl<M: MetaStore + 'static, C: ChunkStore + 'static> Filesystem for FluxFs<M, C
         _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        if self.client.has_ufs() {
-            reply.error(Errno::EROFS);
-            return;
-        }
+        // Size changes use Dirty copy-up on UFS-backed mounts (same as write).
         if let Some(sz) = size {
             if let Err(e) = self.client.truncate(ino.0, sz) {
                 reply.error(map_err(e));
                 return;
             }
         }
+
+        let meta_touch =
+            mode.is_some() || uid.is_some() || gid.is_some() || atime.is_some() || mtime.is_some();
+        if !meta_touch {
+            match self.client.get_inode(ino.0) {
+                Ok(inode) => reply.attr(&TTL, &self.attr(&inode)),
+                Err(e) => reply.error(map_err(e)),
+            }
+            return;
+        }
+
         match self.client.get_inode(ino.0) {
             Ok(mut inode) => {
                 if let Some(m) = mode {
@@ -112,11 +120,16 @@ impl<M: MetaStore + 'static, C: ChunkStore + 'static> Filesystem for FluxFs<M, C
                 if let Some(g) = gid {
                     inode.gid = g;
                 }
-                if mode.is_some() || uid.is_some() || gid.is_some() {
-                    if let Err(e) = self.client.meta.put_inode(&inode) {
-                        reply.error(map_err(e));
-                        return;
-                    }
+                if let Some(t) = atime {
+                    inode.atime_ms = time_or_now_to_ms(t);
+                }
+                if let Some(t) = mtime {
+                    inode.mtime_ms = time_or_now_to_ms(t);
+                }
+                inode.ctime_ms = now_ms();
+                if let Err(e) = self.client.meta.put_inode(&inode) {
+                    reply.error(map_err(e));
+                    return;
                 }
                 reply.attr(&TTL, &self.attr(&inode));
             }
@@ -233,6 +246,32 @@ impl<M: MetaStore + 'static, C: ChunkStore + 'static> Filesystem for FluxFs<M, C
         }
     }
 
+    /// close()/dup paths call flush; do not force UFS publish here.
+    /// Authoritative write-back remains [`Filesystem::fsync`].
+    fn flush(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _lock_owner: LockOwner,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+
+    fn release(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+
     fn fsync(
         &self,
         _req: &Request,
@@ -335,6 +374,23 @@ fn ms_to_systime(ms: i64) -> SystemTime {
     UNIX_EPOCH + Duration::from_millis(ms as u64)
 }
 
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn time_or_now_to_ms(t: TimeOrNow) -> i64 {
+    match t {
+        TimeOrNow::Now => now_ms(),
+        TimeOrNow::SpecificTime(st) => st
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,5 +398,10 @@ mod tests {
     #[test]
     fn busy_is_exposed_as_retryable_eagain() {
         assert_eq!(map_err(FluxError::Busy), Errno::EAGAIN);
+    }
+
+    #[test]
+    fn readonly_is_erofs() {
+        assert_eq!(map_err(FluxError::ReadOnly), Errno::EROFS);
     }
 }
