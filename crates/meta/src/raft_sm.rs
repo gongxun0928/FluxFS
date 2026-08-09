@@ -58,6 +58,11 @@ fn managed_snapshot_kind(name: &str) -> Option<&'static str> {
         Some("building")
     } else if name.starts_with(".installing-") && name.ends_with(".tmp") {
         Some("installing")
+    } else if name.ends_with(".snap") {
+        // Before #42 locally built snapshots used `{snapshot_id}.snap` without
+        // a stable prefix. This directory is private to Raft snapshots, so a
+        // leftover `.snap` file is an unreferenced legacy artifact at startup.
+        Some("legacy")
     } else {
         None
     }
@@ -95,8 +100,15 @@ fn prune_snapshot_dir(
             continue;
         };
         if should_remove(kind) {
-            std::fs::remove_file(path)?;
-            removed += 1;
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    // A stale artifact must not make an otherwise healthy Meta
+                    // state machine unavailable. Retry on the next startup.
+                    tracing::warn!(path = %path.display(), %error, "failed to prune stale snapshot");
+                }
+            }
         }
     }
     if removed > 0 {
@@ -304,9 +316,6 @@ impl RaftStateMachine<FluxRaftTypeConfig> for Arc<MetaStateMachine> {
                     &std::io::Error::other(e.to_string()),
                 ))
             })?;
-        // Keep path discoverable: store as xattr via sidecar name pattern is enough;
-        // install_snapshot receives the File handle directly.
-        let _ = path;
         Ok(Box::new(file))
     }
 
@@ -474,6 +483,7 @@ mod tests {
             "incoming-1.snap",
             "installed-2.snap",
             "built-3.snap",
+            "1-7-3.snap",
             ".building-4.tmp",
             ".installing-5.tmp",
         ] {
@@ -481,7 +491,7 @@ mod tests {
         }
         std::fs::write(dir.path().join("keep.txt"), b"keep").unwrap();
 
-        assert_eq!(prune_snapshot_dir_on_startup(dir.path()).unwrap(), 5);
+        assert_eq!(prune_snapshot_dir_on_startup(dir.path()).unwrap(), 6);
         assert!(dir.path().join("keep.txt").exists());
         assert_eq!(prune_snapshot_dir_on_startup(dir.path()).unwrap(), 0);
     }
