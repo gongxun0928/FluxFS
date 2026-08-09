@@ -8,8 +8,8 @@ use fluxfs_proto::meta::v1::{
     FinalizeGcTombstonesRequest, FinishGcRequest, GetInodeRequest, GetManifestRequest,
     GetWorkerMembershipRequest, ImportExternalRequest, InitializeGcDeleteTargetsRequest,
     ListFlushIntentsRequest, ListGcTombstonesRequest, LookupRequest, PutInodeCasRequest,
-    PutInodeRequest, PutManifestRequest, ReaddirRequest, RegisterWorkerRequest,
-    ReserveChunksRequest, TombstoneGcBatchRequest, UnlinkRequest,
+    PutInodeRequest, PutManifestRequest, ReaddirRequest, RegisterWorkerRequest, RenameRequest,
+    ReserveChunksRequest, RmdirRequest, TombstoneGcBatchRequest, UnlinkRequest,
 };
 use fluxfs_proto::meta_codec::{
     decode_dentries, decode_flush_intents, decode_gc_batch, decode_gc_plan, decode_gc_tombstones,
@@ -604,10 +604,61 @@ impl MetaStore for RemoteMetaStore {
                 parent,
                 name: name.to_string(),
                 expected_parent_generation: expected_parent_generation.unwrap_or(0),
+                request_id: RequestOpId::random().to_hex(),
             })
             .await
         })
         .map_err(flux_from_status)?;
         Ok(())
+    }
+
+    fn rmdir_cas(
+        &self,
+        expected_parent_generation: Option<u64>,
+        parent: InodeId,
+        name: &str,
+    ) -> Result<()> {
+        let mut c = self.client()?;
+        self.block_on(async {
+            c.rmdir(RmdirRequest {
+                parent,
+                name: name.to_string(),
+                expected_parent_generation: expected_parent_generation.unwrap_or(0),
+                request_id: RequestOpId::random().to_hex(),
+            })
+            .await
+        })
+        .map_err(flux_from_status)?;
+        Ok(())
+    }
+
+    fn rename_cas(
+        &self,
+        expected_old_parent_generation: Option<u64>,
+        old_parent: InodeId,
+        old_name: &str,
+        expected_new_parent_generation: Option<u64>,
+        new_parent: InodeId,
+        new_name: &str,
+        no_replace: bool,
+    ) -> Result<Inode> {
+        let mut c = self.client()?;
+        let response = self
+            .block_on(async {
+                c.rename(RenameRequest {
+                    old_parent,
+                    old_name: old_name.to_string(),
+                    expected_old_parent_generation: expected_old_parent_generation.unwrap_or(0),
+                    new_parent,
+                    new_name: new_name.to_string(),
+                    expected_new_parent_generation: expected_new_parent_generation.unwrap_or(0),
+                    no_replace,
+                    request_id: RequestOpId::random().to_hex(),
+                })
+                .await
+            })
+            .map_err(flux_from_status)?
+            .into_inner();
+        decode_inode(&response.inode_json)
     }
 }

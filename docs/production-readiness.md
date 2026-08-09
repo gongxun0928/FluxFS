@@ -21,6 +21,9 @@ metadata, data-path, GC, watermark, and local I/O-engine design.
 - RPCs support mTLS workload identity/authorization, structured errors,
   request-ID spans, Prometheus metrics, bounded queues/semaphores, and separate
   low-priority GC admission.
+- Transactional rename/rmdir semantics run through Meta/OpenRaft/tonic, and the
+  reusable client plus `fluxfs fs` stream data in bounded chunks without a FUSE
+  mount. Destructive imported/UFS namespace operations fail closed.
 - Meta schema gates, portable streaming snapshots, legacy snapshot decoding,
   and crash-durable snapshot file publication are implemented.
 
@@ -86,6 +89,10 @@ network-partition tests rather than only localhost scripts.
   and explicit timestamp updates do use generation-CAS Dirty copy-up semantics;
   ordinary reads are mounted `noatime`. Freeze and test the wider advertised
   POSIX contract before general use.
+- Rename cycle detection currently scans the moved directory subtree in one
+  metadata transaction. Production-scale directory trees need a bounded or
+  indexed ancestry mechanism, and CLI/FUSE permission enforcement needs a real
+  authenticated identity-to-UID/GID policy (CLI creation currently uses `0:0`).
 - The synchronous FUSE bridge and owned `Vec<u8>` data path add copies and
   blocking transitions. Add batching/coalescing, deadlines/cancellation, buffer
   pools, and end-to-end adaptive admission based on measurement.

@@ -37,6 +37,8 @@ service MetaService {
   rpc FinishGc(FinishGcRequest) returns (FinishGcResponse);
   rpc ImportExternal(ImportExternalRequest) returns (ImportExternalResponse);
   rpc Unlink(UnlinkRequest) returns (UnlinkResponse);
+  rpc Rmdir(RmdirRequest) returns (RmdirResponse);
+  rpc Rename(RenameRequest) returns (RenameResponse);
   rpc Ping(PingRequest) returns (PingResponse);
 }
 
@@ -194,5 +196,26 @@ message UnlinkRequest {
   string name = 2;
   // 0 = unset (no directory CAS). Directory generations start at 1.
   uint64 expected_parent_generation = 3;
+  string request_id = 4;
 }
 message UnlinkResponse {}
+
+message RmdirRequest {
+  uint64 parent = 1;
+  string name = 2;
+  uint64 expected_parent_generation = 3;
+  string request_id = 4;
+}
+message RmdirResponse {}
+
+message RenameRequest {
+  uint64 old_parent = 1;
+  string old_name = 2;
+  uint64 expected_old_parent_generation = 3;
+  uint64 new_parent = 4;
+  string new_name = 5;
+  uint64 expected_new_parent_generation = 6;
+  bool no_replace = 7;
+  string request_id = 8;
+}
+message RenameResponse { bytes inode_json = 1; }

@@ -11,6 +11,7 @@ use fluxfs_types::{
 use fluxfs_ufs::{ReadPathConfig, ReadPathStats, Ufs, UfsEntryMode, UfsProbe, UfsReadPath};
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
+use std::io::{Read, Write};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::runtime::{Handle, Runtime};
@@ -170,6 +171,7 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         gid: u32,
     ) -> Result<Inode> {
         self.reject_ufs_mutation()?;
+        reject_imported_inode_mutation(&self.meta.get_inode(parent)?)?;
         self.meta
             .create(parent, name, FileType::Directory, mode, uid, gid)
     }
@@ -183,6 +185,7 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         gid: u32,
     ) -> Result<Inode> {
         self.reject_ufs_mutation()?;
+        reject_imported_inode_mutation(&self.meta.get_inode(parent)?)?;
         self.meta
             .create(parent, name, FileType::Regular, mode, uid, gid)
     }
@@ -211,19 +214,144 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
 
     pub fn unlink(&self, parent: InodeId, name: &str) -> Result<()> {
         self.reject_ufs_mutation()?;
+        reject_imported_inode_mutation(&self.meta.get_inode(parent)?)?;
+        let inode = self.meta.lookup(parent, name)?;
+        reject_imported_inode_mutation(&inode)?;
         self.meta.unlink(parent, name)
     }
 
+    pub fn rmdir(&self, parent: InodeId, name: &str) -> Result<()> {
+        self.reject_ufs_mutation()?;
+        reject_imported_inode_mutation(&self.meta.get_inode(parent)?)?;
+        let inode = self.meta.lookup(parent, name)?;
+        reject_imported_inode_mutation(&inode)?;
+        self.meta.rmdir(parent, name)
+    }
+
+    pub fn rename(
+        &self,
+        old_parent: InodeId,
+        old_name: &str,
+        new_parent: InodeId,
+        new_name: &str,
+        no_replace: bool,
+    ) -> Result<Inode> {
+        self.reject_ufs_mutation()?;
+        reject_imported_inode_mutation(&self.meta.get_inode(old_parent)?)?;
+        let source = self.meta.lookup(old_parent, old_name)?;
+        reject_imported_inode_mutation(&source)?;
+        reject_imported_inode_mutation(&self.meta.get_inode(new_parent)?)?;
+        match self.meta.lookup(new_parent, new_name) {
+            Ok(destination) => reject_imported_inode_mutation(&destination)?,
+            Err(FluxError::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+        self.meta
+            .rename(old_parent, old_name, new_parent, new_name, no_replace)
+    }
+
     pub fn lookup_path(&self, path: &str) -> Result<Inode> {
-        let mut cur = ROOT_INODE;
-        let path = path.trim_matches('/');
-        if path.is_empty() {
-            return self.meta.get_inode(ROOT_INODE);
+        let mut inode = self.meta.get_inode(ROOT_INODE)?;
+        for part in path_components(path)? {
+            inode = self.lookup(inode.id, part)?;
         }
-        for part in path.split('/') {
-            cur = self.lookup(cur, part)?.id;
+        Ok(inode)
+    }
+
+    /// Resolve a path into its parent directory and final POSIX name.
+    pub fn resolve_parent(&self, path: &str) -> Result<(Inode, String)> {
+        let parts = path_components(path)?;
+        let (name, parents) = parts
+            .split_last()
+            .ok_or_else(|| FluxError::InvalidArg("root has no parent name".into()))?;
+        let mut parent = self.meta.get_inode(ROOT_INODE)?;
+        for part in parents {
+            parent = self.lookup(parent.id, part)?;
+            if parent.file_type != FileType::Directory {
+                return Err(FluxError::NotDirectory);
+            }
         }
-        self.meta.get_inode(cur)
+        Ok((parent, (*name).to_string()))
+    }
+
+    pub fn mkdir_path(&self, path: &str, mode: u32, uid: u32, gid: u32) -> Result<Inode> {
+        let (parent, name) = self.resolve_parent(path)?;
+        self.mkdir(parent.id, &name, mode, uid, gid)
+    }
+
+    pub fn create_file_path(&self, path: &str, mode: u32, uid: u32, gid: u32) -> Result<Inode> {
+        let (parent, name) = self.resolve_parent(path)?;
+        self.create_file(parent.id, &name, mode, uid, gid)
+    }
+
+    pub fn unlink_path(&self, path: &str) -> Result<()> {
+        let (parent, name) = self.resolve_parent(path)?;
+        self.unlink(parent.id, &name)
+    }
+
+    pub fn rmdir_path(&self, path: &str) -> Result<()> {
+        let (parent, name) = self.resolve_parent(path)?;
+        self.rmdir(parent.id, &name)
+    }
+
+    pub fn rename_path(&self, old_path: &str, new_path: &str, no_replace: bool) -> Result<Inode> {
+        let (old_parent, old_name) = self.resolve_parent(old_path)?;
+        let (new_parent, new_name) = self.resolve_parent(new_path)?;
+        self.rename(
+            old_parent.id,
+            &old_name,
+            new_parent.id,
+            &new_name,
+            no_replace,
+        )
+    }
+
+    pub fn setattr_path(&self, path: &str, attrs: InodeSetAttr) -> Result<Inode> {
+        let inode = self.lookup_path(path)?;
+        self.setattr(inode.id, attrs)
+    }
+
+    /// Stream one inode to a writer without materializing the whole file.
+    pub fn read_to_writer<W: Write>(&self, ino: InodeId, writer: &mut W) -> Result<u64> {
+        let inode = self.meta.get_inode(ino)?;
+        if inode.file_type != FileType::Regular {
+            return Err(FluxError::IsDirectory);
+        }
+        let mut offset = 0_u64;
+        while offset < inode.size {
+            let len = (inode.size - offset).min(CHUNK_SIZE) as u32;
+            let bytes = self.read_at(ino, offset, len)?;
+            if bytes.is_empty() {
+                return Err(FluxError::Io("short streaming read".into()));
+            }
+            writer
+                .write_all(&bytes)
+                .map_err(|error| FluxError::Io(error.to_string()))?;
+            offset = offset
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| FluxError::InvalidArg("stream offset overflow".into()))?;
+        }
+        Ok(offset)
+    }
+
+    /// Replace an inode with bytes read incrementally from `reader`.
+    pub fn write_from_reader<R: Read>(&self, ino: InodeId, reader: &mut R) -> Result<u64> {
+        self.truncate(ino, 0)?;
+        let mut buffer = vec![0_u8; CHUNK_SIZE as usize];
+        let mut offset = 0_u64;
+        loop {
+            let read = reader
+                .read(&mut buffer)
+                .map_err(|error| FluxError::Io(error.to_string()))?;
+            if read == 0 {
+                break;
+            }
+            self.write_at(ino, offset, &buffer[..read])?;
+            offset = offset
+                .checked_add(read as u64)
+                .ok_or_else(|| FluxError::InvalidArg("stream offset overflow".into()))?;
+        }
+        Ok(offset)
     }
 
     pub fn put_chunk(&self, data: &[u8]) -> Result<ChunkId> {
@@ -1234,6 +1362,45 @@ fn mark_data_mutated(inode: &mut Inode) {
     );
 }
 
+fn reject_imported_inode_mutation(inode: &Inode) -> Result<()> {
+    let imported = inode.ufs.is_some()
+        || inode.locality_fields.as_ref().is_some_and(|fields| {
+            fields.backing_mode == BackingMode::UfsBacked || fields.origin == Origin::Imported
+        });
+    if imported {
+        Err(FluxError::ReadOnly)
+    } else {
+        Ok(())
+    }
+}
+
+fn path_components(path: &str) -> Result<Vec<&str>> {
+    if !path.starts_with('/') {
+        return Err(FluxError::InvalidArg(
+            "FluxFS paths must be absolute".into(),
+        ));
+    }
+    let mut parts = Vec::new();
+    for part in path.split('/').filter(|part| !part.is_empty()) {
+        if part == "." || part == ".." {
+            return Err(FluxError::InvalidArg(format!(
+                "path component is reserved: {part}"
+            )));
+        }
+        if part.as_bytes().contains(&0) {
+            return Err(FluxError::InvalidArg("path component contains NUL".into()));
+        }
+        if part.len() > 255 {
+            return Err(FluxError::InvalidArg(format!(
+                "path component too long: {} bytes",
+                part.len()
+            )));
+        }
+        parts.push(part);
+    }
+    Ok(parts)
+}
+
 fn apply_inode_attrs(inode: &mut Inode, attrs: &InodeSetAttr) -> bool {
     let mut touched = false;
     if let Some(mode) = attrs.mode {
@@ -1333,6 +1500,121 @@ mod tests {
         assert_eq!(got, b"hello world");
         let part = client.read_at(f.id, 6, 5).unwrap();
         assert_eq!(part, b"world");
+    }
+
+    #[test]
+    fn path_sdk_streams_crud_rename_and_rmdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = HeedMetaStore::open(dir.path().join("meta")).unwrap();
+        let chunks = DiskChunkStore::open(dir.path().join("chunks")).unwrap();
+        let client = FluxClient::new(meta, chunks);
+
+        client.mkdir_path("/a", 0o755, 10, 20).unwrap();
+        client.mkdir_path("/b", 0o755, 10, 20).unwrap();
+        let file = client
+            .create_file_path("/a/data.bin", 0o640, 10, 20)
+            .unwrap();
+        let payload = vec![0x5a; CHUNK_SIZE as usize + 123];
+        let mut source = std::io::Cursor::new(payload.clone());
+        assert_eq!(
+            client.write_from_reader(file.id, &mut source).unwrap(),
+            payload.len() as u64
+        );
+        let mut output = Vec::new();
+        assert_eq!(
+            client.read_to_writer(file.id, &mut output).unwrap(),
+            payload.len() as u64
+        );
+        assert_eq!(output, payload);
+
+        let moved = client
+            .rename_path("/a/data.bin", "/b/moved.bin", true)
+            .unwrap();
+        assert_eq!(moved.id, file.id);
+        assert_eq!(client.lookup_path("/b/moved.bin").unwrap().id, file.id);
+        assert_eq!(
+            client.lookup_path("/a/data.bin").unwrap_err(),
+            FluxError::NotFound
+        );
+
+        assert_eq!(client.rmdir_path("/b").unwrap_err(), FluxError::NotEmpty);
+        client.unlink_path("/b/moved.bin").unwrap();
+        client.rmdir_path("/b").unwrap();
+        client.rmdir_path("/a").unwrap();
+        assert_eq!(client.lookup_path("/b").unwrap_err(), FluxError::NotFound);
+        assert!(matches!(
+            client.lookup_path("/../escape"),
+            Err(FluxError::InvalidArg(_))
+        ));
+    }
+
+    #[test]
+    fn imported_namespace_delete_and_rename_fail_closed_without_ufs_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = HeedMetaStore::open(dir.path().join("meta")).unwrap();
+        let chunks = DiskChunkStore::open(dir.path().join("chunks")).unwrap();
+        let mut imported = meta
+            .create(ROOT_INODE, "external", FileType::Regular, 0o644, 0, 0)
+            .unwrap();
+        imported.locality_fields = Some(LocalityFields {
+            backing_mode: BackingMode::UfsBacked,
+            data_state: DataState::UfsClean,
+            op_state: OpState::None,
+            origin: Origin::Imported,
+        });
+        imported.locality = LocalityLabel::External;
+        imported.ufs = Some(UfsObject {
+            key: "external".into(),
+            size: 0,
+            etag: Some("etag".into()),
+            mtime_ms: None,
+        });
+        meta.put_inode(&imported).unwrap();
+        let client = FluxClient::new(meta, chunks);
+
+        assert_eq!(
+            client.unlink(ROOT_INODE, "external"),
+            Err(FluxError::ReadOnly)
+        );
+        assert_eq!(
+            client
+                .rename(ROOT_INODE, "external", ROOT_INODE, "renamed", false)
+                .unwrap_err(),
+            FluxError::ReadOnly
+        );
+        assert_eq!(
+            client.lookup(ROOT_INODE, "external").unwrap().id,
+            imported.id
+        );
+
+        let mut imported_dir = client
+            .meta
+            .create(ROOT_INODE, "external-dir", FileType::Directory, 0o755, 0, 0)
+            .unwrap();
+        imported_dir.locality_fields = Some(LocalityFields {
+            backing_mode: BackingMode::UfsBacked,
+            data_state: DataState::UfsClean,
+            op_state: OpState::None,
+            origin: Origin::Imported,
+        });
+        imported_dir.locality = LocalityLabel::External;
+        client.meta.put_inode(&imported_dir).unwrap();
+        assert_eq!(
+            client
+                .create_file(imported_dir.id, "child", 0o644, 0, 0)
+                .unwrap_err(),
+            FluxError::ReadOnly
+        );
+        assert_eq!(
+            client
+                .mkdir(imported_dir.id, "child-dir", 0o755, 0, 0)
+                .unwrap_err(),
+            FluxError::ReadOnly
+        );
+        assert!(matches!(
+            client.lookup_path("relative/path"),
+            Err(FluxError::InvalidArg(_))
+        ));
     }
 
     #[test]

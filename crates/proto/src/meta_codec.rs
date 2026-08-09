@@ -176,6 +176,7 @@ pub fn status_from_flux(err: FluxError) -> tonic::Status {
         FluxError::InvalidArg(_) | FluxError::NotDirectory | FluxError::IsDirectory => {
             Code::InvalidArgument
         }
+        FluxError::NotEmpty => Code::FailedPrecondition,
         FluxError::Capability(_) => Code::ResourceExhausted,
         FluxError::Busy => Code::Unavailable,
         FluxError::CasFailed { .. } | FluxError::DirtyConflict | FluxError::ReadOnly => {
@@ -264,6 +265,7 @@ mod tests {
             FluxError::AlreadyExists,
             FluxError::NotDirectory,
             FluxError::IsDirectory,
+            FluxError::NotEmpty,
             FluxError::InvalidArg("bad offset 123".into()),
             FluxError::Capability("over 4MiB".into()),
             FluxError::CasFailed {

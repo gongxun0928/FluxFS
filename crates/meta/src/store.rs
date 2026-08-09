@@ -234,4 +234,45 @@ pub trait MetaStore: Send + Sync {
         parent: InodeId,
         name: &str,
     ) -> Result<()>;
+
+    /// Remove an empty directory from `parent`.
+    fn rmdir(&self, parent: InodeId, name: &str) -> Result<()> {
+        self.rmdir_cas(None, parent, name)
+    }
+
+    /// Remove an empty directory with optional parent-generation CAS.
+    fn rmdir_cas(
+        &self,
+        expected_parent_generation: Option<u64>,
+        parent: InodeId,
+        name: &str,
+    ) -> Result<()>;
+
+    /// Atomically rename/move a dentry, replacing a compatible destination
+    /// unless `no_replace` is set.
+    fn rename(
+        &self,
+        old_parent: InodeId,
+        old_name: &str,
+        new_parent: InodeId,
+        new_name: &str,
+        no_replace: bool,
+    ) -> Result<Inode> {
+        self.rename_cas(
+            None, old_parent, old_name, None, new_parent, new_name, no_replace,
+        )
+    }
+
+    /// Rename with optional generation CAS for both parent directories.
+    #[allow(clippy::too_many_arguments)]
+    fn rename_cas(
+        &self,
+        expected_old_parent_generation: Option<u64>,
+        old_parent: InodeId,
+        old_name: &str,
+        expected_new_parent_generation: Option<u64>,
+        new_parent: InodeId,
+        new_name: &str,
+        no_replace: bool,
+    ) -> Result<Inode>;
 }

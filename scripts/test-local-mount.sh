@@ -91,6 +91,28 @@ assert st.st_size == 12
 assert int(st.st_mtime) == 1_234_567_890
 assert open(path, "rb").read() == b"abXYefgh" + b"\0" * 4
 PY
+
+# Atomic namespace operations through real FUSE callbacks.
+mkdir "$mount_dir/rename-left" "$mount_dir/rename-right"
+printf 'rename-source\n' >"$mount_dir/rename-left/source"
+mv "$mount_dir/rename-left/source" "$mount_dir/rename-right/moved"
+test ! -e "$mount_dir/rename-left/source"
+test "$(cat "$mount_dir/rename-right/moved")" = "rename-source"
+printf 'replacement\n' >"$mount_dir/rename-right/replacement"
+mv "$mount_dir/rename-right/moved" "$mount_dir/rename-right/replacement"
+test "$(cat "$mount_dir/rename-right/replacement")" = "rename-source"
+mkdir "$mount_dir/rename-left/tree"
+printf 'child\n' >"$mount_dir/rename-left/tree/child"
+if rmdir "$mount_dir/rename-left/tree" 2>/dev/null; then
+    echo "rmdir unexpectedly removed a non-empty directory" >&2
+    exit 1
+fi
+rm "$mount_dir/rename-left/tree/child"
+rmdir "$mount_dir/rename-left/tree"
+mkdir "$mount_dir/rename-left/move-tree"
+mv "$mount_dir/rename-left/move-tree" "$mount_dir/rename-right/move-tree"
+rmdir "$mount_dir/rename-right/move-tree"
+rmdir "$mount_dir/rename-left"
 rm "$mount_dir/remove.txt"
 test ! -e "$mount_dir/remove.txt"
 stop_mount
@@ -110,6 +132,9 @@ assert st.st_size == 12
 assert int(st.st_mtime) == 1_234_567_890
 assert open(path, "rb").read() == b"abXYefgh" + b"\0" * 4
 PY
+test "$(cat "$mount_dir/rename-right/replacement")" = "rename-source"
+rm "$mount_dir/rename-right/replacement"
+rmdir "$mount_dir/rename-right"
 printf '\nrestart-ok\n' >>"$mount_dir/hello.txt"
 test "$(tail -n 1 "$mount_dir/hello.txt")" = "restart-ok"
 stop_mount

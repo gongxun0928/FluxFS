@@ -11,6 +11,8 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod cluster_cli;
+
 #[derive(Parser, Debug)]
 #[command(name = "fluxfs", about = "FluxFS MVP co-located control binary")]
 struct Cli {
@@ -20,7 +22,7 @@ struct Cli {
 
 /// Client-side TLS args shared by subcommands that dial Meta/Worker (task #30 C1).
 #[derive(Parser, Debug, Clone, Default)]
-struct TlsClientArgs {
+pub(crate) struct TlsClientArgs {
     /// Cluster CA cert (PEM) for verifying server identity. Required when
     /// --tls-client-cert is set (mTLS); production default.
     #[arg(long)]
@@ -39,7 +41,7 @@ struct TlsClientArgs {
 impl TlsClientArgs {
     /// Build a `ClientTlsOptions` from the parsed flags (None when TLS is
     /// disabled, in which case the caller must have opted into plaintext).
-    fn build(
+    pub(crate) fn build(
         &self,
         domain: Option<String>,
     ) -> anyhow::Result<Option<fluxfs_tls::ClientTlsOptions>> {
@@ -56,6 +58,10 @@ impl TlsClientArgs {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// HDFS-dfs-like filesystem CRUD over Meta/Chunk RPCs (no FUSE mount required).
+    Fs(cluster_cli::FsArgs),
+    /// Read-only cluster inspection commands.
+    Admin(cluster_cli::AdminArgs),
     /// Meta create/lookup + chunk put/get + local UFS HEAD smoke.
     Smoke {
         #[arg(long, default_value = "/tmp/fluxfs-smoke")]
@@ -163,6 +169,7 @@ enum Cmd {
 async fn main() -> Result<()> {
     fluxfs_tls::install_crypto_provider();
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_span_events(
             tracing_subscriber::fmt::format::FmtSpan::NEW
@@ -172,6 +179,8 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::Fs(args) => args.run()?,
+        Cmd::Admin(args) => args.run()?,
         Cmd::CompactChunks { data_dir } => {
             let store = DiskChunkStore::open(&data_dir).context("open chunk store")?;
             let report = store.compact().context("compact chunks")?;

@@ -907,6 +907,8 @@ pub enum FluxError {
     NotDirectory,
     #[error("is a directory")]
     IsDirectory,
+    #[error("directory not empty")]
+    NotEmpty,
     #[error("invalid argument: {0}")]
     InvalidArg(String),
     #[error("capability exceeded: {0}")]

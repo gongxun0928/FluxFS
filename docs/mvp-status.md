@@ -1,6 +1,6 @@
 # FluxFS MVP implementation status
 
-Status: verified implementation description as of 2026-08-09. This document
+Status: verified implementation description as of 2026-08-10. This document
 describes what is in `main`; it is not a production-readiness claim. The
 original [v0.1 design](mvp-v0.1.md) is retained as historical context.
 
@@ -109,6 +109,37 @@ Startup replays unfinished intents. A process crash before multipart completion
 cannot publish a partial object, but the object store must have an incomplete
 multipart lifecycle policy to reclaim abandoned parts.
 
+### Namespace, SDK, FUSE, and CLI
+
+The authoritative namespace supports transactional `rmdir` and rename through
+the MetaStore, OpenRaft state machine, snapshot-safe heed transaction, tonic
+contract, and remote client. Rename moves a dentry and updates both parent
+generations atomically, supports destination replacement and no-replace,
+rejects file/directory type mismatches, refuses a non-empty destination
+directory, and prevents moving a directory into its own subtree. `unlink`
+rejects directories and `rmdir` rejects regular or non-empty targets.
+
+FUSE wires those operations to real `rename(2)` and `rmdir(2)` callbacks.
+Normal rename and `RENAME_NOREPLACE` are supported; exchange and whiteout are
+explicitly rejected. The Rust client exposes validated absolute-path CRUD plus
+bounded 4 MiB `Read`/`Write` streaming helpers, so tools do not buffer whole
+files in memory.
+
+`fluxfs fs` uses the same remote client and membership-discovered RF=2 Workers
+without requiring a FUSE mount. It provides file transfer, namespace CRUD, and
+basic numeric POSIX attributes. `put` streams into a temporary inode and makes
+the new file visible with one atomic rename; a failed transfer best-effort
+removes the temporary name. `fluxfs admin status|workers` is read-only. Both
+command groups use the existing TLS flags and are exercised with a distinct
+client-admin mTLS identity. Until shell/user identity mapping exists, CLI
+creates use bootstrap owner `0:0`; `chown` accepts numeric IDs.
+
+Imported/UFS dentries are not silently changed by the namespace-only path:
+unlink, rmdir, rename, and replacement of imported entries fail closed. The
+mount-free CLI has no UFS publication adapter; this preserves the existing
+External consistency boundary instead of pretending a metadata-only delete or
+rename modified the backing object.
+
 ## 3. Garbage collection
 
 Physical data deletion is asynchronous. Mount readiness and foreground writes
@@ -199,6 +230,9 @@ than a capability claimed by the current implementation.
 - `available_bytes` is administrative rather than live disk telemetry.
 - Very large fragmented manifests and global metadata snapshots still have
   scale costs despite indexed extents and streaming transfer.
+- Directory-cycle validation for rename scans the moved subtree inside the
+  atomic metadata transaction; very large directory trees need an indexed or
+  otherwise bounded ancestry design before production scale.
 - Remaining POSIX scope (including links, xattrs, locking, open-unlink lifetime,
   and permission enforcement), multi-machine chaos/soak, operational upgrades/DR, complete
   capacity control, and positional/async local I/O remain production work.

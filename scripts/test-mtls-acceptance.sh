@@ -51,6 +51,7 @@ worker2_pid=""
 mount_pid=""
 
 cleanup() {
+    local status=$?
     fusermount3 -u "$mount_dir" 2>/dev/null || true
     for pid in "$mount_pid" "$meta_pid" "$worker0_pid" "$worker1_pid" "$worker2_pid"; do
         if [[ -n "$pid" ]]; then
@@ -58,7 +59,16 @@ cleanup() {
             wait "$pid" 2>/dev/null || true
         fi
     done
+    if (( status != 0 )); then
+        echo "mTLS acceptance failed; recent process logs:" >&2
+        for log in "$test_root"/*.log; do
+            [[ -f "$log" ]] || continue
+            echo "--- $(basename "$log")" >&2
+            tail -n 40 "$log" >&2 || true
+        done
+    fi
     rm -rf -- "$test_root"
+    return "$status"
 }
 trap cleanup EXIT
 
@@ -87,38 +97,53 @@ start_meta() {
 
 start_worker0() {
     "$repo_dir/target/debug/fluxfs-chunkworker" \
-        --worker-id 0 --listen "127.0.0.1:$worker0_port" \
+        --worker-id 1 --listen "127.0.0.1:$worker0_port" \
+        --advertise-endpoint "https://127.0.0.1:$worker0_port" \
+        --meta-addr "https://127.0.0.1:$meta_port" \
         --data-dir "$test_root/worker-0" \
         --tls-ca-cert "$cert_dir/ca.crt" \
-        --tls-server-cert "$cert_dir/worker-0.crt" \
-        --tls-server-key  "$cert_dir/worker-0.key" \
+        --tls-server-cert "$cert_dir/worker-1.crt" \
+        --tls-server-key  "$cert_dir/worker-1.key" \
         >"$test_root/worker-0.log" 2>&1 &
     worker0_pid=$!
-    wait_port "$worker0_port"
+    if ! wait_port "$worker0_port"; then
+        cat "$test_root/worker-0.log" >&2
+        return 1
+    fi
 }
 
 start_worker1() {
     "$repo_dir/target/debug/fluxfs-chunkworker" \
-        --worker-id 1 --listen "127.0.0.1:$worker1_port" \
+        --worker-id 2 --listen "127.0.0.1:$worker1_port" \
+        --advertise-endpoint "https://127.0.0.1:$worker1_port" \
+        --meta-addr "https://127.0.0.1:$meta_port" \
         --data-dir "$test_root/worker-1" \
         --tls-ca-cert "$cert_dir/ca.crt" \
-        --tls-server-cert "$cert_dir/worker-1.crt" \
-        --tls-server-key  "$cert_dir/worker-1.key" \
+        --tls-server-cert "$cert_dir/worker-2.crt" \
+        --tls-server-key  "$cert_dir/worker-2.key" \
         >"$test_root/worker-1.log" 2>&1 &
     worker1_pid=$!
-    wait_port "$worker1_port"
+    if ! wait_port "$worker1_port"; then
+        cat "$test_root/worker-1.log" >&2
+        return 1
+    fi
 }
 
 start_worker2() {
     "$repo_dir/target/debug/fluxfs-chunkworker" \
-        --worker-id 2 --listen "127.0.0.1:$worker2_port" \
+        --worker-id 3 --listen "127.0.0.1:$worker2_port" \
+        --advertise-endpoint "https://127.0.0.1:$worker2_port" \
+        --meta-addr "https://127.0.0.1:$meta_port" \
         --data-dir "$test_root/worker-2" \
         --tls-ca-cert "$cert_dir/ca.crt" \
-        --tls-server-cert "$cert_dir/worker-2.crt" \
-        --tls-server-key  "$cert_dir/worker-2.key" \
+        --tls-server-cert "$cert_dir/worker-3.crt" \
+        --tls-server-key  "$cert_dir/worker-3.key" \
         >"$test_root/worker-2.log" 2>&1 &
     worker2_pid=$!
-    wait_port "$worker2_port"
+    if ! wait_port "$worker2_port"; then
+        cat "$test_root/worker-2.log" >&2
+        return 1
+    fi
 }
 
 # Mount with caller-supplied client cert/key (so we can re-mount for reject
@@ -128,9 +153,6 @@ start_mount_with() {
     "$repo_dir/target/debug/fluxfs" mount --no-ufs \
         --data-dir "$test_root/client" --mountpoint "$mount_dir" \
         --meta-addr "https://127.0.0.1:$meta_port" \
-        --chunk-worker "https://127.0.0.1:$worker0_port" \
-        --chunk-worker "https://127.0.0.1:$worker1_port" \
-        --chunk-worker "https://127.0.0.1:$worker2_port" \
         --tls-ca-cert "$cert_dir/ca.crt" \
         --tls-client-cert "$cc" \
         --tls-client-key  "$ck" \
@@ -186,7 +208,7 @@ cargo build --manifest-path "$repo_dir/Cargo.toml" \
     -p fluxfs -p fluxfs-metamaster -p fluxfs-chunkworker >/dev/null
 
 echo "==> minting dev cluster certs"
-"$repo_dir/scripts/dev-ca.sh" "$cert_dir" "0 1 2" >/dev/null
+"$repo_dir/scripts/dev-ca.sh" "$cert_dir" "1 2 3" >/dev/null
 
 echo "==> minting rogue CA + rogue client"
 mint_rogue
@@ -209,6 +231,45 @@ fusermount3 -u "$mount_dir"
 wait "$mount_pid" 2>/dev/null || true
 mount_pid=""
 echo "    PASS"
+
+echo "==> [1b/5] client-admin CLI over mTLS: admin + streaming namespace CRUD"
+cli_tls=(
+    --tls-ca-cert "$cert_dir/ca.crt"
+    --tls-client-cert "$cert_dir/client.crt"
+    --tls-client-key "$cert_dir/client.key"
+)
+admin=(
+    "$repo_dir/target/debug/fluxfs" admin
+    --meta-addr "https://127.0.0.1:$meta_port"
+    "${cli_tls[@]}"
+)
+fs=(
+    "$repo_dir/target/debug/fluxfs" fs
+    --meta-addr "https://127.0.0.1:$meta_port"
+    "${cli_tls[@]}"
+)
+for _ in $(seq 1 100); do
+    if "${admin[@]}" status >"$test_root/cli-status.log" 2>&1 \
+            && grep -q 'workers_live=3/3' "$test_root/cli-status.log"; then
+        break
+    fi
+    sleep 0.05
+done
+grep -q 'cluster ok:' "$test_root/cli-status.log"
+grep -q 'workers_live=3/3' "$test_root/cli-status.log"
+"${admin[@]}" workers >"$test_root/cli-workers.log"
+test "$(tail -n +2 "$test_root/cli-workers.log" | wc -l)" = "3"
+
+"${fs[@]}" mkdir /cli
+dd if=/dev/zero of="$test_root/cli.expected" bs=1M count=5 status=none
+printf 'cli-mtls-tail\n' >>"$test_root/cli.expected"
+"${fs[@]}" put "$test_root/cli.expected" /cli/source.bin
+"${fs[@]}" mv /cli/source.bin /cli/renamed.bin --no-replace
+"${fs[@]}" cat /cli/renamed.bin >"$test_root/cli.actual"
+cmp "$test_root/cli.expected" "$test_root/cli.actual"
+"${fs[@]}" rm /cli/renamed.bin
+"${fs[@]}" rmdir /cli
+echo "    PASS (client-admin cert authorized Meta rename/rmdir and Worker stream RPCs)"
 
 echo "==> [2/5] reject: plaintext dial against mTLS port"
 if "$repo_dir/target/debug/fluxfs" mount --no-ufs \
@@ -384,9 +445,6 @@ mount_pid=""
 if ! "$repo_dir/target/debug/fluxfs" orphan-gc \
         --data-dir "$test_root/client-gc" \
         --meta-addr "https://127.0.0.1:$meta_port" \
-        --chunk-worker "https://127.0.0.1:$worker0_port" \
-        --chunk-worker "https://127.0.0.1:$worker1_port" \
-        --chunk-worker "https://127.0.0.1:$worker2_port" \
         --tls-ca-cert "$cert_dir/ca.crt" \
         --tls-client-cert "$cert_dir/client.crt" \
         --tls-client-key  "$cert_dir/client.key" \

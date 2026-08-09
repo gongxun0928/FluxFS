@@ -251,6 +251,32 @@ pub enum MetaRaftRequest {
         #[serde(default)]
         expected_parent_generation: Option<u64>,
     },
+    Rmdir {
+        #[serde(default)]
+        request_id: Option<RequestOpId>,
+        #[serde(default)]
+        ledger_now_unix_ms: u64,
+        parent: u64,
+        name: String,
+        #[serde(default)]
+        expected_parent_generation: Option<u64>,
+    },
+    Rename {
+        #[serde(default)]
+        request_id: Option<RequestOpId>,
+        #[serde(default)]
+        ledger_now_unix_ms: u64,
+        old_parent: u64,
+        old_name: String,
+        #[serde(default)]
+        expected_old_parent_generation: Option<u64>,
+        new_parent: u64,
+        new_name: String,
+        #[serde(default)]
+        expected_new_parent_generation: Option<u64>,
+        #[serde(default)]
+        no_replace: bool,
+    },
 }
 
 impl MetaRaftRequest {
@@ -277,7 +303,9 @@ impl MetaRaftRequest {
             | Self::BeginGc { request_id, .. }
             | Self::FinishGc { request_id, .. }
             | Self::ImportExternal { request_id, .. }
-            | Self::Unlink { request_id, .. } => request_id.as_ref(),
+            | Self::Unlink { request_id, .. }
+            | Self::Rmdir { request_id, .. }
+            | Self::Rename { request_id, .. } => request_id.as_ref(),
         }
     }
 
@@ -304,7 +332,9 @@ impl MetaRaftRequest {
             | Self::BeginGc { request_id, .. }
             | Self::FinishGc { request_id, .. }
             | Self::ImportExternal { request_id, .. }
-            | Self::Unlink { request_id, .. } => {
+            | Self::Unlink { request_id, .. }
+            | Self::Rmdir { request_id, .. }
+            | Self::Rename { request_id, .. } => {
                 *request_id = Some(id);
             }
         }
@@ -379,6 +409,12 @@ impl MetaRaftRequest {
             }
             | Self::Unlink {
                 ledger_now_unix_ms, ..
+            }
+            | Self::Rmdir {
+                ledger_now_unix_ms, ..
+            }
+            | Self::Rename {
+                ledger_now_unix_ms, ..
             } => *ledger_now_unix_ms,
         }
     }
@@ -450,6 +486,12 @@ impl MetaRaftRequest {
             }
             | Self::Unlink {
                 ledger_now_unix_ms, ..
+            }
+            | Self::Rmdir {
+                ledger_now_unix_ms, ..
+            }
+            | Self::Rename {
+                ledger_now_unix_ms, ..
             } => {
                 *ledger_now_unix_ms = now_unix_ms;
             }
@@ -482,6 +524,8 @@ impl MetaRaftRequest {
             Self::FinishGc { .. } => "finish_gc",
             Self::ImportExternal { .. } => "import_external",
             Self::Unlink { .. } => "unlink",
+            Self::Rmdir { .. } => "rmdir",
+            Self::Rename { .. } => "rename",
         }
     }
 }

@@ -146,6 +146,14 @@ start_worker 1 "$worker1_port"
 start_worker 2 "$worker2_port"
 start_mount
 
+# Imported namespace identity is UFS-owned. FUSE rename must fail closed rather
+# than silently moving only the FluxFS dentry while leaving the S3 key behind.
+if mv "$mount_dir/large.bin" "$mount_dir/renamed.bin" 2>/dev/null; then
+    echo "External rename unexpectedly changed only the FluxFS namespace" >&2
+    exit 1
+fi
+test -f "$mount_dir/large.bin"
+
 # First random write materializes only the middle 4 MiB window as a Local RF=2
 # extent; bytes outside it remain pinned UFS ranges.
 python3 - "$mount_dir/large.bin" "$test_root/expected.bin" <<'PY'

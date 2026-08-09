@@ -6,8 +6,8 @@ use fluxfs_meta::MetaStore;
 use fluxfs_types::{FileType as FluxFileType, FluxError, Inode};
 use fuser::{
     mount, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
-    INodeNo, LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, SessionACL, TimeOrNow,
+    INodeNo, LockOwner, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, SessionACL, TimeOrNow,
 }; // SessionACL used in mount_ephemeral
 use std::ffi::OsStr;
 use std::path::Path;
@@ -135,6 +135,48 @@ impl<M: MetaStore + 'static, C: ChunkStore + 'static> Filesystem for FluxFs<M, C
         match self.client.unlink(parent.0, name) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(map_err(e)),
+        }
+    }
+
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        match self.client.rmdir(parent.0, name) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(map_err(error)),
+        }
+    }
+
+    fn rename(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        flags: RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        let (Some(name), Some(newname)) = (name.to_str(), newname.to_str()) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let supported = RenameFlags::RENAME_NOREPLACE;
+        if !(flags - supported).is_empty() {
+            reply.error(Errno::EOPNOTSUPP);
+            return;
+        }
+        match self.client.rename(
+            parent.0,
+            name,
+            newparent.0,
+            newname,
+            flags.contains(RenameFlags::RENAME_NOREPLACE),
+        ) {
+            Ok(_) => reply.ok(),
+            Err(error) => reply.error(map_err(error)),
         }
     }
 
@@ -330,6 +372,7 @@ fn map_err(e: FluxError) -> Errno {
         FluxError::AlreadyExists => Errno::EEXIST,
         FluxError::NotDirectory => Errno::ENOTDIR,
         FluxError::IsDirectory => Errno::EISDIR,
+        FluxError::NotEmpty => Errno::ENOTEMPTY,
         FluxError::Capability(_) => Errno::EOPNOTSUPP,
         FluxError::Busy => Errno::EAGAIN,
         FluxError::CasFailed { .. } => Errno::EAGAIN,
@@ -391,6 +434,7 @@ mod tests {
             map_err(FluxError::Capability("unsupported".into())),
             Errno::EOPNOTSUPP
         );
+        assert_eq!(map_err(FluxError::NotEmpty), Errno::ENOTEMPTY);
     }
 
     #[test]

@@ -13,7 +13,8 @@ via `scripts/dev-minio.sh` / `fluxfs ufs-check`); External objects are lazily
 imported into FUSE and read with pinned, bounded Range GETs. Random writes copy
 up only touched 4 MiB windows into RF=2 Local extents, keep untouched bytes as
 pinned UFS ranges, then atomically CAS the inode to Dirty. Basic create/read/write, random write,
-truncate, chmod/chown, explicit timestamp updates, mkdir/readdir, unlink,
+truncate, chmod/chown, explicit timestamp updates, mkdir/readdir, unlink/rmdir,
+same-namespace atomic rename (including replacement and `RENAME_NOREPLACE`),
 unmount/remount, process-crash recovery, and single-replica read fallback are
 executable. A combined size/attribute update uses one generation CAS, including
 for an imported UFS object; ordinary reads follow an explicit `noatime` mount
@@ -36,6 +37,13 @@ under `meta/raft/`; inode mutations and SM `last_applied` commit in one MetaStor
 write txn. Snapshots export/import full inode/dentry/manifest state. This is
 durable single-voter recovery, not multi-voter metadata HA.
 
+The reusable Rust client also exposes validated path CRUD and bounded 4 MiB
+reader/writer streaming. `fluxfs fs` provides mount-free `ls`, `stat`, `cat`,
+`get`, `put`, `mkdir`, `rm`, `rmdir`, `mv`, `chmod`, `chown`, `touch`, and
+`truncate`; `fluxfs admin` provides read-only cluster and Worker status.
+`put` stages data in a temporary inode and exposes it with one atomic rename.
+Both CLIs support the existing client-admin mTLS certificate flags.
+
 Current MVP implementation: [`docs/mvp-status.md`](docs/mvp-status.md) · Historical design:
 [`docs/mvp-v0.1.md`](docs/mvp-v0.1.md) · Alpha gates:
 [`docs/alpha-checklist.md`](docs/alpha-checklist.md) · Production gap analysis:
@@ -52,7 +60,7 @@ crates/
   chunk/    RF=2 authoritative disk store + evictable foyer facade
   chunkworker/ independent durable chunk process
   ufs/      OpenDAL adapter + bounded range cache/single-flight prefetch
-  client/   internal API (not public SDK)
+  client/   reusable inode/path API and bounded streaming data path
   fuse/     Ephemeral FUSE operations
   fluxfs/   co-located binary + CLI
 ```
@@ -70,6 +78,7 @@ cargo run -p fluxfs -- smoke --data-dir /tmp/fluxfs-smoke
 ./scripts/test-multiprocess.sh
 ./scripts/test-ufs-minio.sh
 ./scripts/test-dirty-copyup-minio.sh
+./scripts/test-cli.sh
 
 # Ephemeral local mount (no UFS)
 mkdir -p /tmp/fluxfs-data /tmp/fluxfs-mnt
@@ -90,6 +99,12 @@ cargo run -p fluxfs -- ufs-check
 
 # External mount over the test bucket (existing-object random writes copy up to Dirty)
 cargo run -p fluxfs -- mount --ufs s3://fluxfs --data-dir /tmp/fluxfs-external-data --mountpoint /tmp/fluxfs-mnt
+
+# With MetaMaster + membership-registered ChunkWorkers running:
+cargo run -p fluxfs -- fs --meta-addr http://127.0.0.1:50051 --allow-insecure-dev mkdir /demo
+cargo run -p fluxfs -- fs --meta-addr http://127.0.0.1:50051 --allow-insecure-dev put ./README.md /demo/README.md
+cargo run -p fluxfs -- fs --meta-addr http://127.0.0.1:50051 --allow-insecure-dev cat /demo/README.md
+cargo run -p fluxfs -- admin --meta-addr http://127.0.0.1:50051 --allow-insecure-dev status
 ```
 
 ## Locked product boundaries (alpha)
@@ -98,6 +113,9 @@ cargo run -p fluxfs -- mount --ufs s3://fluxfs --data-dir /tmp/fluxfs-external-d
 - dentry + inode namespace; External lazy + rebuildable TTL cache
 - Dirty/Ephemeral default RF=2; Clean/External cache RF=1
 - Ephemeral via `--no-ufs`; no nested mounts; External write → copy-up → Dirty
+- Destructive namespace operations on imported/UFS entries fail closed. The
+  mount-free CLI has no UFS adapter and cannot silently delete or rename only
+  FluxFS metadata for an External object.
 - Dirty/Ephemeral random writes and truncate use bounded 4 MiB windows; UFS flush uses
   bounded-memory multipart publication. There is no artificial 1 GiB file cap.
 - Configure the object store's incomplete-multipart lifecycle cleanup: a process

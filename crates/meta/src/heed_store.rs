@@ -653,6 +653,39 @@ impl HeedMetaStore {
                         Err(e) => MetaRaftResponse::Err(e),
                     }
                 }
+                MetaRaftRequest::Rmdir {
+                    parent,
+                    name,
+                    expected_parent_generation,
+                    ..
+                } => {
+                    match self.rmdir_in_txn(&mut wtxn, *expected_parent_generation, *parent, name) {
+                        Ok(()) => MetaRaftResponse::Empty,
+                        Err(e) => MetaRaftResponse::Err(e),
+                    }
+                }
+                MetaRaftRequest::Rename {
+                    old_parent,
+                    old_name,
+                    expected_old_parent_generation,
+                    new_parent,
+                    new_name,
+                    expected_new_parent_generation,
+                    no_replace,
+                    ..
+                } => match self.rename_in_txn(
+                    &mut wtxn,
+                    *expected_old_parent_generation,
+                    *old_parent,
+                    old_name,
+                    *expected_new_parent_generation,
+                    *new_parent,
+                    new_name,
+                    *no_replace,
+                ) {
+                    Ok(inode) => MetaRaftResponse::Inode(Box::new(inode)),
+                    Err(e) => MetaRaftResponse::Err(e),
+                },
             }
         };
 
@@ -1742,35 +1775,232 @@ impl HeedMetaStore {
             .ok_or(FluxError::NotFound)?
             .to_vec();
         let child_id = u64_from_bytes(&child_raw)?;
+        let child = get_inode_raw(&self.inodes, wtxn, child_id)?;
+        if child.file_type == FileType::Directory {
+            return Err(FluxError::IsDirectory);
+        }
         self.load_and_bump_parent_dir(wtxn, parent, expected_parent_generation)?;
         self.dentries
             .delete(wtxn, &key)
             .map_err(|e| FluxError::Meta(e.to_string()))?;
 
-        let mut child = get_inode_raw(&self.inodes, wtxn, child_id)?;
+        self.remove_inode_link_in_txn(wtxn, child)
+    }
+
+    fn rmdir_in_txn(
+        &self,
+        wtxn: &mut heed::RwTxn,
+        expected_parent_generation: Option<u64>,
+        parent: InodeId,
+        name: &str,
+    ) -> Result<()> {
+        let key = dentry_key(parent, name);
+        let child_raw = self
+            .dentries
+            .get(wtxn, &key)
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+            .ok_or(FluxError::NotFound)?
+            .to_vec();
+        let child_id = u64_from_bytes(&child_raw)?;
+        let child = get_inode_raw(&self.inodes, wtxn, child_id)?;
+        if child.file_type != FileType::Directory {
+            return Err(FluxError::NotDirectory);
+        }
+        if self.directory_has_children_in_txn(wtxn, child_id)? {
+            return Err(FluxError::NotEmpty);
+        }
+        self.load_and_bump_parent_dir(wtxn, parent, expected_parent_generation)?;
+        self.dentries
+            .delete(wtxn, &key)
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        self.delete_inode_in_txn(wtxn, child_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rename_in_txn(
+        &self,
+        wtxn: &mut heed::RwTxn,
+        expected_old_parent_generation: Option<u64>,
+        old_parent: InodeId,
+        old_name: &str,
+        expected_new_parent_generation: Option<u64>,
+        new_parent: InodeId,
+        new_name: &str,
+        no_replace: bool,
+    ) -> Result<Inode> {
+        validate_dentry_name(old_name)?;
+        validate_dentry_name(new_name)?;
+
+        let old_key = dentry_key(old_parent, old_name);
+        let new_key = dentry_key(new_parent, new_name);
+        let source_id = self
+            .dentries
+            .get(wtxn, &old_key)
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+            .ok_or(FluxError::NotFound)
+            .and_then(u64_from_bytes)?;
+        let mut source = get_inode_raw(&self.inodes, wtxn, source_id)?;
+
+        let old_parent_inode = get_inode_raw(&self.inodes, wtxn, old_parent)?;
+        let new_parent_inode = if old_parent == new_parent {
+            old_parent_inode.clone()
+        } else {
+            get_inode_raw(&self.inodes, wtxn, new_parent)?
+        };
+        if old_parent_inode.file_type != FileType::Directory
+            || new_parent_inode.file_type != FileType::Directory
+        {
+            return Err(FluxError::NotDirectory);
+        }
+        check_optional_generation(&old_parent_inode, expected_old_parent_generation)?;
+        check_optional_generation(&new_parent_inode, expected_new_parent_generation)?;
+
+        if old_key == new_key {
+            return Ok(source);
+        }
+        if source.file_type == FileType::Directory
+            && self.inode_is_descendant_in_txn(wtxn, source.id, new_parent)?
+        {
+            return Err(FluxError::InvalidArg(
+                "cannot move a directory into its own subtree".into(),
+            ));
+        }
+
+        let destination = self
+            .dentries
+            .get(wtxn, &new_key)
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+            .map(u64_from_bytes)
+            .transpose()?;
+        if no_replace && destination.is_some() {
+            return Err(FluxError::AlreadyExists);
+        }
+        if destination == Some(source.id) {
+            return Ok(source);
+        }
+        if let Some(destination_id) = destination {
+            let destination_inode = get_inode_raw(&self.inodes, wtxn, destination_id)?;
+            match (source.file_type, destination_inode.file_type) {
+                (FileType::Directory, FileType::Regular) => {
+                    return Err(FluxError::NotDirectory);
+                }
+                (FileType::Regular, FileType::Directory) => {
+                    return Err(FluxError::IsDirectory);
+                }
+                (FileType::Directory, FileType::Directory)
+                    if self.directory_has_children_in_txn(wtxn, destination_id)? =>
+                {
+                    return Err(FluxError::NotEmpty);
+                }
+                _ => {}
+            }
+        }
+
+        self.load_and_bump_parent_dir(wtxn, old_parent, expected_old_parent_generation)?;
+        if new_parent != old_parent {
+            self.load_and_bump_parent_dir(wtxn, new_parent, expected_new_parent_generation)?;
+        }
+
+        if let Some(destination_id) = destination {
+            self.dentries
+                .delete(wtxn, &new_key)
+                .map_err(|e| FluxError::Meta(e.to_string()))?;
+            let destination_inode = get_inode_raw(&self.inodes, wtxn, destination_id)?;
+            if destination_inode.file_type == FileType::Directory {
+                self.delete_inode_in_txn(wtxn, destination_id)?;
+            } else {
+                self.remove_inode_link_in_txn(wtxn, destination_inode)?;
+            }
+        }
+        self.dentries
+            .delete(wtxn, &old_key)
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        self.dentries
+            .put(wtxn, &new_key, &u64_bytes(source.id))
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        source.generation = source.generation.saturating_add(1);
+        source.ctime_ms = now_ms();
+        put_inode_raw(&self.inodes, wtxn, &source)?;
+        Ok(source)
+    }
+
+    fn directory_has_children_in_txn(&self, txn: &heed::RwTxn, dir: InodeId) -> Result<bool> {
+        let prefix = dentry_prefix(dir);
+        let mut iter = self
+            .dentries
+            .prefix_iter(txn, &prefix)
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        Ok(iter
+            .next()
+            .transpose()
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+            .is_some())
+    }
+
+    fn inode_is_descendant_in_txn(
+        &self,
+        txn: &heed::RwTxn,
+        ancestor: InodeId,
+        candidate: InodeId,
+    ) -> Result<bool> {
+        if ancestor == candidate {
+            return Ok(true);
+        }
+        let mut pending = vec![ancestor];
+        let mut visited = BTreeSet::new();
+        while let Some(dir) = pending.pop() {
+            if !visited.insert(dir) {
+                continue;
+            }
+            let prefix = dentry_prefix(dir);
+            let iter = self
+                .dentries
+                .prefix_iter(txn, &prefix)
+                .map_err(|e| FluxError::Meta(e.to_string()))?;
+            let mut children = Vec::new();
+            for item in iter {
+                let (_, raw) = item.map_err(|e| FluxError::Meta(e.to_string()))?;
+                children.push(u64_from_bytes(raw)?);
+            }
+            for child in children {
+                if child == candidate {
+                    return Ok(true);
+                }
+                if get_inode_raw(&self.inodes, txn, child)?.file_type == FileType::Directory {
+                    pending.push(child);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn remove_inode_link_in_txn(&self, wtxn: &mut heed::RwTxn, mut child: Inode) -> Result<()> {
         if child.link_count == 0 {
             return Err(FluxError::Meta(format!(
-                "inode {child_id} already has link_count=0"
+                "inode {} already has link_count=0",
+                child.id
             )));
         }
         child.link_count -= 1;
         child.ctime_ms = now_ms();
         if child.link_count == 0 {
-            // Drop live manifest refs so concurrent GC can reclaim chunks.
-            // Abort in-flight write reservations for this inode (deterministic
-            // expire of abandoned tickets is T2; unlink must not leave forever-live
-            // reservations pinning deleted-file chunks).
-            for reservation in self.list_reservations_in_txn(wtxn)? {
-                if reservation.inode == child_id {
-                    self.abort_reservation_in_txn(wtxn, reservation.ticket)?;
-                }
-            }
-            self.inodes
-                .delete(wtxn, &inode_key(child_id))
-                .map_err(|e| FluxError::Meta(e.to_string()))?;
+            self.delete_inode_in_txn(wtxn, child.id)
         } else {
-            put_inode_raw(&self.inodes, wtxn, &child)?;
+            put_inode_raw(&self.inodes, wtxn, &child)
         }
+    }
+
+    fn delete_inode_in_txn(&self, wtxn: &mut heed::RwTxn, child_id: InodeId) -> Result<()> {
+        // Drop live manifest refs so concurrent GC can reclaim chunks. Abort
+        // in-flight write reservations so deleted files cannot pin data.
+        for reservation in self.list_reservations_in_txn(wtxn)? {
+            if reservation.inode == child_id {
+                self.abort_reservation_in_txn(wtxn, reservation.ticket)?;
+            }
+        }
+        self.inodes
+            .delete(wtxn, &inode_key(child_id))
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
         Ok(())
     }
 
@@ -2791,6 +3021,41 @@ impl MetaStore for HeedMetaStore {
             store.unlink_in_txn(wtxn, expected_parent_generation, parent, name)
         })
     }
+
+    fn rmdir_cas(
+        &self,
+        expected_parent_generation: Option<u64>,
+        parent: InodeId,
+        name: &str,
+    ) -> Result<()> {
+        self.with_write_txn(|store, wtxn| {
+            store.rmdir_in_txn(wtxn, expected_parent_generation, parent, name)
+        })
+    }
+
+    fn rename_cas(
+        &self,
+        expected_old_parent_generation: Option<u64>,
+        old_parent: InodeId,
+        old_name: &str,
+        expected_new_parent_generation: Option<u64>,
+        new_parent: InodeId,
+        new_name: &str,
+        no_replace: bool,
+    ) -> Result<Inode> {
+        self.with_write_txn(|store, wtxn| {
+            store.rename_in_txn(
+                wtxn,
+                expected_old_parent_generation,
+                old_parent,
+                old_name,
+                expected_new_parent_generation,
+                new_parent,
+                new_name,
+                no_replace,
+            )
+        })
+    }
 }
 
 fn get_inode_raw(inodes: &InodeDb, txn: &heed::RwTxn<'_>, id: InodeId) -> Result<Inode> {
@@ -2836,7 +3101,27 @@ fn inode_key(id: InodeId) -> [u8; 8] {
 }
 
 fn dentry_key(parent: InodeId, name: &str) -> String {
-    format!("{parent:016x}\0{name}")
+    format!("{}{name}", dentry_prefix(parent))
+}
+
+fn dentry_prefix(parent: InodeId) -> String {
+    format!("{parent:016x}\0")
+}
+
+fn validate_dentry_name(name: &str) -> Result<()> {
+    Dentry {
+        parent: ROOT_INODE,
+        name: name.to_string(),
+        child: ROOT_INODE,
+    }
+    .validate()
+}
+
+fn check_optional_generation(inode: &Inode, expected: Option<u64>) -> Result<()> {
+    if let Some(expected) = expected {
+        check_generation(inode, expected)?;
+    }
+    Ok(())
 }
 
 fn reservation_key(ticket: WriteTicketId) -> String {
@@ -3748,6 +4033,135 @@ mod tests {
         assert!(batch.removed_manifests >= 1);
         assert_eq!(batch.tombstoned_chunks, vec![chunk]);
         assert_eq!(store.get_manifest(mid), Err(FluxError::NotFound));
+    }
+
+    #[test]
+    fn rmdir_and_rename_enforce_posix_namespace_rules_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HeedMetaStore::open(dir.path()).unwrap();
+        let left = store
+            .create(ROOT_INODE, "left", FileType::Directory, 0o755, 0, 0)
+            .unwrap();
+        let right = store
+            .create(ROOT_INODE, "right", FileType::Directory, 0o755, 0, 0)
+            .unwrap();
+        let file = store
+            .create(left.id, "file", FileType::Regular, 0o644, 0, 0)
+            .unwrap();
+
+        assert_eq!(
+            store.unlink(ROOT_INODE, "left"),
+            Err(FluxError::IsDirectory)
+        );
+        assert_eq!(store.rmdir(left.id, "file"), Err(FluxError::NotDirectory));
+        assert_eq!(store.rmdir(ROOT_INODE, "left"), Err(FluxError::NotEmpty));
+
+        let moved = store
+            .rename(left.id, "file", right.id, "moved", false)
+            .unwrap();
+        assert_eq!(moved.id, file.id);
+        assert_eq!(
+            store.lookup(left.id, "file").unwrap_err(),
+            FluxError::NotFound
+        );
+        assert_eq!(store.lookup(right.id, "moved").unwrap().id, file.id);
+
+        let replacement = store
+            .create(right.id, "replacement", FileType::Regular, 0o600, 0, 0)
+            .unwrap();
+        assert_eq!(
+            store
+                .rename(right.id, "moved", right.id, "replacement", true)
+                .unwrap_err(),
+            FluxError::AlreadyExists
+        );
+        let renamed = store
+            .rename(right.id, "moved", right.id, "replacement", false)
+            .unwrap();
+        assert_eq!(renamed.id, file.id);
+        assert_eq!(
+            store.get_inode(replacement.id).unwrap_err(),
+            FluxError::NotFound
+        );
+
+        let nested = store
+            .create(left.id, "nested", FileType::Directory, 0o755, 0, 0)
+            .unwrap();
+        assert!(matches!(
+            store.rename(ROOT_INODE, "left", nested.id, "cycle", false),
+            Err(FluxError::InvalidArg(_))
+        ));
+        let occupied = store
+            .create(right.id, "occupied", FileType::Directory, 0o755, 0, 0)
+            .unwrap();
+        store
+            .create(occupied.id, "child", FileType::Regular, 0o644, 0, 0)
+            .unwrap();
+        assert_eq!(
+            store
+                .rename(left.id, "nested", right.id, "occupied", false)
+                .unwrap_err(),
+            FluxError::NotEmpty
+        );
+
+        store.rmdir(left.id, "nested").unwrap();
+        store.rmdir(ROOT_INODE, "left").unwrap();
+        assert_eq!(store.get_inode(left.id).unwrap_err(), FluxError::NotFound);
+    }
+
+    #[test]
+    fn rename_parent_generation_cas_is_all_or_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HeedMetaStore::open(dir.path()).unwrap();
+        let left = store
+            .create(ROOT_INODE, "cas-left", FileType::Directory, 0o755, 0, 0)
+            .unwrap();
+        let right = store
+            .create(ROOT_INODE, "cas-right", FileType::Directory, 0o755, 0, 0)
+            .unwrap();
+        store
+            .create(left.id, "file", FileType::Regular, 0o644, 0, 0)
+            .unwrap();
+        let left_gen = store.get_inode(left.id).unwrap().generation;
+        let right_gen = store.get_inode(right.id).unwrap().generation;
+
+        assert_eq!(
+            store
+                .rename_cas(
+                    Some(left_gen - 1),
+                    left.id,
+                    "file",
+                    Some(right_gen),
+                    right.id,
+                    "file",
+                    false,
+                )
+                .unwrap_err(),
+            FluxError::CasFailed {
+                expected: left_gen - 1,
+                actual: left_gen,
+            }
+        );
+        assert!(store.lookup(left.id, "file").is_ok());
+        assert_eq!(
+            store.lookup(right.id, "file").unwrap_err(),
+            FluxError::NotFound
+        );
+        assert_eq!(store.get_inode(right.id).unwrap().generation, right_gen);
+
+        store
+            .rename_cas(
+                Some(left_gen),
+                left.id,
+                "file",
+                Some(right_gen),
+                right.id,
+                "file",
+                false,
+            )
+            .unwrap();
+        assert_eq!(store.get_inode(left.id).unwrap().generation, left_gen + 1);
+        assert_eq!(store.get_inode(right.id).unwrap().generation, right_gen + 1);
     }
 
     #[test]

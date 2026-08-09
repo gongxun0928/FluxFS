@@ -19,9 +19,9 @@ use fluxfs_proto::meta::v1::{
     ListFlushIntentsResponse, ListGcTombstonesRequest, ListGcTombstonesResponse, LookupRequest,
     LookupResponse, PingRequest, PingResponse, PutInodeCasRequest, PutInodeCasResponse,
     PutInodeRequest, PutInodeResponse, PutManifestRequest, PutManifestResponse, ReaddirRequest,
-    ReaddirResponse, RegisterWorkerRequest, ReserveChunksRequest, ReserveChunksResponse,
-    TombstoneGcBatchRequest, TombstoneGcBatchResponse, UnlinkRequest, UnlinkResponse,
-    WorkerMembershipResponse,
+    ReaddirResponse, RegisterWorkerRequest, RenameRequest, RenameResponse, ReserveChunksRequest,
+    ReserveChunksResponse, RmdirRequest, RmdirResponse, TombstoneGcBatchRequest,
+    TombstoneGcBatchResponse, UnlinkRequest, UnlinkResponse, WorkerMembershipResponse,
 };
 use fluxfs_proto::meta_codec::{
     decode_chunk_ids, decode_flush_intent, decode_gc_delete_acks, decode_inode, decode_manifest,
@@ -861,7 +861,7 @@ impl MetaService for MetaSvc {
             .write(
                 &corr_id,
                 MetaRaftRequest::Unlink {
-                    request_id: Some(RequestOpId::random()),
+                    request_id: parse_request_op_id(&r.request_id),
                     ledger_now_unix_ms: 0,
                     parent: r.parent,
                     name: r.name,
@@ -871,6 +871,59 @@ impl MetaService for MetaSvc {
             .await?;
         self.map_resp_empty(resp)?;
         Ok(Response::new(UnlinkResponse {}))
+    }
+
+    async fn rmdir(&self, req: Request<RmdirRequest>) -> Result<Response<RmdirResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
+        let corr_id = fluxfs_proto::request_id::extract_request_id(&req);
+        let r = req.into_inner();
+        let resp = self
+            .write(
+                &corr_id,
+                MetaRaftRequest::Rmdir {
+                    request_id: parse_request_op_id(&r.request_id),
+                    ledger_now_unix_ms: 0,
+                    parent: r.parent,
+                    name: r.name,
+                    expected_parent_generation: parent_gen_cas(r.expected_parent_generation),
+                },
+            )
+            .await?;
+        self.map_resp_empty(resp)?;
+        Ok(Response::new(RmdirResponse {}))
+    }
+
+    async fn rename(
+        &self,
+        req: Request<RenameRequest>,
+    ) -> Result<Response<RenameResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
+        let corr_id = fluxfs_proto::request_id::extract_request_id(&req);
+        let r = req.into_inner();
+        let resp = self
+            .write(
+                &corr_id,
+                MetaRaftRequest::Rename {
+                    request_id: parse_request_op_id(&r.request_id),
+                    ledger_now_unix_ms: 0,
+                    old_parent: r.old_parent,
+                    old_name: r.old_name,
+                    expected_old_parent_generation: parent_gen_cas(
+                        r.expected_old_parent_generation,
+                    ),
+                    new_parent: r.new_parent,
+                    new_name: r.new_name,
+                    expected_new_parent_generation: parent_gen_cas(
+                        r.expected_new_parent_generation,
+                    ),
+                    no_replace: r.no_replace,
+                },
+            )
+            .await?;
+        let inode = self.map_resp_inode(resp)?;
+        Ok(Response::new(RenameResponse {
+            inode_json: encode_inode(&inode).map_err(status_from_flux)?,
+        }))
     }
 }
 

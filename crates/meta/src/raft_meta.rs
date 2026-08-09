@@ -459,4 +459,43 @@ impl MetaStore for RaftMetaStore {
         })?;
         Self::map_empty(resp)
     }
+
+    fn rmdir_cas(
+        &self,
+        expected_parent_generation: Option<u64>,
+        parent: InodeId,
+        name: &str,
+    ) -> Result<()> {
+        let resp = self.write(MetaRaftRequest::Rmdir {
+            request_id: Some(RequestOpId::random()),
+            ledger_now_unix_ms: 0,
+            parent,
+            name: name.to_string(),
+            expected_parent_generation,
+        })?;
+        Self::map_empty(resp)
+    }
+
+    fn rename_cas(
+        &self,
+        expected_old_parent_generation: Option<u64>,
+        old_parent: InodeId,
+        old_name: &str,
+        expected_new_parent_generation: Option<u64>,
+        new_parent: InodeId,
+        new_name: &str,
+        no_replace: bool,
+    ) -> Result<Inode> {
+        Self::map_inode(self.write(MetaRaftRequest::Rename {
+            request_id: Some(RequestOpId::random()),
+            ledger_now_unix_ms: 0,
+            old_parent,
+            old_name: old_name.to_string(),
+            expected_old_parent_generation,
+            new_parent,
+            new_name: new_name.to_string(),
+            expected_new_parent_generation,
+            no_replace,
+        })?)
+    }
 }
