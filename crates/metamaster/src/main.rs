@@ -4,7 +4,7 @@ use fluxfs_meta::{
     start_single_voter, FluxRaft, HeedMetaStore, HeedMetaStoreOptions, MetaRaftRequest,
     MetaRaftResponse, MetaStore,
 };
-use fluxfs_metrics::{spawn_prometheus, FluxMetrics};
+use fluxfs_metrics::{install_process_metrics, spawn_prometheus, FluxMetrics};
 use fluxfs_proto::meta::v1::{
     AbortChunkReservationRequest, AbortChunkReservationResponse, AcknowledgeGcDeletesRequest,
     AcknowledgeGcDeletesResponse, BeginFlushRequest, BeginFlushResponse, BeginGcRequest,
@@ -29,11 +29,15 @@ use fluxfs_proto::meta_codec::{
     encode_manifest, encode_worker_membership, file_type_from_wire, status_from_flux,
 };
 use fluxfs_proto::{MetaService, MetaServiceServer};
-use fluxfs_types::{FlushId, FluxError, GcLeaseId, ManifestId, RequestOpId, WriteTicketId};
+use fluxfs_types::{
+    FlushId, FluxError, GcLeaseId, ManifestId, RequestOpId, WorkerMembership, WriteTicketId,
+};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 use tonic::{Request, Response, Status};
+use tracing::Instrument;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -85,13 +89,40 @@ impl MetaSvc {
         }
     }
 
+    fn sample_capacity(&self, membership: &WorkerMembership) {
+        let mut min = u64::MAX;
+        let mut sum = 0u64;
+        for worker in &membership.workers {
+            sum = sum.saturating_add(worker.available_bytes);
+            min = min.min(worker.available_bytes);
+        }
+        if membership.workers.is_empty() {
+            min = 0;
+        }
+        FluxMetrics::set(&self.metrics.worker_available_bytes_min, min);
+        FluxMetrics::set(&self.metrics.worker_available_bytes_sum, sum);
+    }
+
     async fn write(&self, req: MetaRaftRequest) -> std::result::Result<MetaRaftResponse, Status> {
-        FluxMetrics::inc(&self.metrics.meta_rpc_total);
-        let resp = self.raft.client_write(req).await.map_err(|e| {
-            FluxMetrics::inc(&self.metrics.meta_rpc_error_total);
-            Status::unavailable(format!("raft write: {e}"))
-        })?;
-        Ok(resp.data)
+        let started = Instant::now();
+        let op = req.op_name();
+        let request_id = req
+            .request_id()
+            .filter(|id| !id.is_none())
+            .map(|id| id.to_hex())
+            .unwrap_or_else(|| "-".into());
+        let span = tracing::info_span!("meta_rpc", op, request_id = %request_id);
+        async move {
+            FluxMetrics::inc(&self.metrics.meta_rpc_total);
+            let resp = self.raft.client_write(req).await.map_err(|e| {
+                FluxMetrics::inc(&self.metrics.meta_rpc_error_total);
+                Status::unavailable(format!("raft write: {e}"))
+            })?;
+            FluxMetrics::observe_ms(&self.metrics.meta_rpc_latency_ms, started);
+            Ok(resp.data)
+        }
+        .instrument(span)
+        .await
     }
 
     fn map_resp_inode(
@@ -204,6 +235,7 @@ impl MetaService for MetaSvc {
             })
             .await?;
         let membership = self.map_resp_worker_membership(response)?;
+        self.sample_capacity(&membership);
         Ok(Response::new(WorkerMembershipResponse {
             membership_json: encode_worker_membership(&membership).map_err(status_from_flux)?,
         }))
@@ -216,6 +248,7 @@ impl MetaService for MetaSvc {
         // Read-only membership snapshot; ClientAdmin/Meta/Worker all hold ReadMeta.
         fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::ReadMeta)?;
         let membership = self.store.worker_membership().map_err(status_from_flux)?;
+        self.sample_capacity(&membership);
         Ok(Response::new(WorkerMembershipResponse {
             membership_json: encode_worker_membership(&membership).map_err(status_from_flux)?,
         }))
@@ -223,6 +256,7 @@ impl MetaService for MetaSvc {
 
     async fn ping(&self, req: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
         fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::ReadMeta)?;
+        FluxMetrics::inc(&self.metrics.meta_rpc_total);
         Ok(Response::new(PingResponse {
             version: env!("CARGO_PKG_VERSION").into(),
         }))
@@ -233,6 +267,7 @@ impl MetaService for MetaSvc {
         req: Request<GetInodeRequest>,
     ) -> Result<Response<GetInodeResponse>, Status> {
         fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::ReadMeta)?;
+        FluxMetrics::inc(&self.metrics.meta_rpc_total);
         let id = req.into_inner().id;
         let inode = self.store.get_inode(id).map_err(status_from_flux)?;
         Ok(Response::new(GetInodeResponse {
@@ -457,6 +492,7 @@ impl MetaService for MetaSvc {
     ) -> Result<Response<ListGcTombstonesResponse>, Status> {
         fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::ReadMeta)?;
         let tombstones = self.store.list_gc_tombstones().map_err(status_from_flux)?;
+        FluxMetrics::set(&self.metrics.gc_tombstone_pending, tombstones.len() as u64);
         Ok(Response::new(ListGcTombstonesResponse {
             tombstones_json: encode_gc_tombstones(&tombstones).map_err(status_from_flux)?,
         }))
@@ -593,6 +629,7 @@ impl MetaService for MetaSvc {
     ) -> Result<Response<ListFlushIntentsResponse>, Status> {
         fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::ReadMeta)?;
         let intents = self.store.list_flush_intents().map_err(status_from_flux)?;
+        FluxMetrics::set(&self.metrics.flush_intent_pending, intents.len() as u64);
         Ok(Response::new(ListFlushIntentsResponse {
             intents_json: encode_flush_intents(&intents).map_err(status_from_flux)?,
         }))
@@ -758,6 +795,7 @@ async fn main() -> Result<()> {
         .await
         .context("start openraft single-voter")?;
     let metrics = FluxMetrics::new();
+    install_process_metrics(Arc::clone(&metrics));
     if let Some(addr) = cli.metrics_listen {
         spawn_prometheus(addr, Arc::clone(&metrics));
         println!("fluxfs-metamaster metrics on http://{addr}/metrics");

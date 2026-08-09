@@ -601,6 +601,9 @@ fn mount_with_background_gc<M: MetaStore + 'static, C: ChunkStore + 'static>(
     client: Arc<FluxClient<M, C>>,
     mountpoint: &PathBuf,
 ) -> Result<()> {
+    // So client GC/flush/repair can increment process-local counters when a
+    // co-located mount does not run metamaster/chunkworker metrics endpoints.
+    fluxfs_metrics::install_process_metrics(fluxfs_metrics::FluxMetrics::new());
     let (gc_stop, gc_handle) = spawn_background_gc(Arc::clone(&client));
     println!(
         "background GC: batch={BACKGROUND_GC_BATCH} idle={}s (non-blocking)",

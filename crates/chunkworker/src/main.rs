@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use fluxfs_chunk::{ChunkStore, FoyerCacheConfig, FoyerChunkStore};
 use fluxfs_meta::{MetaStore, RemoteMetaStore};
-use fluxfs_metrics::{spawn_prometheus, FluxMetrics};
+use fluxfs_metrics::{install_process_metrics, spawn_prometheus, FluxMetrics};
 use fluxfs_proto::chunk::v1::{
     ContainsChunkRequest, ContainsChunkResponse, DeleteChunkRequest, DeleteChunkResponse,
     GetChunkRequest, GetChunkResponse, HealthRequest, HealthResponse, ListChunksRequest,
@@ -13,9 +13,10 @@ use fluxfs_types::{ChunkId, FluxError, WorkerRegistration, WorkerTargetId, CHUNK
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response, Status};
+use tracing::Instrument;
 
 const MAX_CHUNK_RPC_MESSAGE: usize = CHUNK_SIZE as usize + 64 * 1024;
 
@@ -139,12 +140,27 @@ struct ChunkSvc {
 }
 
 impl ChunkSvc {
+    fn sample_watermarks(&self) {
+        FluxMetrics::set(
+            &self.metrics.chunk_inflight_available,
+            self.in_flight.available_permits() as u64,
+        );
+        FluxMetrics::set(
+            &self.metrics.chunk_gc_inflight_available,
+            self.gc_in_flight.available_permits() as u64,
+        );
+    }
+
     fn try_enter(&self) -> Result<OwnedSemaphorePermit, Status> {
-        try_enter(&self.in_flight)
+        let permit = try_enter(&self.in_flight);
+        self.sample_watermarks();
+        permit
     }
 
     fn try_enter_gc(&self) -> Result<OwnedSemaphorePermit, Status> {
-        try_enter(&self.gc_in_flight)
+        let permit = try_enter(&self.gc_in_flight);
+        self.sample_watermarks();
+        permit
     }
 }
 
@@ -161,29 +177,36 @@ impl ChunkWorker for ChunkSvc {
         request: Request<PutChunkRequest>,
     ) -> Result<Response<PutChunkResponse>, Status> {
         fluxfs_tls::require_in_extensions(&request, fluxfs_types::auth::Capability::PutChunk)?;
-        FluxMetrics::inc(&self.metrics.chunk_rpc_total);
-        let _permit = self.try_enter().inspect_err(|_status| {
-            FluxMetrics::inc(&self.metrics.chunk_rpc_error_total);
-        })?;
-        let data = request.into_inner().data;
-        let nbytes = data.len() as u64;
-        let store = Arc::clone(&self.store);
-        let chunk = tokio::task::spawn_blocking(move || store.put(&data))
-            .await
-            .map_err(|error| {
+        let started = Instant::now();
+        let span = tracing::info_span!("chunk_rpc", op = "put_chunk", worker_id = self.worker_id);
+        async move {
+            FluxMetrics::inc(&self.metrics.chunk_rpc_total);
+            let _permit = self.try_enter().inspect_err(|_status| {
                 FluxMetrics::inc(&self.metrics.chunk_rpc_error_total);
-                Status::internal(format!("chunk put task: {error}"))
-            })?
-            .map_err(|error| {
-                FluxMetrics::inc(&self.metrics.chunk_rpc_error_total);
-                status_from_flux(error)
             })?;
-        FluxMetrics::add(&self.metrics.chunk_put_bytes_total, nbytes);
-        Ok(Response::new(PutChunkResponse {
-            chunk_id: chunk.as_bytes().to_vec(),
-            worker_id: self.worker_id,
-            durable: true,
-        }))
+            let data = request.into_inner().data;
+            let nbytes = data.len() as u64;
+            let store = Arc::clone(&self.store);
+            let chunk = tokio::task::spawn_blocking(move || store.put(&data))
+                .await
+                .map_err(|error| {
+                    FluxMetrics::inc(&self.metrics.chunk_rpc_error_total);
+                    Status::internal(format!("chunk put task: {error}"))
+                })?
+                .map_err(|error| {
+                    FluxMetrics::inc(&self.metrics.chunk_rpc_error_total);
+                    status_from_flux(error)
+                })?;
+            FluxMetrics::add(&self.metrics.chunk_put_bytes_total, nbytes);
+            FluxMetrics::observe_ms(&self.metrics.chunk_rpc_latency_ms, started);
+            Ok(Response::new(PutChunkResponse {
+                chunk_id: chunk.as_bytes().to_vec(),
+                worker_id: self.worker_id,
+                durable: true,
+            }))
+        }
+        .instrument(span)
+        .await
     }
 
     async fn get_chunk(
@@ -191,32 +214,39 @@ impl ChunkWorker for ChunkSvc {
         request: Request<GetChunkRequest>,
     ) -> Result<Response<GetChunkResponse>, Status> {
         fluxfs_tls::require_in_extensions(&request, fluxfs_types::auth::Capability::GetChunk)?;
-        FluxMetrics::inc(&self.metrics.chunk_rpc_total);
-        let _permit = self.try_enter().inspect_err(|_status| {
-            FluxMetrics::inc(&self.metrics.chunk_rpc_error_total);
-        })?;
-        let req = request.into_inner();
-        let promote_cache = req.promote_cache;
-        let chunk = ChunkId::try_from(req.chunk_id.as_slice()).map_err(|error| {
-            FluxMetrics::inc(&self.metrics.chunk_rpc_error_total);
-            status_from_flux(error)
-        })?;
-        let store = Arc::clone(&self.store);
-        let data =
-            tokio::task::spawn_blocking(move || store.get_with_promote(&chunk, promote_cache))
-                .await
-                .map_err(|error| {
-                    FluxMetrics::inc(&self.metrics.chunk_rpc_error_total);
-                    Status::internal(format!("chunk get task: {error}"))
-                })?
-                .map_err(|error| {
-                    FluxMetrics::inc(&self.metrics.chunk_rpc_error_total);
-                    status_from_flux(error)
-                })?;
-        Ok(Response::new(GetChunkResponse {
-            data,
-            worker_id: self.worker_id,
-        }))
+        let started = Instant::now();
+        let span = tracing::info_span!("chunk_rpc", op = "get_chunk", worker_id = self.worker_id);
+        async move {
+            FluxMetrics::inc(&self.metrics.chunk_rpc_total);
+            let _permit = self.try_enter().inspect_err(|_status| {
+                FluxMetrics::inc(&self.metrics.chunk_rpc_error_total);
+            })?;
+            let req = request.into_inner();
+            let promote_cache = req.promote_cache;
+            let chunk = ChunkId::try_from(req.chunk_id.as_slice()).map_err(|error| {
+                FluxMetrics::inc(&self.metrics.chunk_rpc_error_total);
+                status_from_flux(error)
+            })?;
+            let store = Arc::clone(&self.store);
+            let data =
+                tokio::task::spawn_blocking(move || store.get_with_promote(&chunk, promote_cache))
+                    .await
+                    .map_err(|error| {
+                        FluxMetrics::inc(&self.metrics.chunk_rpc_error_total);
+                        Status::internal(format!("chunk get task: {error}"))
+                    })?
+                    .map_err(|error| {
+                        FluxMetrics::inc(&self.metrics.chunk_rpc_error_total);
+                        status_from_flux(error)
+                    })?;
+            FluxMetrics::observe_ms(&self.metrics.chunk_rpc_latency_ms, started);
+            Ok(Response::new(GetChunkResponse {
+                data,
+                worker_id: self.worker_id,
+            }))
+        }
+        .instrument(span)
+        .await
     }
 
     async fn contains_chunk(
@@ -343,6 +373,12 @@ async fn main() -> Result<()> {
             .context("open chunk store + foyer HybridCache")?,
     );
     let metrics = FluxMetrics::new();
+    install_process_metrics(Arc::clone(&metrics));
+    FluxMetrics::set(&metrics.chunk_inflight_available, cli.max_in_flight as u64);
+    FluxMetrics::set(
+        &metrics.chunk_gc_inflight_available,
+        cli.gc_max_in_flight as u64,
+    );
     if let Some(addr) = cli.metrics_listen {
         spawn_prometheus(addr, Arc::clone(&metrics));
         println!("fluxfs-chunkworker metrics on http://{addr}/metrics");

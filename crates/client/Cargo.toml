@@ -8,12 +8,14 @@ description = "Internal client API shared by CLI / FUSE / tests (not public SDK 
 [dependencies]
 blake3 = { workspace = true }
 fluxfs-types = { workspace = true }
+fluxfs-metrics = { workspace = true }
 fluxfs-meta = { workspace = true }
 fluxfs-chunk = { workspace = true }
 fluxfs-ufs = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

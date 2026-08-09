@@ -888,6 +888,7 @@ dependencies = [
  "fluxfs-client",
  "fluxfs-fuse",
  "fluxfs-meta",
+ "fluxfs-metrics",
  "fluxfs-proto",
  "fluxfs-tls",
  "fluxfs-types",
@@ -904,6 +905,7 @@ name = "fluxfs-chunk"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "fluxfs-metrics",
  "fluxfs-proto",
  "fluxfs-tls",
  "fluxfs-types",
@@ -943,12 +945,14 @@ dependencies = [
  "blake3",
  "fluxfs-chunk",
  "fluxfs-meta",
+ "fluxfs-metrics",
  "fluxfs-types",
  "fluxfs-ufs",
  "serde",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

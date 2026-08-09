@@ -235,6 +235,33 @@ impl MetaRaftRequest {
         }
         self
     }
+
+    /// Stable operation label for tracing / metrics (`op=` field).
+    pub fn op_name(&self) -> &'static str {
+        match self {
+            Self::RegisterWorker { .. } => "register_worker",
+            Self::Create { .. } => "create",
+            Self::PutInode { .. } => "put_inode",
+            Self::PutManifest { .. } => "put_manifest",
+            Self::CommitInodeManifest { .. } => "commit_inode_manifest",
+            Self::ReserveChunks { .. } => "reserve_chunks",
+            Self::AbortChunkReservation { .. } => "abort_chunk_reservation",
+            Self::ExpireChunkReservations { .. } => "expire_chunk_reservations",
+            Self::PruneClientRequests { .. } => "prune_client_requests",
+            Self::CommitInodeManifestReserved { .. } => "commit_inode_manifest_reserved",
+            Self::TombstoneGcBatch { .. } => "tombstone_gc_batch",
+            Self::FinalizeGcTombstones { .. } => "finalize_gc_tombstones",
+            Self::InitializeGcDeleteTargets { .. } => "initialize_gc_delete_targets",
+            Self::AcknowledgeGcDeletes { .. } => "acknowledge_gc_deletes",
+            Self::BeginFlush { .. } => "begin_flush",
+            Self::CommitFlush { .. } => "commit_flush",
+            Self::FailFlushConflict { .. } => "fail_flush_conflict",
+            Self::BeginGc { .. } => "begin_gc",
+            Self::FinishGc { .. } => "finish_gc",
+            Self::ImportExternal { .. } => "import_external",
+            Self::Unlink { .. } => "unlink",
+        }
+    }
 }
 
 /// Application response returned after apply.

@@ -6,6 +6,7 @@
 //! endpoints are repair spares.
 
 use crate::ChunkStore;
+use fluxfs_metrics::FluxMetrics;
 use fluxfs_proto::chunk::v1::{
     ContainsChunkRequest, DeleteChunkRequest, GetChunkRequest, HealthRequest, ListChunksRequest,
     PutChunkRequest,
@@ -346,7 +347,17 @@ impl RemoteReplicatedChunkStore {
 
     /// One throttled scrub page on the low-priority GC RPC pool.
     pub fn repair_pass(&self, limit: usize) -> Result<RepairReport> {
-        self.call_gc(|reply| Command::RepairPass { limit, reply })
+        let started = Instant::now();
+        let span = tracing::info_span!("repair_pass", limit);
+        let _enter = span.enter();
+        let report = self.call_gc(|reply| Command::RepairPass { limit, reply })?;
+        if let Some(m) = fluxfs_metrics::process_metrics() {
+            FluxMetrics::inc(&m.repair_pass_total);
+            FluxMetrics::add(&m.repair_replica_total, report.repaired_replicas as u64);
+            FluxMetrics::set(&m.repair_lag_more, u64::from(report.more));
+            FluxMetrics::observe_ms(&m.repair_pass_latency_ms, started);
+        }
+        Ok(report)
     }
 
     fn call<T>(&self, command: impl FnOnce(RpcReply<T>) -> Command) -> Result<T> {

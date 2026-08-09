@@ -2,6 +2,7 @@
 
 use fluxfs_chunk::ChunkStore;
 use fluxfs_meta::MetaStore;
+use fluxfs_metrics::FluxMetrics;
 use fluxfs_types::{
     BackingMode, ChunkId, DataGen, DataState, Extent, ExtentTree, FileType, FlushId, FlushIntent,
     FluxError, Inode, InodeId, LocalityFields, LocalityLabel, Manifest, OpState, Origin,
@@ -11,7 +12,7 @@ use fluxfs_ufs::{ReadPathConfig, ReadPathStats, Ufs, UfsEntryMode, UfsProbe, Ufs
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::{Handle, Runtime};
 
 struct UfsRuntime {
@@ -227,6 +228,9 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
     /// Flush one Dirty UFS-backed inode through the durable intent protocol.
     /// Ephemeral and already-clean files are already durable at their declared tier.
     pub fn flush_inode(&self, ino: InodeId) -> Result<Inode> {
+        let started = Instant::now();
+        let span = tracing::info_span!("flush_inode", inode = ino);
+        let _enter = span.enter();
         let _guard = self
             .io_lock
             .lock()
@@ -247,45 +251,48 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         if fields.data_state == DataState::DirtyConflict {
             return Err(FluxError::DirtyConflict);
         }
-        if let Some(intent) = inode.flush_intent.clone() {
-            return self.complete_flush_intent(inode.id, &intent);
-        }
-        if fields.data_state != DataState::Dirty {
-            return Err(FluxError::Busy);
-        }
-
-        let manifest_id = inode
-            .manifest_id
-            .ok_or_else(|| FluxError::Meta("Dirty inode missing manifest".into()))?;
-        let manifest = self.meta.get_manifest(manifest_id)?;
-        if manifest.gen != inode.head_gen || manifest.size != inode.size {
-            return Err(FluxError::Meta(
-                "Dirty inode head does not match manifest snapshot".into(),
-            ));
-        }
-        let target_digest = self.inode_digest(&inode)?;
-        let target = inode
-            .ufs
-            .as_ref()
-            .ok_or_else(|| FluxError::Meta("Dirty inode missing UFS target".into()))?;
-        let expected_ufs_version = match target.etag.clone() {
-            Some(etag) => Some(UfsVersion(etag)),
-            None if fields.origin == Origin::FluxCreated => None,
-            None => {
-                return Err(FluxError::Capability(
-                    "safe overwrite of imported data requires a UFS ETag".into(),
+        let result = if let Some(intent) = inode.flush_intent.clone() {
+            self.complete_flush_intent(inode.id, &intent)
+        } else if fields.data_state != DataState::Dirty {
+            Err(FluxError::Busy)
+        } else {
+            let manifest_id = inode
+                .manifest_id
+                .ok_or_else(|| FluxError::Meta("Dirty inode missing manifest".into()))?;
+            let manifest = self.meta.get_manifest(manifest_id)?;
+            if manifest.gen != inode.head_gen || manifest.size != inode.size {
+                return Err(FluxError::Meta(
+                    "Dirty inode head does not match manifest snapshot".into(),
                 ));
             }
+            let target_digest = self.inode_digest(&inode)?;
+            let target = inode
+                .ufs
+                .as_ref()
+                .ok_or_else(|| FluxError::Meta("Dirty inode missing UFS target".into()))?;
+            let expected_ufs_version = match target.etag.clone() {
+                Some(etag) => Some(UfsVersion(etag)),
+                None if fields.origin == Origin::FluxCreated => None,
+                None => {
+                    return Err(FluxError::Capability(
+                        "safe overwrite of imported data requires a UFS ETag".into(),
+                    ));
+                }
+            };
+            let intent = FlushIntent {
+                flush_id: FlushId::random(),
+                snapshot_gen: inode.head_gen,
+                snapshot_manifest_root: manifest.root_digest(),
+                expected_ufs_version,
+                target_digest,
+            };
+            self.meta.begin_flush(inode.generation, inode.id, &intent)?;
+            self.complete_flush_intent(inode.id, &intent)
         };
-        let intent = FlushIntent {
-            flush_id: FlushId::random(),
-            snapshot_gen: inode.head_gen,
-            snapshot_manifest_root: manifest.root_digest(),
-            expected_ufs_version,
-            target_digest,
-        };
-        self.meta.begin_flush(inode.generation, inode.id, &intent)?;
-        self.complete_flush_intent(inode.id, &intent)
+        if let Some(m) = fluxfs_metrics::process_metrics() {
+            FluxMetrics::observe_ms(&m.flush_latency_ms, started);
+        }
+        result
     }
 
     /// Reconcile durable intents after process restart. Transient failures stay
@@ -338,34 +345,49 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
                 "GC batch size must be non-zero".into(),
             ));
         }
+        let started = Instant::now();
+        let span = tracing::info_span!("gc_pass", batch_size);
+        let _enter = span.enter();
+        if let Some(m) = fluxfs_metrics::process_metrics() {
+            FluxMetrics::inc(&m.gc_pass_total);
+        }
         let mut report = OrphanGcReport::default();
         // Expiration is bounded by the same scheduler budget. Late writers are
         // fenced because reserved commit requires the ticket to still exist.
         self.meta.expire_chunk_reservations(batch_size)?;
         self.meta.prune_client_requests(batch_size)?;
         let pending = self.meta.list_gc_tombstones()?;
+        if let Some(m) = fluxfs_metrics::process_metrics() {
+            FluxMetrics::set(&m.gc_tombstone_pending, pending.len() as u64);
+        }
         if !pending.is_empty() {
             let batch = &pending[..pending.len().min(batch_size)];
             report.removed_chunks += self.reclaim_tombstones(batch)?;
-            return Ok(report);
-        }
-        let mut cursor = self
-            .gc_cursor
-            .lock()
-            .map_err(|_| FluxError::Io("GC cursor lock poisoned".into()))?;
-        let page = self.chunks.list_chunks_page(*cursor, batch_size)?;
-        *cursor = page.next_cursor;
-        drop(cursor);
+        } else {
+            let mut cursor = self
+                .gc_cursor
+                .lock()
+                .map_err(|_| FluxError::Io("GC cursor lock poisoned".into()))?;
+            let page = self.chunks.list_chunks_page(*cursor, batch_size)?;
+            *cursor = page.next_cursor;
+            drop(cursor);
 
-        let batch = self.meta.tombstone_gc_batch(&page.chunks)?;
-        report.removed_manifests += batch.removed_manifests;
-        let created = self
-            .meta
-            .list_gc_tombstones()?
-            .into_iter()
-            .filter(|tombstone| batch.tombstoned_chunks.contains(&tombstone.chunk))
-            .collect::<Vec<_>>();
-        report.removed_chunks += self.reclaim_tombstones(&created)?;
+            let batch = self.meta.tombstone_gc_batch(&page.chunks)?;
+            report.removed_manifests += batch.removed_manifests;
+            if let Some(m) = fluxfs_metrics::process_metrics() {
+                FluxMetrics::add(&m.gc_tombstone_total, batch.tombstoned_chunks.len() as u64);
+            }
+            let created = self
+                .meta
+                .list_gc_tombstones()?
+                .into_iter()
+                .filter(|tombstone| batch.tombstoned_chunks.contains(&tombstone.chunk))
+                .collect::<Vec<_>>();
+            report.removed_chunks += self.reclaim_tombstones(&created)?;
+        }
+        if let Some(m) = fluxfs_metrics::process_metrics() {
+            FluxMetrics::observe_ms(&m.gc_pass_latency_ms, started);
+        }
         Ok(report)
     }
 
@@ -521,7 +543,13 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
                 .commit_flush(current.generation, ino, flush_id, published)
             {
                 Err(FluxError::CasFailed { .. }) => continue,
-                result => return result,
+                Ok(inode) => {
+                    if let Some(m) = fluxfs_metrics::process_metrics() {
+                        FluxMetrics::inc(&m.flush_complete_total);
+                    }
+                    return Ok(inode);
+                }
+                Err(error) => return Err(error),
             }
         }
         Err(FluxError::Busy)
@@ -540,7 +568,12 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
                 .fail_flush_conflict(current.generation, ino, flush_id, message)
             {
                 Err(FluxError::CasFailed { .. }) => continue,
-                Ok(_) => return Err(FluxError::DirtyConflict),
+                Ok(_) => {
+                    if let Some(m) = fluxfs_metrics::process_metrics() {
+                        FluxMetrics::inc(&m.flush_conflict_total);
+                    }
+                    return Err(FluxError::DirtyConflict);
+                }
                 Err(error) => return Err(error),
             }
         }
