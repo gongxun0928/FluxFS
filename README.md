@@ -33,8 +33,10 @@ under `meta/raft/`; inode mutations and SM `last_applied` commit in one MetaStor
 write txn. Snapshots export/import full inode/dentry/manifest state. This is
 durable single-voter recovery, not multi-voter metadata HA.
 
-Design: [`docs/mvp-v0.1.md`](docs/mvp-v0.1.md) · Alpha gates: [`docs/alpha-checklist.md`](docs/alpha-checklist.md)
-· Production gap analysis: [`docs/production-readiness.md`](docs/production-readiness.md)
+Current MVP implementation: [`docs/mvp-status.md`](docs/mvp-status.md) · Historical design:
+[`docs/mvp-v0.1.md`](docs/mvp-v0.1.md) · Alpha gates:
+[`docs/alpha-checklist.md`](docs/alpha-checklist.md) · Production gap analysis:
+[`docs/production-readiness.md`](docs/production-readiness.md)
 
 ## Workspace
 

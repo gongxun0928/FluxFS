@@ -1,122 +1,101 @@
 # Production readiness gap analysis
 
-This document separates verified MVP behavior from temporary designs that must
-not be mistaken for a production architecture. It is a prioritization input,
-not a production-readiness claim.
+This document separates the verified MVP from the work still required for a
+production claim. See [MVP implementation status](mvp-status.md) for the current
+metadata, data-path, GC, watermark, and local I/O-engine design.
 
-## Current verified state
+## Verified MVP controls
 
-- FUSE supports Ephemeral files and lazy External namespace/read access.
-- External random writes perform chunk-aligned read-modify-write. Each touched
-  4 MiB window becomes an RF=2 Local extent; untouched ranges remain pinned to
-  the imported UFS object.
-- New chunks are durable before one metadata state-machine transaction stores
-  the immutable manifest and CAS-switches the inode head. A failed CAS can leave
-  unreachable data, but cannot expose a partial head.
-- The localhost topology is one durable OpenRaft voter, three ChunkWorkers, and
-  RF=2 authoritative chunks with a repair spare.
-- MinIO/FUSE acceptance covers mixed reads, the backing object remaining
-  unchanged before flush, one Worker loss, repair to the spare, and remount.
+- All authoritative metadata mutations use one OpenRaft state-machine contract.
+  Request IDs have a deterministic, durable retention ledger.
+- Chunk RF acknowledgement precedes a generation-CAS manifest commit. Durable
+  pre-Put reservations and GC tombstones close the writer/delete race.
+- UFS write-back uses a durable intent, conditional bounded publication,
+  size/digest verification, generation CAS, and startup reconciliation.
+- Worker membership has stable IDs, leases, failure domains, capacity-weighted
+  placement, paginated inventory, throttled repair, and durable delete retry
+  accounting.
+- Chunk storage uses checksummed append-only segments with background
+  compaction. Clean data has bounded Foyer DRAM+SSD caching; authoritative Dirty
+  data does not depend on eviction-prone cache state.
+- RPCs support mTLS workload identity/authorization, structured errors,
+  request-ID spans, Prometheus metrics, bounded queues/semaphores, and separate
+  low-priority GC admission.
+- Meta schema gates, portable streaming snapshots, legacy snapshot decoding,
+  and crash-durable snapshot file publication are implemented.
 
-This is a strong local alpha slice. It does not yet provide metadata HA, UFS
-write-back, full POSIX behavior, multi-tenant security, or production operations.
+These controls and the localhost FUSE/MinIO acceptance suite make a useful
+restricted MVP. They do not establish production availability or scale.
 
-## P0: redesign or complete before production
+## P0 before production
 
-### Correctness and availability
+### Metadata availability and consistency
 
-1. **Metadata consensus is single-voter.** `StubNetwork` cannot contact another
-   voter, membership is fixed, and reads go directly to heed. Production needs
-   a real multi-voter OpenRaft network, membership changes, snapshot transfer,
-   and leader-aware ReadIndex or proven lease reads. Direct local reads become
-   unsafe as soon as multiple voters exist.
-2. **Client retries are not idempotent.** Raft orders requests but does not
-   deduplicate a timeout retry submitted as a new request. Every mutation needs
-   a stable client/session/request ID, result retention, and deterministic IDs.
-3. **Write paths are inconsistent.** The co-located mount can mutate heed
-   directly while the remote path uses Raft. Production must route every
-   authoritative mutation through the same state-machine contract.
-4. **Namespace transactions are incomplete.** External import currently creates
-   an Ephemeral inode and then converts it through separate manifest/inode calls.
-   Rename, unlink, and data-head CAS are not one serializable namespace model.
-   Add atomic import and directory/inode concurrency control.
-5. **UFS flush and recovery are absent.** Production needs durable FLUSH_INTENT,
-   reconstruct/Put/verify, conditional publication, generation CAS, replay after
-   crash, and explicit DirtyConflict handling. Never mark Clean merely because a
-   Put returned success.
-6. **Concurrent garbage collection has a correctness core but incomplete lifecycle.**
-   Writers durably reserve all Local content addresses before RF Put; bounded
-   Meta transactions compute current manifest/reservation references, tombstone
-   only zero-reference candidates, and fence new reservations until idempotent
-   Worker deletion is finalized. Tombstones survive snapshots/restarts. Remaining
-   work includes abandoned-reservation expiry, inode reclamation after unlink,
-   down-Worker retry accounting, metrics, and production-scale reference indexes.
-7. **Error contracts are lossy.** Some typed tonic errors are reconstructed from
-   strings. Use structured error details with stable wire codes and retryability.
+MetaMaster remains one durable voter with a stub Raft network. Production needs
+a real multi-voter transport, membership changes, quorum fault testing,
+snapshot transfer between nodes, leader routing, and linearizable reads
+(`ReadIndex` or a proven lease-read protocol). Direct local state reads must not
+be introduced when multiple voters exist.
 
-### Scale and resource control
+### Capacity and resource control
 
-1. **heed is a measured single-writer alpha engine, not a billion-inode claim.**
-   B1 added configurable map capacity, durable schema versions with explicit
-   upgrade/downgrade policy, a portable snapshot migration boundary, and a
-   deterministic 70/20/10 metadata workload with machine-readable gates. The
-   100k-inode/1M-operation local baseline passes, so heed remains the default;
-   target-hardware scale/concurrency runs decide when an LSM path is justified.
-   See [metadata engine qualification](meta-engine.md).
-2. **Extent lookup/update is indexed; snapshots remain whole-object.** B2 adds a
-   versioned ordered extent tree with legacy-array reads, logarithmic range
-   positioning, and non-linear consuming replacement (see
-   [manifest extent tree](extent-tree.md)). MetaStore still serializes each
-   immutable manifest blob and Raft snapshots still buffer all metadata; B3
-   must add checkpointed pages and streaming/incremental transfer.
-3. **Worker membership and repair are fixed and synchronous.** Exactly three
-   endpoints are configured by the client. Topology changes trigger full
-   inventories and checksum reads before writes continue. Production needs a
-   placement/membership service, failure domains, capacity-aware selection,
-   throttled background scrub/repair, pagination, and admission control.
-4. **Chunk layout is one file per object.** Directory fsync is correct for the
-   alpha but filesystem inode count and small-file amplification will dominate
-   at scale. Evaluate packfiles/segments, compaction, and checksum indexes.
-5. **The Foyer store is a placeholder.** It is currently a mutex-protected
-   in-memory map, not a production HybridCache. Clean data needs bounded DRAM/SSD
-   policies and eviction; authoritative Dirty data must remain outside an
-   evictable cache.
+Worker `available_bytes` is an administrative registration value rather than
+live free-space telemetry. Add periodic disk sampling, reserved headroom,
+hysteretic high/low watermarks, write admission, cache/packfile accounting, and
+operator alerts. Add per-tenant/per-mount quotas and validate behavior when a
+disk fills during a Put or compaction.
 
-### Security and operability
+The current heed qualification covers the committed local benchmark and keeps
+the engine behind MetaStore boundaries. It is not evidence for billion-inode or
+high-concurrency targets. Run target-hardware scale, concurrency, recovery, and
+snapshot-install workloads before deciding whether to add an LSM engine. See
+[metadata engine qualification](meta-engine.md).
 
-1. Meta, Worker, and client RPCs have no authentication, authorization, or TLS.
-   Add workload identity, encrypted transport, tenant/mount authorization,
-   credential rotation, and audit logs.
-2. There are no production SLO signals: add metrics, distributed traces, request
-   IDs, health/readiness, repair/flush lag, capacity and conflict alerts.
-3. Define schema compatibility, rolling upgrade/downgrade, backup/restore, and
-   disaster recovery. Validate with multi-machine chaos, long soak, deterministic
-   simulation, and linearizability/fault testing rather than localhost scripts.
+Manifests have indexed extents but each immutable manifest is still serialized
+as one value. Raft snapshot transfer streams records, yet snapshot creation must
+still scan the full MetaStore. Large fragmented-file and billion-entry designs
+need paged manifests, incremental/checkpointed snapshots, reference indexes,
+and explicit memory/I/O budgets.
 
-## P1: can follow a controlled alpha, but is still temporary
+### Local I/O path
 
-- Ephemeral random writes rebuild the whole file; replace this with the same
-  extent-tree RMW machinery used by Dirty files.
-- The UFS range cache is process-local FIFO with fixed two-part prefetch. Add
-  shared bounded DRAM/SSD cache, adaptive streams, retry/backoff, and global I/O
-  concurrency budgets.
-- Lazy namespace path state is an in-memory map and imported metadata has no real
-  TTL/event invalidation. Make cache entries discardable and persistent open
-  handles stable across refresh/restart.
-- The synchronous FUSE adapter uses blocking runtime bridges. ChunkWorker
-  concurrency and the remote-client pending queue are bounded with fail-fast
-  backpressure, but production should also pool async clients, batch/coalesce
-  I/O, propagate cancellation/deadlines, and add adaptive admission control.
-- External create/unlink/truncate remain read-only, and rename, fsync durability,
-  locks, links, symlinks, xattrs, mmap, permissions/ACLs, and complete errno
-  behavior are not implemented. Freeze the supported POSIX contract before a
-  general-purpose claim.
+Packfile reads are synchronous `seek` + `read_exact` calls executed through
+`spawn_blocking`. The current whole-chunk `ChunkStore` API does not support
+positional reads, caller-owned buffers, cancellation, or an async completion
+engine. Introduce a lower positional I/O interface before claiming `pread` or
+`io_uring`, then benchmark both under realistic queue depth and FUSE workloads.
+
+### Security and operations
+
+mTLS and workload authorization exist, but production still needs certificate
+issuance/revocation operations, audit retention, secret rotation procedures,
+tenant isolation review, rate limits, and external security testing.
+
+Define rolling upgrade/downgrade, backup/restore, disaster recovery, SLOs,
+alert routing, dashboards, runbooks, and safe operator controls. Validate them
+with multi-machine chaos, long soak, rolling failures, clock skew, disk-full and
+network-partition tests rather than only localhost scripts.
+
+## P1 / controlled-alpha boundaries
+
+- Lazy External namespace entries lack a complete TTL/event invalidation model.
+  Open handles need explicit identity and refresh rules.
+- External create/unlink/truncate and many POSIX operations (locks, links,
+  symlinks, xattrs, mmap, ACLs, and complete errno behavior) are not supported.
+  Freeze and test the advertised POSIX contract before general use.
+- The synchronous FUSE bridge and owned `Vec<u8>` data path add copies and
+  blocking transitions. Add batching/coalescing, deadlines/cancellation, buffer
+  pools, and end-to-end adaptive admission based on measurement.
+- Request-ID spans provide per-RPC cross-process correlation, not a full
+  OpenTelemetry trace graph or production collector/export pipeline.
+- Incomplete object-store multipart uploads after a process crash require a
+  backend lifecycle policy. Old object versions and their retention are also
+  UFS/operator-owned.
 
 ## Intentional boundary
 
-`external-consistency = best-effort` is a product choice, not an implementation
-accident. Pinned ETags and conditional reads detect many out-of-band replacements
-and return a conflict instead of silently mixing bytes, but non-versioned UFS
-cannot recover an overwritten old base. Production documentation and telemetry
-must make this boundary visible; deployments requiring strong cross-writer
-consistency need versioned objects or exclusive external-writer control.
+`external-consistency = best-effort` is a product choice. Pinned ETags and
+conditional operations detect many out-of-band replacements and return a
+conflict instead of silently mixing bytes, but a non-versioned UFS cannot
+recover an overwritten old base. Deployments requiring strong cross-writer
+consistency need object versioning or exclusive external-writer control.

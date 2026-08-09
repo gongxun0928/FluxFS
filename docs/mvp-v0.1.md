@@ -1,5 +1,8 @@
 # FluxFS MVP v0.1 Design (cursor-agent)
 
+> Historical proposal. For the verified current implementation and remaining
+> boundaries, see [MVP implementation status](mvp-status.md).
+
 Status: proposal for discussion with @ubuntu-cc / @gongxun  
 Date: 2026-08-02  
 Repo: https://github.com/gongxun0928/FluxFS
