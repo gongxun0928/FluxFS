@@ -936,11 +936,11 @@ async fn all_chunks_page(
             "chunk inventory page limit must be non-zero".into(),
         ));
     }
-    let healthy: BTreeMap<u64, usize> = clients
-        .iter()
-        .enumerate()
-        .map(|(index, client)| (client.id.0, index))
-        .collect();
+    // GC inventory must make progress with a Worker down. Chunks unique to the
+    // missing Worker will be discovered after it reconnects; candidates found
+    // on healthy replicas still get tombstones whose durable target set keeps
+    // the unavailable delete pending.
+    let healthy = healthy_workers(clients).await?;
     let page = inventory_page_with_holders(clients, &healthy, list_cursor, limit).await?;
     Ok(ChunkPage {
         chunks: page.chunks.keys().copied().collect(),
