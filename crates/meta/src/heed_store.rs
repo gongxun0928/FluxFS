@@ -2330,6 +2330,10 @@ impl HeedMetaStore {
             )));
         }
         child.link_count -= 1;
+        child.generation = child
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| FluxError::InvalidArg("inode generation overflow".into()))?;
         child.ctime_ms = now_ms();
         if child.link_count == 0 {
             self.delete_inode_in_txn(wtxn, child.id)
@@ -3638,12 +3642,35 @@ fn validate_posix_acl_ea(value: &[u8]) -> Result<()> {
             "unsupported POSIX ACL xattr version {version}"
         )));
     }
+    let mut user_obj = false;
+    let mut group_obj = false;
+    let mut other = false;
+    let mut mask = false;
+    let mut has_named_entry = false;
     for entry in value[4..].chunks_exact(8) {
         let tag = u16::from_le_bytes(entry[0..2].try_into().expect("two-byte tag"));
         let perm = u16::from_le_bytes(entry[2..4].try_into().expect("two-byte perm"));
         if !ACL_TAGS.contains(&tag) || perm & !0o7 != 0 {
             return Err(FluxError::InvalidArg("invalid POSIX ACL entry".into()));
         }
+        match tag {
+            0x01 if !user_obj => user_obj = true,
+            0x04 if !group_obj => group_obj = true,
+            0x20 if !other => other = true,
+            0x10 if !mask => mask = true,
+            0x02 | 0x08 => has_named_entry = true,
+            0x01 | 0x04 | 0x10 | 0x20 => {
+                return Err(FluxError::InvalidArg(
+                    "duplicate required POSIX ACL entry".into(),
+                ));
+            }
+            _ => unreachable!("ACL tag was validated above"),
+        }
+    }
+    if !(user_obj && group_obj && other) || (has_named_entry && !mask) {
+        return Err(FluxError::InvalidArg(
+            "POSIX ACL is missing required base or mask entries".into(),
+        ));
     }
     Ok(())
 }
@@ -4538,6 +4565,7 @@ mod tests {
         let linked = store.link(file.id, ROOT_INODE, "alias").unwrap();
         assert_eq!(linked.id, file.id);
         assert_eq!(linked.link_count, 2);
+        assert_eq!(linked.generation, file.generation + 1);
         assert_eq!(store.lookup(ROOT_INODE, "alias").unwrap().id, file.id);
         assert_eq!(
             store.link(file.id, ROOT_INODE, "alias").unwrap_err(),
@@ -4553,7 +4581,9 @@ mod tests {
             store.lookup(ROOT_INODE, "source").unwrap_err(),
             FluxError::NotFound
         );
-        assert_eq!(store.get_inode(file.id).unwrap().link_count, 1);
+        let surviving = store.get_inode(file.id).unwrap();
+        assert_eq!(surviving.link_count, 1);
+        assert_eq!(surviving.generation, linked.generation + 1);
         store.unlink(ROOT_INODE, "alias").unwrap();
         assert_eq!(store.get_inode(file.id).unwrap_err(), FluxError::NotFound);
     }
@@ -4691,6 +4721,16 @@ mod tests {
             acl.extend_from_slice(&perm.to_le_bytes());
             acl.extend_from_slice(&u32::MAX.to_le_bytes());
         }
+        let malformed_acl = 2_u32.to_le_bytes().to_vec();
+        assert!(matches!(
+            store.set_xattr(
+                file.id,
+                "system.posix_acl_access",
+                &malformed_acl,
+                XattrSetMode::Upsert,
+            ),
+            Err(FluxError::InvalidArg(_))
+        ));
         assert!(matches!(
             store.set_xattr(
                 file.id,
