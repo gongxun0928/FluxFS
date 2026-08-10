@@ -60,9 +60,10 @@ or environment limitation. Pin the pjdfstest revision so upstream changes do
 not silently change the gate.
 
 Initial suites: basic open/read/write/stat, mkdir/rmdir, rename within one
-mount, unlink/open-handle lifetime, truncate, fsync, permission checks, and
-64-bit timestamps. Exclude hard links, nested/cross-mount rename, mmap coherence,
-file locking, xattrs, and other semantics explicitly outside v0.1.
+mount, truncate, fsync, hard/symbolic links, xattr CRUD and ACL round-trip, and
+64-bit timestamps. Exclude open-unlink lifetime until its session model is
+selected, plus nested/cross-mount rename, mmap coherence, file locking, ACL
+permission enforcement, and other semantics explicitly outside v0.1.
 
 ## MVP staging and gates
 

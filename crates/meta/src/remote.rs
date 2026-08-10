@@ -6,23 +6,26 @@ use fluxfs_proto::meta::v1::{
     CommitFlushRequest, CommitInodeManifestRequest, CommitInodeManifestReservedRequest,
     CreateRequest, CurrentGcPlanRequest, ExpireChunkReservationsRequest, FailFlushConflictRequest,
     FinalizeGcTombstonesRequest, FinishGcRequest, GetInodeRequest, GetManifestRequest,
-    GetWorkerMembershipRequest, ImportExternalRequest, InitializeGcDeleteTargetsRequest,
-    ListFlushIntentsRequest, ListGcTombstonesRequest, LookupRequest, PutInodeCasRequest,
-    PutInodeRequest, PutManifestRequest, ReaddirRequest, RegisterWorkerRequest, RenameRequest,
-    ReserveChunksRequest, RmdirRequest, TombstoneGcBatchRequest, UnlinkRequest,
+    GetWorkerMembershipRequest, GetXattrRequest, ImportExternalRequest,
+    InitializeGcDeleteTargetsRequest, LinkRequest, ListFlushIntentsRequest,
+    ListGcTombstonesRequest, ListXattrsRequest, LookupRequest, PutInodeCasRequest, PutInodeRequest,
+    PutManifestRequest, ReaddirRequest, RegisterWorkerRequest, RemoveXattrRequest, RenameRequest,
+    ReserveChunksRequest, RmdirRequest, SetXattrRequest, SymlinkRequest, TombstoneGcBatchRequest,
+    UnlinkRequest,
 };
 use fluxfs_proto::meta_codec::{
     decode_dentries, decode_flush_intents, decode_gc_batch, decode_gc_plan, decode_gc_tombstones,
     decode_inode, decode_manifest, decode_worker_membership, encode_chunk_ids, encode_flush_intent,
     encode_gc_delete_acks, encode_inode, encode_manifest, encode_ufs_object,
     encode_worker_registration, encode_worker_targets, file_type_to_wire, flux_from_status,
+    xattr_set_mode_to_wire,
 };
 use fluxfs_proto::request_id::RequestIdInterceptor;
 use fluxfs_proto::MetaServiceClient;
 use fluxfs_types::{
     ChunkId, Dentry, FileType, FlushId, FlushIntent, FluxError, GcBatch, GcLeaseId, GcPlan,
     GcTombstone, Inode, InodeId, Manifest, ManifestId, RequestOpId, Result, UfsObject,
-    WorkerMembership, WorkerRegistration, WorkerTargetId, WriteTicketId, ROOT_INODE,
+    WorkerMembership, WorkerRegistration, WorkerTargetId, WriteTicketId, XattrSetMode, ROOT_INODE,
 };
 use std::future::Future;
 use std::sync::Mutex;
@@ -215,6 +218,34 @@ impl MetaStore for RemoteMetaStore {
             .map_err(flux_from_status)?
             .into_inner();
         decode_inode(&resp.inode_json)
+    }
+
+    fn symlink_cas(
+        &self,
+        expected_parent_generation: Option<u64>,
+        parent: InodeId,
+        name: &str,
+        target: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Inode> {
+        let mut c = self.client()?;
+        let response = self
+            .block_on(async {
+                c.symlink(SymlinkRequest {
+                    parent,
+                    name: name.to_string(),
+                    target: target.to_string(),
+                    uid,
+                    gid,
+                    expected_parent_generation: expected_parent_generation.unwrap_or(0),
+                    request_id: RequestOpId::random().to_hex(),
+                })
+                .await
+            })
+            .map_err(flux_from_status)?
+            .into_inner();
+        decode_inode(&response.inode_json)
     }
 
     fn readdir(&self, dir: InodeId) -> Result<Vec<Dentry>> {
@@ -630,6 +661,105 @@ impl MetaStore for RemoteMetaStore {
         })
         .map_err(flux_from_status)?;
         Ok(())
+    }
+
+    fn link_cas(
+        &self,
+        expected_new_parent_generation: Option<u64>,
+        inode: InodeId,
+        new_parent: InodeId,
+        new_name: &str,
+    ) -> Result<Inode> {
+        let mut c = self.client()?;
+        let response = self
+            .block_on(async {
+                c.link(LinkRequest {
+                    inode,
+                    new_parent,
+                    new_name: new_name.to_string(),
+                    expected_new_parent_generation: expected_new_parent_generation.unwrap_or(0),
+                    request_id: RequestOpId::random().to_hex(),
+                })
+                .await
+            })
+            .map_err(flux_from_status)?
+            .into_inner();
+        decode_inode(&response.inode_json)
+    }
+
+    fn get_xattr(&self, inode: InodeId, name: &str) -> Result<Vec<u8>> {
+        let mut client = self.client()?;
+        let response = self
+            .block_on(async {
+                client
+                    .get_xattr(GetXattrRequest {
+                        inode,
+                        name: name.to_string(),
+                    })
+                    .await
+            })
+            .map_err(flux_from_status)?
+            .into_inner();
+        Ok(response.value)
+    }
+
+    fn list_xattrs(&self, inode: InodeId) -> Result<Vec<String>> {
+        let mut client = self.client()?;
+        let response = self
+            .block_on(async { client.list_xattrs(ListXattrsRequest { inode }).await })
+            .map_err(flux_from_status)?
+            .into_inner();
+        Ok(response.names)
+    }
+
+    fn set_xattr_cas(
+        &self,
+        expected_generation: u64,
+        inode: InodeId,
+        name: &str,
+        value: &[u8],
+        mode: XattrSetMode,
+    ) -> Result<Inode> {
+        let mut client = self.client()?;
+        let response = self
+            .block_on(async {
+                client
+                    .set_xattr(SetXattrRequest {
+                        inode,
+                        name: name.to_string(),
+                        value: value.to_vec(),
+                        mode: xattr_set_mode_to_wire(mode),
+                        expected_generation,
+                        request_id: RequestOpId::random().to_hex(),
+                    })
+                    .await
+            })
+            .map_err(flux_from_status)?
+            .into_inner();
+        decode_inode(&response.inode_json)
+    }
+
+    fn remove_xattr_cas(
+        &self,
+        expected_generation: u64,
+        inode: InodeId,
+        name: &str,
+    ) -> Result<Inode> {
+        let mut client = self.client()?;
+        let response = self
+            .block_on(async {
+                client
+                    .remove_xattr(RemoveXattrRequest {
+                        inode,
+                        name: name.to_string(),
+                        expected_generation,
+                        request_id: RequestOpId::random().to_hex(),
+                    })
+                    .await
+            })
+            .map_err(flux_from_status)?
+            .into_inner();
+        decode_inode(&response.inode_json)
     }
 
     fn rename_cas(

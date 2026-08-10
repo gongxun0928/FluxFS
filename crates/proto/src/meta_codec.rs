@@ -3,7 +3,7 @@ use fluxfs_types::schema::{decode_versioned, Versioned};
 use fluxfs_types::{
     ChunkId, Dentry, FileType, FlushIntent, FluxError, GcBatch, GcPlan, GcTombstone, Inode,
     InodeId, Manifest, ManifestId, Result as FluxResult, UfsObject, WorkerMembership,
-    WorkerRegistration, WorkerTargetId,
+    WorkerRegistration, WorkerTargetId, XattrSetMode,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -157,6 +157,7 @@ pub fn file_type_to_wire(ft: FileType) -> u32 {
     match ft {
         FileType::Directory => 0,
         FileType::Regular => 1,
+        FileType::Symlink => 2,
     }
 }
 
@@ -164,7 +165,27 @@ pub fn file_type_from_wire(v: u32) -> FluxResult<FileType> {
     match v {
         0 => Ok(FileType::Directory),
         1 => Ok(FileType::Regular),
+        2 => Ok(FileType::Symlink),
         _ => Err(FluxError::InvalidArg(format!("bad file_type wire={v}"))),
+    }
+}
+
+pub fn xattr_set_mode_to_wire(mode: XattrSetMode) -> u32 {
+    match mode {
+        XattrSetMode::Upsert => 0,
+        XattrSetMode::Create => 1,
+        XattrSetMode::Replace => 2,
+    }
+}
+
+pub fn xattr_set_mode_from_wire(value: u32) -> FluxResult<XattrSetMode> {
+    match value {
+        0 => Ok(XattrSetMode::Upsert),
+        1 => Ok(XattrSetMode::Create),
+        2 => Ok(XattrSetMode::Replace),
+        _ => Err(FluxError::InvalidArg(format!(
+            "bad xattr set mode wire={value}"
+        ))),
     }
 }
 
@@ -177,6 +198,9 @@ pub fn status_from_flux(err: FluxError) -> tonic::Status {
             Code::InvalidArgument
         }
         FluxError::NotEmpty => Code::FailedPrecondition,
+        FluxError::NoData => Code::NotFound,
+        FluxError::NoSpace => Code::ResourceExhausted,
+        FluxError::NotPermitted => Code::FailedPrecondition,
         FluxError::Capability(_) => Code::ResourceExhausted,
         FluxError::Busy => Code::Unavailable,
         FluxError::CasFailed { .. } | FluxError::DirtyConflict | FluxError::ReadOnly => {
@@ -266,6 +290,9 @@ mod tests {
             FluxError::NotDirectory,
             FluxError::IsDirectory,
             FluxError::NotEmpty,
+            FluxError::NoData,
+            FluxError::NoSpace,
+            FluxError::NotPermitted,
             FluxError::InvalidArg("bad offset 123".into()),
             FluxError::Capability("over 4MiB".into()),
             FluxError::CasFailed {
@@ -372,6 +399,7 @@ mod tests {
             ctime_ms: 0,
             atime_ms: 0,
             link_count: 1,
+            symlink_target: None,
             generation: 1,
             head_gen: fluxfs_types::DataGen(1),
             ufs_gen: fluxfs_types::DataGen(0),
@@ -405,6 +433,7 @@ mod tests {
             ctime_ms: 2,
             atime_ms: 3,
             link_count: 1,
+            symlink_target: None,
             generation: 5,
             head_gen: fluxfs_types::DataGen(5),
             ufs_gen: fluxfs_types::DataGen(3),
@@ -459,6 +488,7 @@ mod tests {
             ctime_ms: 0,
             atime_ms: 0,
             link_count: 1,
+            symlink_target: None,
             generation: 1,
             head_gen: fluxfs_types::DataGen(0),
             ufs_gen: fluxfs_types::DataGen(0),

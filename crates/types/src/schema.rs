@@ -231,6 +231,7 @@ mod tests {
             ctime_ms: 2,
             atime_ms: 3,
             link_count: 1,
+            symlink_target: None,
             generation: 9,
             head_gen: DataGen(9),
             ufs_gen: DataGen(5),

@@ -99,6 +99,23 @@ grep -q '^mode=0600$' "$test_root/moved-stat"
 grep -q '^uid=123$' "$test_root/moved-stat"
 grep -q '^gid=456$' "$test_root/moved-stat"
 
+"${fs[@]}" ln /right/moved.bin /right/hard.bin
+test "$("${fs[@]}" stat /right/moved.bin | sed -n 's/^inode=//p')" = \
+    "$("${fs[@]}" stat /right/hard.bin | sed -n 's/^inode=//p')"
+"${fs[@]}" ln --symbolic moved.bin /right/sym.bin
+test "$("${fs[@]}" readlink /right/sym.bin)" = "moved.bin"
+"${fs[@]}" lstat /right/sym.bin | grep -q '^type=Symlink$'
+"${fs[@]}" stat /right/sym.bin | grep -q '^type=Regular$'
+"${fs[@]}" setxattr --create /right/hard.bin user.cli cli-value
+test "$("${fs[@]}" getxattr /right/hard.bin user.cli)" = "cli-value"
+test "$("${fs[@]}" getxattr /right/sym.bin user.cli)" = "cli-value"
+"${fs[@]}" listxattr /right/hard.bin | grep -q '^user.cli$'
+"${fs[@]}" setxattr --no-follow /right/sym.bin user.link-self link-value
+test "$("${fs[@]}" getxattr --no-follow /right/sym.bin user.link-self)" = "link-value"
+"${fs[@]}" listxattr --no-follow /right/sym.bin | grep -q '^user.link-self$'
+"${fs[@]}" setxattr --replace /right/hard.bin user.cli replaced
+test "$("${fs[@]}" getxattr /right/moved.bin user.cli)" = "replaced"
+
 printf 'replacement\n' >"$test_root/replacement"
 printf 'source-wins\n' >"$test_root/source"
 "${fs[@]}" put "$test_root/replacement" /right/destination
@@ -113,6 +130,11 @@ test "$("${fs[@]}" cat /right/destination)" = "source-wins"
 "${fs[@]}" truncate 1024 /right/moved.bin
 "${fs[@]}" stat /right/moved.bin | grep -q '^size=1024$'
 "${fs[@]}" rm /right/moved.bin
+test "$("${fs[@]}" cat /right/hard.bin | wc -c)" = "1024"
+"${fs[@]}" removexattr /right/hard.bin user.cli
+"${fs[@]}" removexattr --no-follow /right/sym.bin user.link-self
+"${fs[@]}" rm /right/sym.bin
+"${fs[@]}" rm /right/hard.bin
 "${fs[@]}" rm /right/destination
 "${fs[@]}" rmdir /right
 "${fs[@]}" rmdir /left
@@ -121,8 +143,14 @@ test "$("${fs[@]}" cat /right/destination)" = "source-wins"
 "${fs[@]}" mkdir /persisted
 printf 'after-restart\n' >"$test_root/persisted"
 "${fs[@]}" put "$test_root/persisted" /persisted/file
+"${fs[@]}" ln /persisted/file /persisted/hard
+"${fs[@]}" ln --symbolic file /persisted/sym
+"${fs[@]}" setxattr /persisted/file user.persist durable
 kill "$meta_pid"; wait "$meta_pid" 2>/dev/null || true; meta_pid=""
 start_meta
 test "$("${fs[@]}" cat /persisted/file)" = "after-restart"
+test "$("${fs[@]}" cat /persisted/hard)" = "after-restart"
+test "$("${fs[@]}" readlink /persisted/sym)" = "file"
+test "$("${fs[@]}" getxattr /persisted/hard user.persist)" = "durable"
 
-echo "fluxfs fs/admin CLI: streaming CRUD + atomic rename/rmdir + restart: ok"
+echo "fluxfs fs/admin CLI: streaming CRUD + links/xattrs + atomic rename/rmdir + restart: ok"

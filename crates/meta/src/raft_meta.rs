@@ -6,7 +6,7 @@ use crate::store::MetaStore;
 use fluxfs_types::{
     ChunkId, Dentry, FileType, FlushId, FlushIntent, FluxError, GcBatch, GcLeaseId, GcPlan,
     GcTombstone, Inode, InodeId, Manifest, ManifestId, RequestOpId, Result, UfsObject,
-    WorkerMembership, WorkerRegistration, WorkerTargetId, WriteTicketId, ROOT_INODE,
+    WorkerMembership, WorkerRegistration, WorkerTargetId, WriteTicketId, XattrSetMode, ROOT_INODE,
 };
 use std::future::Future;
 use std::sync::Arc;
@@ -177,6 +177,27 @@ impl MetaStore for RaftMetaStore {
             expected_parent_generation,
         })?;
         Self::map_inode(resp)
+    }
+
+    fn symlink_cas(
+        &self,
+        expected_parent_generation: Option<u64>,
+        parent: InodeId,
+        name: &str,
+        target: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Inode> {
+        Self::map_inode(self.write(MetaRaftRequest::Symlink {
+            request_id: Some(RequestOpId::random()),
+            ledger_now_unix_ms: 0,
+            parent,
+            name: name.to_string(),
+            target: target.to_string(),
+            uid,
+            gid,
+            expected_parent_generation,
+        })?)
     }
 
     fn readdir(&self, dir: InodeId) -> Result<Vec<Dentry>> {
@@ -474,6 +495,65 @@ impl MetaStore for RaftMetaStore {
             expected_parent_generation,
         })?;
         Self::map_empty(resp)
+    }
+
+    fn link_cas(
+        &self,
+        expected_new_parent_generation: Option<u64>,
+        inode: InodeId,
+        new_parent: InodeId,
+        new_name: &str,
+    ) -> Result<Inode> {
+        Self::map_inode(self.write(MetaRaftRequest::Link {
+            request_id: Some(RequestOpId::random()),
+            ledger_now_unix_ms: 0,
+            inode,
+            new_parent,
+            new_name: new_name.to_string(),
+            expected_new_parent_generation,
+        })?)
+    }
+
+    fn get_xattr(&self, inode: InodeId, name: &str) -> Result<Vec<u8>> {
+        self.store.get_xattr(inode, name)
+    }
+
+    fn list_xattrs(&self, inode: InodeId) -> Result<Vec<String>> {
+        self.store.list_xattrs(inode)
+    }
+
+    fn set_xattr_cas(
+        &self,
+        expected_generation: u64,
+        inode: InodeId,
+        name: &str,
+        value: &[u8],
+        mode: XattrSetMode,
+    ) -> Result<Inode> {
+        Self::map_inode(self.write(MetaRaftRequest::SetXattr {
+            request_id: Some(RequestOpId::random()),
+            ledger_now_unix_ms: 0,
+            expected_generation,
+            inode,
+            name: name.to_string(),
+            value: value.to_vec(),
+            mode,
+        })?)
+    }
+
+    fn remove_xattr_cas(
+        &self,
+        expected_generation: u64,
+        inode: InodeId,
+        name: &str,
+    ) -> Result<Inode> {
+        Self::map_inode(self.write(MetaRaftRequest::RemoveXattr {
+            request_id: Some(RequestOpId::random()),
+            ledger_now_unix_ms: 0,
+            expected_generation,
+            inode,
+            name: name.to_string(),
+        })?)
     }
 
     fn rename_cas(

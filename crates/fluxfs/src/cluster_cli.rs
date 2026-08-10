@@ -5,7 +5,8 @@ use fluxfs_chunk::{RemoteReplicatedChunkStore, DEFAULT_MAX_PENDING_CHUNK_OPS};
 use fluxfs_client::{FluxClient, InodeSetAttr};
 use fluxfs_meta::{MetaStore, RemoteMetaStore};
 use fluxfs_types::{
-    FileType, FluxError, Inode, RequestOpId, WorkerRegistration, CHUNK_SIZE, ROOT_INODE,
+    FileType, FluxError, Inode, RequestOpId, WorkerRegistration, XattrSetMode, CHUNK_SIZE,
+    ROOT_INODE,
 };
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Write};
@@ -37,6 +38,10 @@ enum FsCommand {
     },
     /// Print detailed inode metadata.
     Stat { path: String },
+    /// Print metadata without following the final symbolic link.
+    Lstat { path: String },
+    /// Print a symbolic link target.
+    Readlink { path: String },
     /// Stream a file to stdout.
     Cat { path: String },
     /// Stream a FluxFS file to a local file.
@@ -58,6 +63,13 @@ enum FsCommand {
     },
     /// Remove one regular file. Imported/UFS namespace entries fail closed.
     Rm { path: String },
+    /// Create a hard link, or a symbolic link with `--symbolic`.
+    Ln {
+        source: String,
+        destination: String,
+        #[arg(long, short = 's')]
+        symbolic: bool,
+    },
     /// Remove one empty directory.
     Rmdir { path: String },
     /// Atomically rename or move one path.
@@ -83,6 +95,42 @@ enum FsCommand {
     },
     /// Set the logical file size (sparse growth is supported).
     Truncate { size: u64, path: String },
+    /// Read an extended attribute (raw bytes to stdout or `--output`).
+    Getxattr {
+        path: String,
+        name: String,
+        #[arg(long, short = 'o')]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        no_follow: bool,
+    },
+    /// List extended attribute names.
+    Listxattr {
+        path: String,
+        #[arg(long)]
+        no_follow: bool,
+    },
+    /// Set an extended attribute from a UTF-8 value or `--value-file`.
+    Setxattr {
+        path: String,
+        name: String,
+        value: Option<String>,
+        #[arg(long)]
+        value_file: Option<PathBuf>,
+        #[arg(long)]
+        create: bool,
+        #[arg(long)]
+        replace: bool,
+        #[arg(long)]
+        no_follow: bool,
+    },
+    /// Remove an extended attribute.
+    Removexattr {
+        path: String,
+        name: String,
+        #[arg(long)]
+        no_follow: bool,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -111,6 +159,14 @@ impl FsArgs {
             FsCommand::Ls { path } => ls(&client, &path),
             FsCommand::Stat { path } => {
                 print_inode(&path, &client.lookup_path(&path)?);
+                Ok(())
+            }
+            FsCommand::Lstat { path } => {
+                print_inode(&path, &client.lstat_path(&path)?);
+                Ok(())
+            }
+            FsCommand::Readlink { path } => {
+                println!("{}", client.readlink_path(&path)?);
                 Ok(())
             }
             FsCommand::Cat { path } => {
@@ -148,6 +204,22 @@ impl FsArgs {
             FsCommand::Rm { path } => {
                 client.unlink_path(&path)?;
                 println!("rm ok: {path}");
+                Ok(())
+            }
+            FsCommand::Ln {
+                source,
+                destination,
+                symbolic,
+            } => {
+                let inode = if symbolic {
+                    client.symlink_path(&source, &destination, current_uid(), current_gid())?
+                } else {
+                    client.link_path(&source, &destination)?
+                };
+                println!(
+                    "ln ok: {source} -> {destination} inode={} symbolic={symbolic}",
+                    inode.id
+                );
                 Ok(())
             }
             FsCommand::Rmdir { path } => {
@@ -217,6 +289,89 @@ impl FsArgs {
                     },
                 )?;
                 println!("truncate ok: {path} size={}", inode.size);
+                Ok(())
+            }
+            FsCommand::Getxattr {
+                path,
+                name,
+                output,
+                no_follow,
+            } => {
+                let value = if no_follow {
+                    client.lget_xattr_path(&path, &name)?
+                } else {
+                    client.get_xattr_path(&path, &name)?
+                };
+                if let Some(output) = output {
+                    std::fs::write(&output, &value)
+                        .with_context(|| format!("write {}", output.display()))?;
+                } else {
+                    let stdout = io::stdout();
+                    let mut stdout = stdout.lock();
+                    stdout.write_all(&value).context("write xattr to stdout")?;
+                    stdout.flush().context("flush stdout")?;
+                }
+                Ok(())
+            }
+            FsCommand::Listxattr { path, no_follow } => {
+                let names = if no_follow {
+                    client.llist_xattrs_path(&path)?
+                } else {
+                    client.list_xattrs_path(&path)?
+                };
+                for name in names {
+                    println!("{name}");
+                }
+                Ok(())
+            }
+            FsCommand::Setxattr {
+                path,
+                name,
+                value,
+                value_file,
+                create,
+                replace,
+                no_follow,
+            } => {
+                if create && replace {
+                    anyhow::bail!("--create and --replace are mutually exclusive");
+                }
+                let value = match (value, value_file) {
+                    (Some(value), None) => value.into_bytes(),
+                    (None, Some(path)) => {
+                        std::fs::read(&path).with_context(|| format!("read {}", path.display()))?
+                    }
+                    (Some(_), Some(_)) => {
+                        anyhow::bail!("provide either VALUE or --value-file, not both")
+                    }
+                    (None, None) => anyhow::bail!("provide VALUE or --value-file"),
+                };
+                let mode = if create {
+                    XattrSetMode::Create
+                } else if replace {
+                    XattrSetMode::Replace
+                } else {
+                    XattrSetMode::Upsert
+                };
+                if no_follow {
+                    client.lset_xattr_path(&path, &name, &value, mode)?;
+                } else {
+                    client.set_xattr_path(&path, &name, &value, mode)?;
+                }
+                println!("setxattr ok: {path} {name} bytes={}", value.len());
+                Ok(())
+            }
+            FsCommand::Removexattr {
+                path,
+                name,
+                no_follow,
+            } => {
+                if no_follow {
+                    client.lremove_xattr_path(&path, &name)?;
+                } else {
+                    client.remove_xattr_path(&path, &name)?;
+                }
+                println!("removexattr ok: {path} {name}");
                 Ok(())
             }
         }
@@ -403,6 +558,7 @@ fn file_type_char(file_type: FileType) -> char {
     match file_type {
         FileType::Directory => 'd',
         FileType::Regular => '-',
+        FileType::Symlink => 'l',
     }
 }
 

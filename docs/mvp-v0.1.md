@@ -101,7 +101,9 @@ This is the reuse point Gongxun asked for: **one chunk layout for write cache an
 | open / read / write / truncate | Yes |
 | rename (same FS, non-External) | Yes (atomic via MetaMaster txn) |
 | rename involving External without copy-up | **No** → copy-up first or EXDEV |
-| hardlink / xattr / flock full | Defer |
+| hardlink / symlink / xattr | Yes for FluxFS-managed namespace; External mutation fails closed |
+| POSIX ACL | Storage, validation, inheritance and round-trip only; no enforcement |
+| flock / open-unlink lifetime | Defer |
 | fsync | Flush that inode’s dirty extents (best-effort durability) |
 
 ## 6. What we take from references (MVP-level)

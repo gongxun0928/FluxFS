@@ -10,6 +10,7 @@ proptest! {
         match ft {
             FileType::Directory => prop_assert!(is_dir),
             FileType::Regular => prop_assert!(!is_dir),
+            FileType::Symlink => unreachable!("generator only constructs directory or regular"),
         }
     }
 }

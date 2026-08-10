@@ -251,6 +251,15 @@ mod hex {
 pub enum FileType {
     Directory,
     Regular,
+    Symlink,
+}
+
+/// Linux `setxattr(2)` create/replace policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum XattrSetMode {
+    Upsert,
+    Create,
+    Replace,
 }
 
 /// UX / protocol locality label (derived from `LocalityFields`).
@@ -400,6 +409,10 @@ pub struct Inode {
     pub ctime_ms: i64,
     pub atime_ms: i64,
     pub link_count: u32,
+    /// Raw symlink target bytes represented as UTF-8 for the current Linux MVP.
+    /// Only present when `file_type == Symlink`.
+    #[serde(default)]
+    pub symlink_target: Option<String>,
 
     // ===== Generation / versioning =====
     /// Latest manifest generation (incremented on every committed write/truncate).
@@ -909,6 +922,12 @@ pub enum FluxError {
     IsDirectory,
     #[error("directory not empty")]
     NotEmpty,
+    #[error("attribute not found")]
+    NoData,
+    #[error("metadata capacity exceeded")]
+    NoSpace,
+    #[error("operation not permitted")]
+    NotPermitted,
     #[error("invalid argument: {0}")]
     InvalidArg(String),
     #[error("capability exceeded: {0}")]

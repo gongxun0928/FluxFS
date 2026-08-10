@@ -83,9 +83,11 @@ network-partition tests rather than only localhost scripts.
 
 - Lazy External namespace entries lack a complete TTL/event invalidation model.
   Open handles need explicit identity and refresh rules.
-- External create/unlink and many POSIX operations (locks, links, symlinks,
-  xattrs, mmap, ACLs, kernel permission enforcement, open-unlink lifetime, and
-  complete errno behavior) are not supported. External truncate, mode/owner,
+- External namespace mutation remains fail-closed. Managed hard links,
+  symbolic links and xattr CRUD are supported; POSIX ACL blobs are validated,
+  stored, inherited, and round-trip through FUSE but are not permission-enforced.
+  Locks, mmap coherence, kernel permission enforcement, open-unlink lifetime,
+  and complete errno behavior remain unsupported. External truncate, mode/owner,
   and explicit timestamp updates do use generation-CAS Dirty copy-up semantics;
   ordinary reads are mounted `noatime`. Freeze and test the wider advertised
   POSIX contract before general use.

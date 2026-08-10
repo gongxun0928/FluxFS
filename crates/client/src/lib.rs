@@ -6,10 +6,11 @@ use fluxfs_metrics::FluxMetrics;
 use fluxfs_types::{
     BackingMode, ChunkId, DataGen, DataState, Extent, ExtentTree, FileType, FlushId, FlushIntent,
     FluxError, Inode, InodeId, LocalityFields, LocalityLabel, Manifest, OpState, Origin,
-    RequestOpId, Result, UfsObject, UfsVersion, WriteTicketId, CHUNK_SIZE, ROOT_INODE,
+    RequestOpId, Result, UfsObject, UfsVersion, WriteTicketId, XattrSetMode, CHUNK_SIZE,
+    ROOT_INODE,
 };
 use fluxfs_ufs::{ReadPathConfig, ReadPathStats, Ufs, UfsEntryMode, UfsProbe, UfsReadPath};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::future::Future;
 use std::io::{Read, Write};
 use std::sync::Mutex;
@@ -228,6 +229,66 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         self.meta.rmdir(parent, name)
     }
 
+    pub fn link(&self, inode: InodeId, new_parent: InodeId, new_name: &str) -> Result<Inode> {
+        self.reject_ufs_mutation()?;
+        let source = self.meta.get_inode(inode)?;
+        reject_imported_inode_mutation(&source)?;
+        reject_imported_inode_mutation(&self.meta.get_inode(new_parent)?)?;
+        self.meta.link(inode, new_parent, new_name)
+    }
+
+    pub fn symlink(
+        &self,
+        parent: InodeId,
+        name: &str,
+        target: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Inode> {
+        self.reject_ufs_mutation()?;
+        reject_imported_inode_mutation(&self.meta.get_inode(parent)?)?;
+        self.meta.symlink(parent, name, target, uid, gid)
+    }
+
+    pub fn readlink(&self, inode: InodeId) -> Result<String> {
+        let inode = self.meta.get_inode(inode)?;
+        if inode.file_type != FileType::Symlink {
+            return Err(FluxError::InvalidArg("inode is not a symlink".into()));
+        }
+        inode
+            .symlink_target
+            .ok_or_else(|| FluxError::Meta("symlink inode missing target".into()))
+    }
+
+    pub fn get_xattr(&self, inode: InodeId, name: &str) -> Result<Vec<u8>> {
+        self.meta.get_xattr(inode, name)
+    }
+
+    pub fn list_xattrs(&self, inode: InodeId) -> Result<Vec<String>> {
+        self.meta.list_xattrs(inode)
+    }
+
+    pub fn set_xattr(
+        &self,
+        inode: InodeId,
+        name: &str,
+        value: &[u8],
+        mode: XattrSetMode,
+    ) -> Result<Inode> {
+        self.reject_ufs_mutation()?;
+        let current = self.meta.get_inode(inode)?;
+        reject_imported_inode_mutation(&current)?;
+        self.meta
+            .set_xattr_cas(current.generation, inode, name, value, mode)
+    }
+
+    pub fn remove_xattr(&self, inode: InodeId, name: &str) -> Result<Inode> {
+        self.reject_ufs_mutation()?;
+        let current = self.meta.get_inode(inode)?;
+        reject_imported_inode_mutation(&current)?;
+        self.meta.remove_xattr_cas(current.generation, inode, name)
+    }
+
     pub fn rename(
         &self,
         old_parent: InodeId,
@@ -251,9 +312,55 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
     }
 
     pub fn lookup_path(&self, path: &str) -> Result<Inode> {
+        self.resolve_path(path, true)
+    }
+
+    /// Resolve all intermediate symlinks but return the final symlink inode.
+    pub fn lstat_path(&self, path: &str) -> Result<Inode> {
+        self.resolve_path(path, false)
+    }
+
+    fn resolve_path(&self, path: &str, follow_final_symlink: bool) -> Result<Inode> {
+        let mut pending = path_components(path)?
+            .into_iter()
+            .map(str::to_string)
+            .collect::<VecDeque<_>>();
+        let mut resolved = Vec::<String>::new();
         let mut inode = self.meta.get_inode(ROOT_INODE)?;
-        for part in path_components(path)? {
-            inode = self.lookup(inode.id, part)?;
+        let mut symlink_count = 0_u32;
+
+        while let Some(part) = pending.pop_front() {
+            let child = self.lookup(inode.id, &part)?;
+            let follow = child.file_type == FileType::Symlink
+                && (follow_final_symlink || !pending.is_empty());
+            if follow {
+                symlink_count += 1;
+                if symlink_count > 40 {
+                    return Err(FluxError::InvalidArg(
+                        "too many levels of symbolic links".into(),
+                    ));
+                }
+                let target = child
+                    .symlink_target
+                    .as_deref()
+                    .ok_or_else(|| FluxError::Meta("symlink inode missing target".into()))?;
+                let mut expanded = if target.starts_with('/') {
+                    Vec::new()
+                } else {
+                    resolved.clone()
+                };
+                append_symlink_target(&mut expanded, target)?;
+                expanded.extend(pending);
+                pending = expanded.into();
+                resolved.clear();
+                inode = self.meta.get_inode(ROOT_INODE)?;
+                continue;
+            }
+            if !pending.is_empty() && child.file_type != FileType::Directory {
+                return Err(FluxError::NotDirectory);
+            }
+            resolved.push(part);
+            inode = child;
         }
         Ok(inode)
     }
@@ -264,12 +371,10 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
         let (name, parents) = parts
             .split_last()
             .ok_or_else(|| FluxError::InvalidArg("root has no parent name".into()))?;
-        let mut parent = self.meta.get_inode(ROOT_INODE)?;
-        for part in parents {
-            parent = self.lookup(parent.id, part)?;
-            if parent.file_type != FileType::Directory {
-                return Err(FluxError::NotDirectory);
-            }
+        let parent_path = format!("/{}", parents.join("/"));
+        let parent = self.lookup_path(&parent_path)?;
+        if parent.file_type != FileType::Directory {
+            return Err(FluxError::NotDirectory);
         }
         Ok((parent, (*name).to_string()))
     }
@@ -292,6 +397,66 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
     pub fn rmdir_path(&self, path: &str) -> Result<()> {
         let (parent, name) = self.resolve_parent(path)?;
         self.rmdir(parent.id, &name)
+    }
+
+    pub fn link_path(&self, source: &str, destination: &str) -> Result<Inode> {
+        let source = self.lstat_path(source)?;
+        let (new_parent, new_name) = self.resolve_parent(destination)?;
+        self.link(source.id, new_parent.id, &new_name)
+    }
+
+    pub fn symlink_path(&self, target: &str, link_path: &str, uid: u32, gid: u32) -> Result<Inode> {
+        let (parent, name) = self.resolve_parent(link_path)?;
+        self.symlink(parent.id, &name, target, uid, gid)
+    }
+
+    pub fn readlink_path(&self, path: &str) -> Result<String> {
+        let inode = self.lstat_path(path)?;
+        self.readlink(inode.id)
+    }
+
+    pub fn get_xattr_path(&self, path: &str, name: &str) -> Result<Vec<u8>> {
+        self.get_xattr(self.lookup_path(path)?.id, name)
+    }
+
+    pub fn list_xattrs_path(&self, path: &str) -> Result<Vec<String>> {
+        self.list_xattrs(self.lookup_path(path)?.id)
+    }
+
+    pub fn set_xattr_path(
+        &self,
+        path: &str,
+        name: &str,
+        value: &[u8],
+        mode: XattrSetMode,
+    ) -> Result<Inode> {
+        self.set_xattr(self.lookup_path(path)?.id, name, value, mode)
+    }
+
+    pub fn remove_xattr_path(&self, path: &str, name: &str) -> Result<Inode> {
+        self.remove_xattr(self.lookup_path(path)?.id, name)
+    }
+
+    pub fn lget_xattr_path(&self, path: &str, name: &str) -> Result<Vec<u8>> {
+        self.get_xattr(self.lstat_path(path)?.id, name)
+    }
+
+    pub fn llist_xattrs_path(&self, path: &str) -> Result<Vec<String>> {
+        self.list_xattrs(self.lstat_path(path)?.id)
+    }
+
+    pub fn lset_xattr_path(
+        &self,
+        path: &str,
+        name: &str,
+        value: &[u8],
+        mode: XattrSetMode,
+    ) -> Result<Inode> {
+        self.set_xattr(self.lstat_path(path)?.id, name, value, mode)
+    }
+
+    pub fn lremove_xattr_path(&self, path: &str, name: &str) -> Result<Inode> {
+        self.remove_xattr(self.lstat_path(path)?.id, name)
     }
 
     pub fn rename_path(&self, old_path: &str, new_path: &str, no_replace: bool) -> Result<Inode> {
@@ -1211,6 +1376,7 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
             ctime_ms: now,
             atime_ms: now,
             link_count: 1,
+            symlink_target: None,
             generation: 1,
             head_gen: DataGen(0),
             ufs_gen: DataGen(0),
@@ -1274,6 +1440,7 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
             ctime_ms: now,
             atime_ms: now,
             link_count: 2,
+            symlink_target: None,
             generation: 1,
             head_gen: DataGen(0),
             ufs_gen: DataGen(0),
@@ -1399,6 +1566,28 @@ fn path_components(path: &str) -> Result<Vec<&str>> {
         parts.push(part);
     }
     Ok(parts)
+}
+
+fn append_symlink_target(base: &mut Vec<String>, target: &str) -> Result<()> {
+    if target.as_bytes().contains(&0) {
+        return Err(FluxError::InvalidArg("symlink target contains NUL".into()));
+    }
+    for part in target.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                base.pop();
+            }
+            part if part.len() > 255 => {
+                return Err(FluxError::InvalidArg(format!(
+                    "symlink component too long: {} bytes",
+                    part.len()
+                )));
+            }
+            part => base.push(part.to_string()),
+        }
+    }
+    Ok(())
 }
 
 fn apply_inode_attrs(inode: &mut Inode, attrs: &InodeSetAttr) -> bool {
@@ -1549,6 +1738,96 @@ mod tests {
     }
 
     #[test]
+    fn path_sdk_resolves_symlinks_and_hardlinks_with_posix_final_component_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = HeedMetaStore::open(dir.path().join("meta")).unwrap();
+        let chunks = DiskChunkStore::open(dir.path().join("chunks")).unwrap();
+        let client = FluxClient::new(meta, chunks);
+
+        client.mkdir_path("/dir", 0o755, 1, 2).unwrap();
+        let file = client.create_file_path("/dir/data", 0o640, 1, 2).unwrap();
+        client.write_at(file.id, 0, b"payload").unwrap();
+        let alias = client.link_path("/dir/data", "/alias").unwrap();
+        assert_eq!(alias.id, file.id);
+        assert_eq!(alias.link_count, 2);
+        client.unlink_path("/dir/data").unwrap();
+        assert_eq!(
+            client
+                .read_all(client.lookup_path("/alias").unwrap().id)
+                .unwrap(),
+            b"payload"
+        );
+
+        let relative = client
+            .symlink_path("../alias", "/dir/relative", 1, 2)
+            .unwrap();
+        assert_eq!(client.lstat_path("/dir/relative").unwrap().id, relative.id);
+        assert_eq!(client.lookup_path("/dir/relative").unwrap().id, file.id);
+        assert_eq!(client.readlink_path("/dir/relative").unwrap(), "../alias");
+
+        client.symlink_path("/dir", "/absolute", 1, 2).unwrap();
+        assert_eq!(
+            client.lookup_path("/absolute/relative").unwrap().id,
+            file.id
+        );
+        client.symlink_path("loop-b", "/loop-a", 1, 2).unwrap();
+        client.symlink_path("loop-a", "/loop-b", 1, 2).unwrap();
+        assert!(matches!(
+            client.lookup_path("/loop-a"),
+            Err(FluxError::InvalidArg(_))
+        ));
+
+        client
+            .set_xattr_path("/alias", "user.note", b"value", XattrSetMode::Create)
+            .unwrap();
+        assert_eq!(
+            client.get_xattr_path("/alias", "user.note").unwrap(),
+            b"value"
+        );
+        assert_eq!(
+            client.list_xattrs_path("/alias").unwrap(),
+            vec!["user.note"]
+        );
+        client.remove_xattr_path("/alias", "user.note").unwrap();
+        assert_eq!(
+            client.get_xattr_path("/alias", "user.note").unwrap_err(),
+            FluxError::NoData
+        );
+        client
+            .set_xattr_path(
+                "/dir/relative",
+                "user.followed",
+                b"target",
+                XattrSetMode::Create,
+            )
+            .unwrap();
+        assert_eq!(
+            client.get_xattr(file.id, "user.followed").unwrap(),
+            b"target"
+        );
+        client
+            .lset_xattr_path(
+                "/dir/relative",
+                "user.link-itself",
+                b"link",
+                XattrSetMode::Create,
+            )
+            .unwrap();
+        assert_eq!(
+            client
+                .lget_xattr_path("/dir/relative", "user.link-itself")
+                .unwrap(),
+            b"link"
+        );
+        assert_eq!(
+            client
+                .get_xattr_path("/dir/relative", "user.link-itself")
+                .unwrap_err(),
+            FluxError::NoData
+        );
+    }
+
+    #[test]
     fn imported_namespace_delete_and_rename_fail_closed_without_ufs_runtime() {
         let dir = tempfile::tempdir().unwrap();
         let meta = HeedMetaStore::open(dir.path().join("meta")).unwrap();
@@ -1585,6 +1864,12 @@ mod tests {
         assert_eq!(
             client.lookup(ROOT_INODE, "external").unwrap().id,
             imported.id
+        );
+        assert_eq!(
+            client
+                .set_xattr(imported.id, "user.note", b"blocked", XattrSetMode::Upsert,)
+                .unwrap_err(),
+            FluxError::ReadOnly
         );
 
         let mut imported_dir = client

@@ -11,6 +11,7 @@ service MetaService {
   rpc GetInode(GetInodeRequest) returns (GetInodeResponse);
   rpc Lookup(LookupRequest) returns (LookupResponse);
   rpc Create(CreateRequest) returns (CreateResponse);
+  rpc Symlink(SymlinkRequest) returns (SymlinkResponse);
   rpc Readdir(ReaddirRequest) returns (ReaddirResponse);
   rpc PutInode(PutInodeRequest) returns (PutInodeResponse);
   // CAS-update one inode without replacing its manifest. Used by POSIX setattr.
@@ -37,6 +38,11 @@ service MetaService {
   rpc FinishGc(FinishGcRequest) returns (FinishGcResponse);
   rpc ImportExternal(ImportExternalRequest) returns (ImportExternalResponse);
   rpc Unlink(UnlinkRequest) returns (UnlinkResponse);
+  rpc Link(LinkRequest) returns (LinkResponse);
+  rpc GetXattr(GetXattrRequest) returns (GetXattrResponse);
+  rpc ListXattrs(ListXattrsRequest) returns (ListXattrsResponse);
+  rpc SetXattr(SetXattrRequest) returns (SetXattrResponse);
+  rpc RemoveXattr(RemoveXattrRequest) returns (RemoveXattrResponse);
   rpc Rmdir(RmdirRequest) returns (RmdirResponse);
   rpc Rename(RenameRequest) returns (RenameResponse);
   rpc Ping(PingRequest) returns (PingResponse);
@@ -61,7 +67,7 @@ message LookupResponse { bytes inode_json = 1; }
 message CreateRequest {
   uint64 parent = 1;
   string name = 2;
-  uint32 file_type = 3; // 0=dir, 1=regular
+  uint32 file_type = 3; // 0=dir, 1=regular, 2=symlink
   uint32 mode = 4;
   uint32 uid = 5;
   uint32 gid = 6;
@@ -70,6 +76,38 @@ message CreateRequest {
   uint64 expected_parent_generation = 8;
 }
 message CreateResponse { bytes inode_json = 1; }
+
+message SymlinkRequest {
+  uint64 parent = 1;
+  string name = 2;
+  string target = 3;
+  uint32 uid = 4;
+  uint32 gid = 5;
+  uint64 expected_parent_generation = 6;
+  string request_id = 7;
+}
+message SymlinkResponse { bytes inode_json = 1; }
+
+message GetXattrRequest { uint64 inode = 1; string name = 2; }
+message GetXattrResponse { bytes value = 1; }
+message ListXattrsRequest { uint64 inode = 1; }
+message ListXattrsResponse { repeated string names = 1; }
+message SetXattrRequest {
+  uint64 inode = 1;
+  string name = 2;
+  bytes value = 3;
+  uint32 mode = 4; // 0=upsert, 1=create, 2=replace
+  uint64 expected_generation = 5;
+  string request_id = 6;
+}
+message SetXattrResponse { bytes inode_json = 1; }
+message RemoveXattrRequest {
+  uint64 inode = 1;
+  string name = 2;
+  uint64 expected_generation = 3;
+  string request_id = 4;
+}
+message RemoveXattrResponse { bytes inode_json = 1; }
 
 message ReaddirRequest { uint64 dir = 1; }
 message ReaddirResponse { bytes dentries_json = 1; }
@@ -199,6 +237,15 @@ message UnlinkRequest {
   string request_id = 4;
 }
 message UnlinkResponse {}
+
+message LinkRequest {
+  uint64 inode = 1;
+  uint64 new_parent = 2;
+  string new_name = 3;
+  uint64 expected_new_parent_generation = 4;
+  string request_id = 5;
+}
+message LinkResponse { bytes inode_json = 1; }
 
 message RmdirRequest {
   uint64 parent = 1;

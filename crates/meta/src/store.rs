@@ -1,7 +1,7 @@
 use fluxfs_types::{
     ChunkId, Dentry, FileType, FlushId, FlushIntent, GcBatch, GcLeaseId, GcPlan, GcTombstone,
     Inode, InodeId, Manifest, ManifestId, RequestOpId, Result, UfsObject, WorkerMembership,
-    WorkerRegistration, WorkerTargetId, WriteTicketId, ROOT_INODE,
+    WorkerRegistration, WorkerTargetId, WriteTicketId, XattrSetMode, ROOT_INODE,
 };
 
 /// Engine-agnostic metadata API frozen for W1.
@@ -50,6 +50,28 @@ pub trait MetaStore: Send + Sync {
         name: &str,
         file_type: FileType,
         mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Inode>;
+
+    fn symlink(
+        &self,
+        parent: InodeId,
+        name: &str,
+        target: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Inode> {
+        self.symlink_cas(None, parent, name, target, uid, gid)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn symlink_cas(
+        &self,
+        expected_parent_generation: Option<u64>,
+        parent: InodeId,
+        name: &str,
+        target: &str,
         uid: u32,
         gid: u32,
     ) -> Result<Inode>;
@@ -247,6 +269,56 @@ pub trait MetaStore: Send + Sync {
         parent: InodeId,
         name: &str,
     ) -> Result<()>;
+
+    /// Create another dentry for an existing non-directory inode.
+    fn link(&self, inode: InodeId, new_parent: InodeId, new_name: &str) -> Result<Inode> {
+        self.link_cas(None, inode, new_parent, new_name)
+    }
+
+    /// Hard-link with optional destination-parent generation CAS.
+    fn link_cas(
+        &self,
+        expected_new_parent_generation: Option<u64>,
+        inode: InodeId,
+        new_parent: InodeId,
+        new_name: &str,
+    ) -> Result<Inode>;
+
+    fn get_xattr(&self, inode: InodeId, name: &str) -> Result<Vec<u8>>;
+
+    fn list_xattrs(&self, inode: InodeId) -> Result<Vec<String>>;
+
+    fn set_xattr(
+        &self,
+        inode: InodeId,
+        name: &str,
+        value: &[u8],
+        mode: XattrSetMode,
+    ) -> Result<Inode> {
+        let generation = self.get_inode(inode)?.generation;
+        self.set_xattr_cas(generation, inode, name, value, mode)
+    }
+
+    fn set_xattr_cas(
+        &self,
+        expected_generation: u64,
+        inode: InodeId,
+        name: &str,
+        value: &[u8],
+        mode: XattrSetMode,
+    ) -> Result<Inode>;
+
+    fn remove_xattr(&self, inode: InodeId, name: &str) -> Result<Inode> {
+        let generation = self.get_inode(inode)?.generation;
+        self.remove_xattr_cas(generation, inode, name)
+    }
+
+    fn remove_xattr_cas(
+        &self,
+        expected_generation: u64,
+        inode: InodeId,
+        name: &str,
+    ) -> Result<Inode>;
 
     /// Atomically rename/move a dentry, replacing a compatible destination
     /// unless `no_replace` is set.

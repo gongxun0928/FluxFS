@@ -115,6 +115,46 @@ rmdir "$mount_dir/rename-right/move-tree"
 rmdir "$mount_dir/rename-left"
 rm "$mount_dir/remove.txt"
 test ! -e "$mount_dir/remove.txt"
+
+# Managed hardlink/symlink and xattr/ACL semantics through real kernel FUSE.
+printf 'linked-data\n' >"$mount_dir/hard-source"
+ln "$mount_dir/hard-source" "$mount_dir/hard-alias"
+test "$(stat -c '%i' "$mount_dir/hard-source")" = "$(stat -c '%i' "$mount_dir/hard-alias")"
+test "$(stat -c '%h' "$mount_dir/hard-source")" = "2"
+rm "$mount_dir/hard-source"
+test "$(cat "$mount_dir/hard-alias")" = "linked-data"
+ln -s ../hard-alias "$mount_dir/dir/relative-link"
+test "$(readlink "$mount_dir/dir/relative-link")" = "../hard-alias"
+test "$(cat "$mount_dir/dir/relative-link")" = "linked-data"
+
+python3 - "$mount_dir/hard-alias" <<'PY'
+import errno, os, sys
+
+path = sys.argv[1]
+os.setxattr(path, "user.fluxfs", b"xattr-value", os.XATTR_CREATE)
+assert os.getxattr(path, "user.fluxfs") == b"xattr-value"
+assert "user.fluxfs" in os.listxattr(path)
+try:
+    os.setxattr(path, "user.fluxfs", b"duplicate", os.XATTR_CREATE)
+    raise AssertionError("XATTR_CREATE unexpectedly replaced existing value")
+except OSError as error:
+    assert error.errno == errno.EEXIST
+os.setxattr(path, "user.fluxfs", b"replacement", os.XATTR_REPLACE)
+try:
+    os.setxattr(path, "user.missing", b"missing", os.XATTR_REPLACE)
+    raise AssertionError("XATTR_REPLACE unexpectedly created missing value")
+except OSError as error:
+    assert error.errno == errno.ENODATA
+PY
+
+setfacl -m u:12345:r-- "$mount_dir/hard-alias"
+getfacl -cn "$mount_dir/hard-alias" | grep -q '^user:12345:r--$'
+setfacl -d -m u:12345:r-x "$mount_dir/dir"
+printf 'acl-child\n' >"$mount_dir/dir/acl-child"
+getfacl -cn "$mount_dir/dir/acl-child" | grep -q '^user:12345:r-x$'
+mkdir "$mount_dir/dir/acl-child-dir"
+getfacl -cn "$mount_dir/dir/acl-child-dir" | grep -q '^user:12345:r-x$'
+getfacl -cdn "$mount_dir/dir/acl-child-dir" | grep -q '^user:12345:r-x$'
 stop_mount
 
 # Reopen the same metadata/chunk directories and verify acknowledged data.
@@ -133,6 +173,20 @@ assert int(st.st_mtime) == 1_234_567_890
 assert open(path, "rb").read() == b"abXYefgh" + b"\0" * 4
 PY
 test "$(cat "$mount_dir/rename-right/replacement")" = "rename-source"
+test "$(cat "$mount_dir/hard-alias")" = "linked-data"
+test "$(readlink "$mount_dir/dir/relative-link")" = "../hard-alias"
+test "$(cat "$mount_dir/dir/relative-link")" = "linked-data"
+python3 - "$mount_dir/hard-alias" <<'PY'
+import os, sys
+
+path = sys.argv[1]
+assert os.getxattr(path, "user.fluxfs") == b"replacement"
+assert "system.posix_acl_access" in os.listxattr(path)
+PY
+getfacl -cn "$mount_dir/hard-alias" | grep -q '^user:12345:r--$'
+getfacl -cn "$mount_dir/dir/acl-child" | grep -q '^user:12345:r-x$'
+getfacl -cn "$mount_dir/dir/acl-child-dir" | grep -q '^user:12345:r-x$'
+getfacl -cdn "$mount_dir/dir/acl-child-dir" | grep -q '^user:12345:r-x$'
 rm "$mount_dir/rename-right/replacement"
 rmdir "$mount_dir/rename-right"
 printf '\nrestart-ok\n' >>"$mount_dir/hello.txt"

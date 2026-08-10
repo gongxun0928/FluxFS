@@ -5,7 +5,7 @@ use fluxfs_types::{
     FileType, FlushId, FlushIntent, FluxError, GcBatch, GcLeaseId, GcPlan, GcTombstone, Inode,
     InodeId, LocalityFields, LocalityLabel, Manifest, ManifestId, OpState, Origin, Result,
     UfsObject, UfsVersion, WorkerMembership, WorkerRegistration, WorkerTargetId, WriteTicketId,
-    ROOT_INODE,
+    XattrSetMode, ROOT_INODE,
 };
 use heed::types::{Bytes, Str};
 use heed::{Database, Env, EnvOpenOptions};
@@ -29,6 +29,11 @@ type DentryDb = Database<Str, Bytes>;
 type MetaDb = Database<Str, Bytes>;
 type ManifestDb = Database<Bytes, Bytes>;
 type RequestDb = Database<Str, Bytes>;
+type XattrDb = Database<Str, Bytes>;
+
+const XATTR_VALUE_MAX: usize = 64 * 1024;
+const XATTR_COUNT_MAX: usize = 64;
+const XATTR_TOTAL_MAX: usize = 256 * 1024;
 
 const KEY_SM_LAST_APPLIED: &str = "raft_sm_last_applied";
 const KEY_SM_LAST_MEMBERSHIP: &str = "raft_sm_last_membership";
@@ -44,6 +49,8 @@ pub struct MetaSnapshotData {
     pub inodes: Vec<Inode>,
     pub dentries: Vec<Dentry>,
     pub manifests: Vec<(u64, Manifest)>,
+    #[serde(default)]
+    pub xattrs: Vec<(InodeId, String, Vec<u8>)>,
     pub next_inode: u64,
     pub next_manifest: u64,
     pub sm: SmAppliedMeta,
@@ -79,6 +86,7 @@ pub struct HeedMetaStore {
     dentries: DentryDb,
     meta: MetaDb,
     manifests: ManifestDb,
+    xattrs: XattrDb,
     /// Durable request-id → apply result ledger for client retry dedup.
     client_requests: RequestDb,
     /// Serialize writers; LMDB allows one write txn at a time anyway.
@@ -139,6 +147,9 @@ impl HeedMetaStore {
         let client_requests: RequestDb = env
             .create_database(&mut wtxn, Some("client_requests"))
             .map_err(|e| FluxError::Meta(e.to_string()))?;
+        let xattrs: XattrDb = env
+            .create_database(&mut wtxn, Some("xattrs"))
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
 
         let stored_schema = meta
             .get(&wtxn, KEY_META_SCHEMA_VERSION)
@@ -149,8 +160,8 @@ impl HeedMetaStore {
         let migrations = migration_path(stored_schema, CURRENT_META_SCHEMA_VERSION)?;
         for migration in migrations {
             // v0 -> v1 marks the store. v1 -> v2 switches future manifest
-            // writes to the versioned tree wire form; its reader accepts old
-            // arrays, so no stop-the-world rewrite is required.
+            // writes to the versioned tree wire form. v2 -> v3 adds an empty
+            // xattr database. All are additive; no row rewrite is required.
             meta.put(&mut wtxn, KEY_META_SCHEMA_VERSION, &u32_bytes(migration.to))
                 .map_err(|e| FluxError::Meta(e.to_string()))?;
         }
@@ -172,6 +183,7 @@ impl HeedMetaStore {
                 ctime_ms: now,
                 atime_ms: now,
                 link_count: 2,
+                symlink_target: None,
                 generation: 1,
                 head_gen: DataGen(1),
                 ufs_gen: DataGen(0),
@@ -212,6 +224,7 @@ impl HeedMetaStore {
             dentries,
             meta,
             manifests,
+            xattrs,
             client_requests,
             write_lock: Mutex::new(()),
         })
@@ -429,6 +442,26 @@ impl HeedMetaStore {
                         Err(e) => MetaRaftResponse::Err(e),
                     }
                 }
+                MetaRaftRequest::Symlink {
+                    parent,
+                    name,
+                    target,
+                    uid,
+                    gid,
+                    expected_parent_generation,
+                    ..
+                } => match self.symlink_in_txn(
+                    &mut wtxn,
+                    *expected_parent_generation,
+                    *parent,
+                    name,
+                    target,
+                    *uid,
+                    *gid,
+                ) {
+                    Ok(inode) => MetaRaftResponse::Inode(Box::new(inode)),
+                    Err(e) => MetaRaftResponse::Err(e),
+                },
                 MetaRaftRequest::PutInode { inode, .. } => {
                     match put_inode_raw(&self.inodes, &mut wtxn, inode.as_ref()) {
                         Ok(()) => MetaRaftResponse::Empty,
@@ -650,6 +683,51 @@ impl HeedMetaStore {
                     match self.unlink_in_txn(&mut wtxn, *expected_parent_generation, *parent, name)
                     {
                         Ok(()) => MetaRaftResponse::Empty,
+                        Err(e) => MetaRaftResponse::Err(e),
+                    }
+                }
+                MetaRaftRequest::Link {
+                    inode,
+                    new_parent,
+                    new_name,
+                    expected_new_parent_generation,
+                    ..
+                } => match self.link_in_txn(
+                    &mut wtxn,
+                    *expected_new_parent_generation,
+                    *inode,
+                    *new_parent,
+                    new_name,
+                ) {
+                    Ok(inode) => MetaRaftResponse::Inode(Box::new(inode)),
+                    Err(e) => MetaRaftResponse::Err(e),
+                },
+                MetaRaftRequest::SetXattr {
+                    expected_generation,
+                    inode,
+                    name,
+                    value,
+                    mode,
+                    ..
+                } => match self.set_xattr_in_txn(
+                    &mut wtxn,
+                    *expected_generation,
+                    *inode,
+                    name,
+                    value,
+                    *mode,
+                ) {
+                    Ok(inode) => MetaRaftResponse::Inode(Box::new(inode)),
+                    Err(e) => MetaRaftResponse::Err(e),
+                },
+                MetaRaftRequest::RemoveXattr {
+                    expected_generation,
+                    inode,
+                    name,
+                    ..
+                } => {
+                    match self.remove_xattr_in_txn(&mut wtxn, *expected_generation, *inode, name) {
+                        Ok(inode) => MetaRaftResponse::Inode(Box::new(inode)),
                         Err(e) => MetaRaftResponse::Err(e),
                     }
                 }
@@ -893,6 +971,16 @@ impl HeedMetaStore {
                 serde_json::from_slice(v).map_err(|e| FluxError::Meta(e.to_string()))?;
             manifests.push((id, manifest));
         }
+        let mut xattrs = Vec::new();
+        let xiter = self
+            .xattrs
+            .iter(&rtxn)
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        for item in xiter {
+            let (key, value) = item.map_err(|e| FluxError::Meta(e.to_string()))?;
+            let (inode, name) = parse_xattr_key(key)?;
+            xattrs.push((inode, name.to_string(), value.to_vec()));
+        }
         let next_inode = u64_from_bytes(
             self.meta
                 .get(&rtxn, "next_inode")
@@ -924,6 +1012,7 @@ impl HeedMetaStore {
             inodes,
             dentries,
             manifests,
+            xattrs,
             next_inode,
             next_manifest,
             sm: sm.clone(),
@@ -958,6 +1047,20 @@ impl HeedMetaStore {
             for k in keys {
                 self.inodes
                     .delete(&mut wtxn, &k)
+                    .map_err(|e| FluxError::Meta(e.to_string()))?;
+            }
+        }
+        {
+            let keys: Vec<String> = self
+                .xattrs
+                .iter(&wtxn)
+                .map_err(|e| FluxError::Meta(e.to_string()))?
+                .map(|i| i.map(|(k, _)| k.to_string()))
+                .collect::<std::result::Result<_, _>>()
+                .map_err(|e| FluxError::Meta(e.to_string()))?;
+            for key in keys {
+                self.xattrs
+                    .delete(&mut wtxn, &key)
                     .map_err(|e| FluxError::Meta(e.to_string()))?;
             }
         }
@@ -1006,6 +1109,11 @@ impl HeedMetaStore {
             let bytes = serde_json::to_vec(manifest).map_err(|e| FluxError::Meta(e.to_string()))?;
             self.manifests
                 .put(&mut wtxn, &inode_key(*id), &bytes)
+                .map_err(|e| FluxError::Meta(e.to_string()))?;
+        }
+        for (inode, name, value) in &snap.xattrs {
+            self.xattrs
+                .put(&mut wtxn, &xattr_key(*inode, name), value)
                 .map_err(|e| FluxError::Meta(e.to_string()))?;
         }
         {
@@ -1153,6 +1261,23 @@ impl HeedMetaStore {
             )?;
         }
 
+        let xiter = self
+            .xattrs
+            .iter(&rtxn)
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        for item in xiter {
+            let (key, value) = item.map_err(|e| FluxError::Meta(e.to_string()))?;
+            let (inode, name) = parse_xattr_key(key)?;
+            write_record(
+                &mut file,
+                &SnapshotRecord::Xattr {
+                    inode,
+                    name: name.to_string(),
+                    value: value.to_vec(),
+                },
+            )?;
+        }
+
         let riter = self
             .client_requests
             .iter(&rtxn)
@@ -1251,6 +1376,20 @@ impl HeedMetaStore {
             }
         }
         {
+            let keys: Vec<String> = self
+                .xattrs
+                .iter(&wtxn)
+                .map_err(|e| FluxError::Meta(e.to_string()))?
+                .map(|i| i.map(|(k, _)| k.to_string()))
+                .collect::<std::result::Result<_, _>>()
+                .map_err(|e| FluxError::Meta(e.to_string()))?;
+            for key in keys {
+                self.xattrs
+                    .delete(&mut wtxn, &key)
+                    .map_err(|e| FluxError::Meta(e.to_string()))?;
+            }
+        }
+        {
             let keys: Vec<Vec<u8>> = self
                 .manifests
                 .iter(&wtxn)
@@ -1331,6 +1470,11 @@ impl HeedMetaStore {
                         .map_err(|e| FluxError::Meta(e.to_string()))?;
                     self.manifests
                         .put(&mut wtxn, &inode_key(id), &bytes)
+                        .map_err(|e| FluxError::Meta(e.to_string()))?;
+                }
+                SnapshotRecord::Xattr { inode, name, value } => {
+                    self.xattrs
+                        .put(&mut wtxn, &xattr_key(inode, &name), &value)
                         .map_err(|e| FluxError::Meta(e.to_string()))?;
                 }
                 SnapshotRecord::ClientRequest {
@@ -1425,6 +1569,66 @@ impl HeedMetaStore {
         uid: u32,
         gid: u32,
     ) -> Result<Inode> {
+        self.create_node_in_txn(
+            wtxn,
+            expected_parent_generation,
+            parent,
+            name,
+            file_type,
+            mode,
+            uid,
+            gid,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn symlink_in_txn(
+        &self,
+        wtxn: &mut heed::RwTxn,
+        expected_parent_generation: Option<u64>,
+        parent: InodeId,
+        name: &str,
+        target: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Inode> {
+        if target.is_empty() || target.as_bytes().contains(&0) {
+            return Err(FluxError::InvalidArg(
+                "invalid empty/NUL symlink target".into(),
+            ));
+        }
+        if target.len() > 4096 {
+            return Err(FluxError::InvalidArg(
+                "symlink target exceeds PATH_MAX=4096".into(),
+            ));
+        }
+        self.create_node_in_txn(
+            wtxn,
+            expected_parent_generation,
+            parent,
+            name,
+            FileType::Symlink,
+            0o777,
+            uid,
+            gid,
+            Some(target),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_node_in_txn(
+        &self,
+        wtxn: &mut heed::RwTxn,
+        expected_parent_generation: Option<u64>,
+        parent: InodeId,
+        name: &str,
+        file_type: FileType,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        symlink_target: Option<&str>,
+    ) -> Result<Inode> {
         if name.is_empty() || name.contains('/') || name == "." || name == ".." {
             return Err(FluxError::InvalidArg(format!("bad name: {name}")));
         }
@@ -1438,6 +1642,11 @@ impl HeedMetaStore {
         }
         // CAS + bump parent before allocating child so failed CAS leaves no orphan id.
         self.load_and_bump_parent_dir(wtxn, parent, expected_parent_generation)?;
+        let inherited_default_acl = self
+            .xattrs
+            .get(wtxn, &xattr_key(parent, "system.posix_acl_default"))
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+            .map(ToOwned::to_owned);
         let id = self.alloc_inode(wtxn)?;
         let now = now_ms();
         let inode = Inode {
@@ -1446,7 +1655,7 @@ impl HeedMetaStore {
             mode,
             uid,
             gid,
-            size: 0,
+            size: symlink_target.map_or(0, |target| target.len() as u64),
             mtime_ms: now,
             ctime_ms: now,
             atime_ms: now,
@@ -1455,6 +1664,7 @@ impl HeedMetaStore {
             } else {
                 1
             },
+            symlink_target: symlink_target.map(str::to_string),
             generation: 1,
             head_gen: DataGen(1),
             ufs_gen: DataGen(0),
@@ -1476,6 +1686,142 @@ impl HeedMetaStore {
         self.dentries
             .put(wtxn, &dentry_key(parent, name), &u64_bytes(id))
             .map_err(|e| FluxError::Meta(e.to_string()))?;
+        if let Some(acl) = inherited_default_acl {
+            self.xattrs
+                .put(wtxn, &xattr_key(id, "system.posix_acl_access"), &acl)
+                .map_err(|e| FluxError::Meta(e.to_string()))?;
+            if file_type == FileType::Directory {
+                self.xattrs
+                    .put(wtxn, &xattr_key(id, "system.posix_acl_default"), &acl)
+                    .map_err(|e| FluxError::Meta(e.to_string()))?;
+            }
+        }
+        Ok(inode)
+    }
+
+    fn link_in_txn(
+        &self,
+        wtxn: &mut heed::RwTxn,
+        expected_new_parent_generation: Option<u64>,
+        inode: InodeId,
+        new_parent: InodeId,
+        new_name: &str,
+    ) -> Result<Inode> {
+        validate_dentry_name(new_name)?;
+        if self
+            .dentries
+            .get(wtxn, &dentry_key(new_parent, new_name))
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+            .is_some()
+        {
+            return Err(FluxError::AlreadyExists);
+        }
+        let mut source = get_inode_raw(&self.inodes, wtxn, inode)?;
+        if source.file_type == FileType::Directory {
+            return Err(FluxError::NotPermitted);
+        }
+        if source.link_count == 0 {
+            return Err(FluxError::NotFound);
+        }
+        self.load_and_bump_parent_dir(wtxn, new_parent, expected_new_parent_generation)?;
+        source.link_count = source
+            .link_count
+            .checked_add(1)
+            .ok_or_else(|| FluxError::InvalidArg("inode link count overflow".into()))?;
+        source.generation = source.generation.saturating_add(1);
+        source.ctime_ms = now_ms();
+        put_inode_raw(&self.inodes, wtxn, &source)?;
+        self.dentries
+            .put(
+                wtxn,
+                &dentry_key(new_parent, new_name),
+                &u64_bytes(source.id),
+            )
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        Ok(source)
+    }
+
+    fn set_xattr_in_txn(
+        &self,
+        wtxn: &mut heed::RwTxn,
+        expected_generation: u64,
+        inode_id: InodeId,
+        name: &str,
+        value: &[u8],
+        mode: XattrSetMode,
+    ) -> Result<Inode> {
+        let mut inode = get_inode_raw(&self.inodes, wtxn, inode_id)?;
+        check_generation(&inode, expected_generation)?;
+        validate_xattr(&inode, name, value)?;
+
+        let key = xattr_key(inode_id, name);
+        let existing = self
+            .xattrs
+            .get(wtxn, &key)
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+            .map(ToOwned::to_owned);
+        match (mode, existing.is_some()) {
+            (XattrSetMode::Create, true) => return Err(FluxError::AlreadyExists),
+            (XattrSetMode::Replace, false) => return Err(FluxError::NoData),
+            _ => {}
+        }
+
+        let mut count = 0_usize;
+        let mut total = 0_usize;
+        let iter = self
+            .xattrs
+            .prefix_iter(wtxn, &xattr_prefix(inode_id))
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        for item in iter {
+            let (_, current) = item.map_err(|e| FluxError::Meta(e.to_string()))?;
+            count = count.saturating_add(1);
+            total = total.saturating_add(current.len());
+        }
+        if existing.is_none() && count >= XATTR_COUNT_MAX {
+            return Err(FluxError::NoSpace);
+        }
+        let next_total = total
+            .saturating_sub(existing.as_ref().map_or(0, Vec::len))
+            .saturating_add(value.len());
+        if next_total > XATTR_TOTAL_MAX {
+            return Err(FluxError::NoSpace);
+        }
+
+        inode.generation = inode
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| FluxError::InvalidArg("inode generation overflow".into()))?;
+        inode.ctime_ms = now_ms();
+        self.xattrs
+            .put(wtxn, &key, value)
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        put_inode_raw(&self.inodes, wtxn, &inode)?;
+        Ok(inode)
+    }
+
+    fn remove_xattr_in_txn(
+        &self,
+        wtxn: &mut heed::RwTxn,
+        expected_generation: u64,
+        inode_id: InodeId,
+        name: &str,
+    ) -> Result<Inode> {
+        validate_xattr_name(name)?;
+        let mut inode = get_inode_raw(&self.inodes, wtxn, inode_id)?;
+        check_generation(&inode, expected_generation)?;
+        let removed = self
+            .xattrs
+            .delete(wtxn, &xattr_key(inode_id, name))
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        if !removed {
+            return Err(FluxError::NoData);
+        }
+        inode.generation = inode
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| FluxError::InvalidArg("inode generation overflow".into()))?;
+        inode.ctime_ms = now_ms();
+        put_inode_raw(&self.inodes, wtxn, &inode)?;
         Ok(inode)
     }
 
@@ -1613,6 +1959,7 @@ impl HeedMetaStore {
             || current.file_type != inode.file_type
             || current.size != inode.size
             || current.link_count != inode.link_count
+            || current.symlink_target != inode.symlink_target
             || current.head_gen != inode.head_gen
             || current.ufs_gen != inode.ufs_gen
             || current.ufs_base_version != inode.ufs_base_version
@@ -1880,16 +2227,17 @@ impl HeedMetaStore {
         }
         if let Some(destination_id) = destination {
             let destination_inode = get_inode_raw(&self.inodes, wtxn, destination_id)?;
-            match (source.file_type, destination_inode.file_type) {
-                (FileType::Directory, FileType::Regular) => {
+            match (
+                source.file_type == FileType::Directory,
+                destination_inode.file_type == FileType::Directory,
+            ) {
+                (true, false) => {
                     return Err(FluxError::NotDirectory);
                 }
-                (FileType::Regular, FileType::Directory) => {
+                (false, true) => {
                     return Err(FluxError::IsDirectory);
                 }
-                (FileType::Directory, FileType::Directory)
-                    if self.directory_has_children_in_txn(wtxn, destination_id)? =>
-                {
+                (true, true) if self.directory_has_children_in_txn(wtxn, destination_id)? => {
                     return Err(FluxError::NotEmpty);
                 }
                 _ => {}
@@ -1997,6 +2345,18 @@ impl HeedMetaStore {
             if reservation.inode == child_id {
                 self.abort_reservation_in_txn(wtxn, reservation.ticket)?;
             }
+        }
+        let xattr_keys = self
+            .xattrs
+            .prefix_iter(wtxn, &xattr_prefix(child_id))
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+            .map(|item| item.map(|(key, _)| key.to_string()))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        for key in xattr_keys {
+            self.xattrs
+                .delete(wtxn, &key)
+                .map_err(|e| FluxError::Meta(e.to_string()))?;
         }
         self.inodes
             .delete(wtxn, &inode_key(child_id))
@@ -2582,6 +2942,28 @@ impl MetaStore for HeedMetaStore {
         })
     }
 
+    fn symlink_cas(
+        &self,
+        expected_parent_generation: Option<u64>,
+        parent: InodeId,
+        name: &str,
+        target: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Inode> {
+        self.with_write_txn(|store, wtxn| {
+            store.symlink_in_txn(
+                wtxn,
+                expected_parent_generation,
+                parent,
+                name,
+                target,
+                uid,
+                gid,
+            )
+        })
+    }
+
     fn readdir(&self, dir: InodeId) -> Result<Vec<Dentry>> {
         let rtxn = self
             .env
@@ -3033,6 +3415,89 @@ impl MetaStore for HeedMetaStore {
         })
     }
 
+    fn link_cas(
+        &self,
+        expected_new_parent_generation: Option<u64>,
+        inode: InodeId,
+        new_parent: InodeId,
+        new_name: &str,
+    ) -> Result<Inode> {
+        self.with_write_txn(|store, wtxn| {
+            store.link_in_txn(
+                wtxn,
+                expected_new_parent_generation,
+                inode,
+                new_parent,
+                new_name,
+            )
+        })
+    }
+
+    fn get_xattr(&self, inode: InodeId, name: &str) -> Result<Vec<u8>> {
+        validate_xattr_name(name)?;
+        let rtxn = self
+            .env
+            .read_txn()
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        let _ = self
+            .inodes
+            .get(&rtxn, &inode_key(inode))
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+            .ok_or(FluxError::NotFound)?;
+        self.xattrs
+            .get(&rtxn, &xattr_key(inode, name))
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+            .map(ToOwned::to_owned)
+            .ok_or(FluxError::NoData)
+    }
+
+    fn list_xattrs(&self, inode: InodeId) -> Result<Vec<String>> {
+        let rtxn = self
+            .env
+            .read_txn()
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        let _ = self
+            .inodes
+            .get(&rtxn, &inode_key(inode))
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+            .ok_or(FluxError::NotFound)?;
+        let mut names = Vec::new();
+        let iter = self
+            .xattrs
+            .prefix_iter(&rtxn, &xattr_prefix(inode))
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        for item in iter {
+            let (key, _) = item.map_err(|e| FluxError::Meta(e.to_string()))?;
+            let (_, name) = parse_xattr_key(key)?;
+            names.push(name.to_string());
+        }
+        Ok(names)
+    }
+
+    fn set_xattr_cas(
+        &self,
+        expected_generation: u64,
+        inode: InodeId,
+        name: &str,
+        value: &[u8],
+        mode: XattrSetMode,
+    ) -> Result<Inode> {
+        self.with_write_txn(|store, wtxn| {
+            store.set_xattr_in_txn(wtxn, expected_generation, inode, name, value, mode)
+        })
+    }
+
+    fn remove_xattr_cas(
+        &self,
+        expected_generation: u64,
+        inode: InodeId,
+        name: &str,
+    ) -> Result<Inode> {
+        self.with_write_txn(|store, wtxn| {
+            store.remove_xattr_in_txn(wtxn, expected_generation, inode, name)
+        })
+    }
+
     fn rename_cas(
         &self,
         expected_old_parent_generation: Option<u64>,
@@ -3106,6 +3571,81 @@ fn dentry_key(parent: InodeId, name: &str) -> String {
 
 fn dentry_prefix(parent: InodeId) -> String {
     format!("{parent:016x}\0")
+}
+
+fn xattr_key(inode: InodeId, name: &str) -> String {
+    format!("{}{name}", xattr_prefix(inode))
+}
+
+fn xattr_prefix(inode: InodeId) -> String {
+    format!("{inode:016x}\0")
+}
+
+fn parse_xattr_key(key: &str) -> Result<(InodeId, &str)> {
+    let (inode_hex, name) = key
+        .split_once('\0')
+        .ok_or_else(|| FluxError::Meta("bad xattr key".into()))?;
+    let inode =
+        u64::from_str_radix(inode_hex, 16).map_err(|error| FluxError::Meta(error.to_string()))?;
+    Ok((inode, name))
+}
+
+fn validate_xattr_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 255 || name.as_bytes().contains(&0) {
+        return Err(FluxError::InvalidArg("invalid xattr name".into()));
+    }
+    if !["user.", "trusted.", "security.", "system."]
+        .iter()
+        .any(|prefix| name.starts_with(prefix) && name.len() > prefix.len())
+    {
+        return Err(FluxError::InvalidArg(
+            "xattr name must use user/trusted/security/system namespace".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_xattr(inode: &Inode, name: &str, value: &[u8]) -> Result<()> {
+    validate_xattr_name(name)?;
+    if value.len() > XATTR_VALUE_MAX {
+        return Err(FluxError::NoSpace);
+    }
+    if matches!(name, "system.posix_acl_access" | "system.posix_acl_default") {
+        if inode.file_type == FileType::Symlink {
+            return Err(FluxError::InvalidArg(
+                "POSIX ACL xattrs are not supported on symlinks".into(),
+            ));
+        }
+        if name == "system.posix_acl_default" && inode.file_type != FileType::Directory {
+            return Err(FluxError::InvalidArg(
+                "default POSIX ACL requires a directory".into(),
+            ));
+        }
+        validate_posix_acl_ea(value)?;
+    }
+    Ok(())
+}
+
+fn validate_posix_acl_ea(value: &[u8]) -> Result<()> {
+    const ACL_EA_VERSION: u32 = 2;
+    const ACL_TAGS: [u16; 6] = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20];
+    if value.len() < 4 || !(value.len() - 4).is_multiple_of(8) {
+        return Err(FluxError::InvalidArg("malformed POSIX ACL xattr".into()));
+    }
+    let version = u32::from_le_bytes(value[0..4].try_into().expect("four-byte header"));
+    if version != ACL_EA_VERSION {
+        return Err(FluxError::InvalidArg(format!(
+            "unsupported POSIX ACL xattr version {version}"
+        )));
+    }
+    for entry in value[4..].chunks_exact(8) {
+        let tag = u16::from_le_bytes(entry[0..2].try_into().expect("two-byte tag"));
+        let perm = u16::from_le_bytes(entry[2..4].try_into().expect("two-byte perm"));
+        if !ACL_TAGS.contains(&tag) || perm & !0o7 != 0 {
+            return Err(FluxError::InvalidArg("invalid POSIX ACL entry".into()));
+        }
+    }
+    Ok(())
 }
 
 fn validate_dentry_name(name: &str) -> Result<()> {
@@ -3255,7 +3795,10 @@ mod tests {
         drop(store);
 
         let upgraded = HeedMetaStore::open(dir.path()).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 2);
+        assert_eq!(
+            upgraded.schema_version().unwrap(),
+            CURRENT_META_SCHEMA_VERSION
+        );
         assert_eq!(upgraded.get_manifest(id).unwrap(), manifest);
     }
 
@@ -3761,6 +4304,7 @@ mod tests {
             ctime_ms: now,
             atime_ms: now,
             link_count: 1,
+            symlink_target: None,
             generation: 1,
             head_gen: DataGen(0),
             ufs_gen: DataGen(0),
@@ -3818,6 +4362,7 @@ mod tests {
             ctime_ms: now,
             atime_ms: now,
             link_count: 2,
+            symlink_target: None,
             generation: 1,
             head_gen: DataGen(0),
             ufs_gen: DataGen(0),
@@ -3870,6 +4415,7 @@ mod tests {
             ctime_ms: now,
             atime_ms: now,
             link_count: 1,
+            symlink_target: None,
             generation: 1,
             head_gen: DataGen(0),
             ufs_gen: DataGen(0),
@@ -3983,6 +4529,245 @@ mod tests {
     }
 
     #[test]
+    fn hardlink_updates_nlink_and_keeps_inode_until_last_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HeedMetaStore::open(dir.path()).unwrap();
+        let file = store
+            .create(ROOT_INODE, "source", FileType::Regular, 0o640, 7, 8)
+            .unwrap();
+        let linked = store.link(file.id, ROOT_INODE, "alias").unwrap();
+        assert_eq!(linked.id, file.id);
+        assert_eq!(linked.link_count, 2);
+        assert_eq!(store.lookup(ROOT_INODE, "alias").unwrap().id, file.id);
+        assert_eq!(
+            store.link(file.id, ROOT_INODE, "alias").unwrap_err(),
+            FluxError::AlreadyExists
+        );
+        assert_eq!(
+            store.link(ROOT_INODE, ROOT_INODE, "root-link").unwrap_err(),
+            FluxError::NotPermitted
+        );
+
+        store.unlink(ROOT_INODE, "source").unwrap();
+        assert_eq!(
+            store.lookup(ROOT_INODE, "source").unwrap_err(),
+            FluxError::NotFound
+        );
+        assert_eq!(store.get_inode(file.id).unwrap().link_count, 1);
+        store.unlink(ROOT_INODE, "alias").unwrap();
+        assert_eq!(store.get_inode(file.id).unwrap_err(), FluxError::NotFound);
+    }
+
+    #[test]
+    fn symlink_is_inline_persistent_and_parent_cas_guarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HeedMetaStore::open(dir.path()).unwrap();
+        let root_generation = store.get_inode(ROOT_INODE).unwrap().generation;
+        let link = store
+            .symlink_cas(
+                Some(root_generation),
+                ROOT_INODE,
+                "link",
+                "dir/target",
+                11,
+                12,
+            )
+            .unwrap();
+        assert_eq!(link.file_type, FileType::Symlink);
+        assert_eq!(link.mode, 0o777);
+        assert_eq!(link.size, 10);
+        assert_eq!(link.symlink_target.as_deref(), Some("dir/target"));
+        assert_eq!(link.link_count, 1);
+        assert!(matches!(
+            store.symlink_cas(Some(root_generation), ROOT_INODE, "stale", "target", 0, 0,),
+            Err(FluxError::CasFailed { .. })
+        ));
+        assert!(matches!(
+            store.symlink(ROOT_INODE, "empty", "", 0, 0),
+            Err(FluxError::InvalidArg(_))
+        ));
+        drop(store);
+
+        let reopened = HeedMetaStore::open(dir.path()).unwrap();
+        let durable = reopened.lookup(ROOT_INODE, "link").unwrap();
+        assert_eq!(durable.id, link.id);
+        assert_eq!(durable.symlink_target.as_deref(), Some("dir/target"));
+    }
+
+    #[test]
+    fn xattr_crud_caps_acl_inheritance_and_snapshots_are_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HeedMetaStore::open(dir.path().join("source")).unwrap();
+        let file = store
+            .create(ROOT_INODE, "xattr-file", FileType::Regular, 0o640, 1, 2)
+            .unwrap();
+
+        let updated = store
+            .set_xattr(file.id, "user.note", b"alpha", XattrSetMode::Create)
+            .unwrap();
+        assert_eq!(updated.generation, file.generation + 1);
+        assert_eq!(store.get_xattr(file.id, "user.note").unwrap(), b"alpha");
+        assert_eq!(store.list_xattrs(file.id).unwrap(), vec!["user.note"]);
+        assert_eq!(
+            store
+                .set_xattr(file.id, "user.note", b"again", XattrSetMode::Create)
+                .unwrap_err(),
+            FluxError::AlreadyExists
+        );
+        assert_eq!(
+            store
+                .set_xattr(file.id, "user.missing", b"x", XattrSetMode::Replace)
+                .unwrap_err(),
+            FluxError::NoData
+        );
+        assert_eq!(
+            store
+                .set_xattr(
+                    file.id,
+                    "user.too-large",
+                    &vec![0; XATTR_VALUE_MAX + 1],
+                    XattrSetMode::Upsert,
+                )
+                .unwrap_err(),
+            FluxError::NoSpace
+        );
+        let cap_file = store
+            .create(ROOT_INODE, "xattr-cap", FileType::Regular, 0o600, 1, 2)
+            .unwrap();
+        for index in 0..XATTR_COUNT_MAX {
+            store
+                .set_xattr(
+                    cap_file.id,
+                    &format!("user.k{index}"),
+                    b"x",
+                    XattrSetMode::Create,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .set_xattr(cap_file.id, "user.overflow", b"x", XattrSetMode::Create,)
+                .unwrap_err(),
+            FluxError::NoSpace
+        );
+        let total_file = store
+            .create(ROOT_INODE, "xattr-total", FileType::Regular, 0o600, 1, 2)
+            .unwrap();
+        for index in 0..4 {
+            store
+                .set_xattr(
+                    total_file.id,
+                    &format!("user.block{index}"),
+                    &vec![index as u8; XATTR_VALUE_MAX],
+                    XattrSetMode::Create,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .set_xattr(
+                    total_file.id,
+                    "user.total-overflow",
+                    b"x",
+                    XattrSetMode::Create,
+                )
+                .unwrap_err(),
+            FluxError::NoSpace
+        );
+        assert!(matches!(
+            store.set_xattr_cas(
+                file.generation,
+                file.id,
+                "user.stale",
+                b"x",
+                XattrSetMode::Upsert,
+            ),
+            Err(FluxError::CasFailed { .. })
+        ));
+
+        let mut acl = 2_u32.to_le_bytes().to_vec();
+        for (tag, perm) in [(0x01_u16, 0o7_u16), (0x04, 0o5), (0x20, 0o5)] {
+            acl.extend_from_slice(&tag.to_le_bytes());
+            acl.extend_from_slice(&perm.to_le_bytes());
+            acl.extend_from_slice(&u32::MAX.to_le_bytes());
+        }
+        assert!(matches!(
+            store.set_xattr(
+                file.id,
+                "system.posix_acl_default",
+                &acl,
+                XattrSetMode::Upsert,
+            ),
+            Err(FluxError::InvalidArg(_))
+        ));
+        let parent = store
+            .create(ROOT_INODE, "acl-dir", FileType::Directory, 0o750, 1, 2)
+            .unwrap();
+        store
+            .set_xattr(
+                parent.id,
+                "system.posix_acl_default",
+                &acl,
+                XattrSetMode::Upsert,
+            )
+            .unwrap();
+        let child = store
+            .create(parent.id, "child", FileType::Regular, 0o640, 1, 2)
+            .unwrap();
+        assert_eq!(
+            store
+                .get_xattr(child.id, "system.posix_acl_access")
+                .unwrap(),
+            acl
+        );
+        let child_dir = store
+            .create(parent.id, "child-dir", FileType::Directory, 0o750, 1, 2)
+            .unwrap();
+        assert_eq!(
+            store
+                .get_xattr(child_dir.id, "system.posix_acl_access")
+                .unwrap(),
+            acl
+        );
+        assert_eq!(
+            store
+                .get_xattr(child_dir.id, "system.posix_acl_default")
+                .unwrap(),
+            acl
+        );
+
+        let snapshot = store.export_snapshot(&SmAppliedMeta::default()).unwrap();
+        let restored = HeedMetaStore::open(dir.path().join("restored")).unwrap();
+        restored.install_snapshot_data(&snapshot).unwrap();
+        assert_eq!(restored.get_xattr(file.id, "user.note").unwrap(), b"alpha");
+        assert_eq!(
+            restored
+                .get_xattr(child.id, "system.posix_acl_access")
+                .unwrap(),
+            acl
+        );
+
+        let snapshot_path = dir.path().join("snapshot.bin");
+        store
+            .export_snapshot_to_path(&SmAppliedMeta::default(), &snapshot_path)
+            .unwrap();
+        let streamed = HeedMetaStore::open(dir.path().join("streamed")).unwrap();
+        let mut snapshot_file = std::fs::File::open(snapshot_path).unwrap();
+        streamed
+            .install_snapshot_from_reader(&mut snapshot_file)
+            .unwrap();
+        assert_eq!(streamed.get_xattr(file.id, "user.note").unwrap(), b"alpha");
+
+        let current = store.get_inode(file.id).unwrap();
+        let removed = store.remove_xattr(file.id, "user.note").unwrap();
+        assert_eq!(removed.generation, current.generation + 1);
+        assert_eq!(
+            store.get_xattr(file.id, "user.note").unwrap_err(),
+            FluxError::NoData
+        );
+    }
+
+    #[test]
     fn unlink_drops_inode_so_gc_can_reclaim_chunks() {
         let dir = tempfile::tempdir().unwrap();
         let store = HeedMetaStore::open(dir.path()).unwrap();
@@ -4065,6 +4850,52 @@ mod tests {
             FluxError::NotFound
         );
         assert_eq!(store.lookup(right.id, "moved").unwrap().id, file.id);
+
+        let symlink = store
+            .symlink(right.id, "link-source", "target", 0, 0)
+            .unwrap();
+        let empty_dir = store
+            .create(right.id, "empty-dir", FileType::Directory, 0o755, 0, 0)
+            .unwrap();
+        assert_eq!(
+            store
+                .rename(right.id, "link-source", right.id, "empty-dir", false)
+                .unwrap_err(),
+            FluxError::IsDirectory
+        );
+        assert_eq!(
+            store.lookup(right.id, "link-source").unwrap().id,
+            symlink.id
+        );
+        assert_eq!(
+            store.lookup(right.id, "empty-dir").unwrap().id,
+            empty_dir.id
+        );
+
+        let dir_source = store
+            .create(right.id, "dir-source", FileType::Directory, 0o755, 0, 0)
+            .unwrap();
+        let link_destination = store
+            .symlink(right.id, "link-destination", "target", 0, 0)
+            .unwrap();
+        assert_eq!(
+            store
+                .rename(right.id, "dir-source", right.id, "link-destination", false,)
+                .unwrap_err(),
+            FluxError::NotDirectory
+        );
+        assert_eq!(
+            store.lookup(right.id, "dir-source").unwrap().id,
+            dir_source.id
+        );
+        assert_eq!(
+            store.lookup(right.id, "link-destination").unwrap().id,
+            link_destination.id
+        );
+        store.unlink(right.id, "link-source").unwrap();
+        store.rmdir(right.id, "empty-dir").unwrap();
+        store.rmdir(right.id, "dir-source").unwrap();
+        store.unlink(right.id, "link-destination").unwrap();
 
         let replacement = store
             .create(right.id, "replacement", FileType::Regular, 0o600, 0, 0)
@@ -4162,6 +4993,150 @@ mod tests {
             .unwrap();
         assert_eq!(store.get_inode(left.id).unwrap().generation, left_gen + 1);
         assert_eq!(store.get_inode(right.id).unwrap().generation, right_gen + 1);
+    }
+
+    #[test]
+    fn rename_symlink_type_matrix_matches_non_directory_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HeedMetaStore::open(dir.path()).unwrap();
+
+        let link_to_dir = store.symlink(ROOT_INODE, "link-to-dir", "x", 0, 0).unwrap();
+        let destination_dir = store
+            .create(
+                ROOT_INODE,
+                "destination-dir",
+                FileType::Directory,
+                0o755,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .rename(
+                    ROOT_INODE,
+                    "link-to-dir",
+                    ROOT_INODE,
+                    "destination-dir",
+                    false,
+                )
+                .unwrap_err(),
+            FluxError::IsDirectory
+        );
+        assert_eq!(
+            store.lookup(ROOT_INODE, "link-to-dir").unwrap().id,
+            link_to_dir.id
+        );
+        assert_eq!(
+            store.lookup(ROOT_INODE, "destination-dir").unwrap().id,
+            destination_dir.id
+        );
+
+        let link_to_regular = store
+            .symlink(ROOT_INODE, "link-to-regular", "target", 0, 0)
+            .unwrap();
+        let replaced_regular = store
+            .create(
+                ROOT_INODE,
+                "regular-destination",
+                FileType::Regular,
+                0o600,
+                0,
+                0,
+            )
+            .unwrap();
+        let renamed = store
+            .rename(
+                ROOT_INODE,
+                "link-to-regular",
+                ROOT_INODE,
+                "regular-destination",
+                false,
+            )
+            .unwrap();
+        assert_eq!(renamed.id, link_to_regular.id);
+        assert_eq!(renamed.file_type, FileType::Symlink);
+        assert_eq!(
+            store.get_inode(replaced_regular.id).unwrap_err(),
+            FluxError::NotFound
+        );
+
+        let link_to_link = store.symlink(ROOT_INODE, "link-source", "a", 0, 0).unwrap();
+        let replaced_link = store
+            .symlink(ROOT_INODE, "link-destination", "b", 0, 0)
+            .unwrap();
+        assert_eq!(
+            store
+                .rename(
+                    ROOT_INODE,
+                    "link-source",
+                    ROOT_INODE,
+                    "link-destination",
+                    false,
+                )
+                .unwrap()
+                .id,
+            link_to_link.id
+        );
+        assert_eq!(
+            store.get_inode(replaced_link.id).unwrap_err(),
+            FluxError::NotFound
+        );
+
+        let directory_source = store
+            .create(
+                ROOT_INODE,
+                "directory-source",
+                FileType::Directory,
+                0o755,
+                0,
+                0,
+            )
+            .unwrap();
+        let link_destination = store
+            .symlink(ROOT_INODE, "symlink-destination", "target", 0, 0)
+            .unwrap();
+        assert_eq!(
+            store
+                .rename(
+                    ROOT_INODE,
+                    "directory-source",
+                    ROOT_INODE,
+                    "symlink-destination",
+                    false,
+                )
+                .unwrap_err(),
+            FluxError::NotDirectory
+        );
+        assert_eq!(
+            store.lookup(ROOT_INODE, "directory-source").unwrap().id,
+            directory_source.id
+        );
+        assert_eq!(
+            store.lookup(ROOT_INODE, "symlink-destination").unwrap().id,
+            link_destination.id
+        );
+
+        let regular_source = store
+            .create(ROOT_INODE, "regular-source", FileType::Regular, 0o600, 0, 0)
+            .unwrap();
+        assert_eq!(
+            store
+                .rename(
+                    ROOT_INODE,
+                    "regular-source",
+                    ROOT_INODE,
+                    "symlink-destination",
+                    false,
+                )
+                .unwrap()
+                .id,
+            regular_source.id
+        );
+        assert_eq!(
+            store.get_inode(link_destination.id).unwrap_err(),
+            FluxError::NotFound
+        );
     }
 
     #[test]

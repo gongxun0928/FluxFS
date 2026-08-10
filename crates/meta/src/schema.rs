@@ -4,8 +4,9 @@ use fluxfs_types::{FluxError, Result};
 ///
 /// Version zero is the legacy, unmarked alpha layout. Version one adds the
 /// durable marker; version two writes versioned ordered extent trees while
-/// retaining a reader for legacy manifest arrays.
-pub const CURRENT_META_SCHEMA_VERSION: u32 = 2;
+/// retaining a reader for legacy manifest arrays; version three adds the
+/// durable xattr side table used by POSIX ACL storage.
+pub const CURRENT_META_SCHEMA_VERSION: u32 = 3;
 pub const LEGACY_UNMARKED_SCHEMA_VERSION: u32 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,7 +16,7 @@ pub struct MetaMigration {
     pub name: &'static str,
 }
 
-const MIGRATIONS: [MetaMigration; 2] = [
+const MIGRATIONS: [MetaMigration; 3] = [
     MetaMigration {
         from: LEGACY_UNMARKED_SCHEMA_VERSION,
         to: 1,
@@ -25,6 +26,11 @@ const MIGRATIONS: [MetaMigration; 2] = [
         from: 1,
         to: 2,
         name: "enable versioned ordered extent-tree manifests",
+    },
+    MetaMigration {
+        from: 2,
+        to: 3,
+        name: "add durable xattr side table",
     },
 ];
 
@@ -64,10 +70,14 @@ mod tests {
 
     #[test]
     fn migration_path_is_explicit_and_rejects_downgrade() {
-        assert_eq!(migration_path(0, 2).unwrap(), MIGRATIONS);
-        assert_eq!(migration_path(1, 2).unwrap(), vec![MIGRATIONS[1]]);
-        assert!(migration_path(2, 2).unwrap().is_empty());
-        assert!(migration_path(3, 2)
+        assert_eq!(migration_path(0, 3).unwrap(), MIGRATIONS);
+        assert_eq!(
+            migration_path(1, 3).unwrap(),
+            vec![MIGRATIONS[1], MIGRATIONS[2]]
+        );
+        assert_eq!(migration_path(2, 3).unwrap(), vec![MIGRATIONS[2]]);
+        assert!(migration_path(3, 3).unwrap().is_empty());
+        assert!(migration_path(4, 3)
             .unwrap_err()
             .to_string()
             .contains("newer"));

@@ -233,6 +233,14 @@ than a capability claimed by the current implementation.
 - Directory-cycle validation for rename scans the moved subtree inside the
   atomic metadata transaction; very large directory trees need an indexed or
   otherwise bounded ancestry design before production scale.
-- Remaining POSIX scope (including links, xattrs, locking, open-unlink lifetime,
-  and permission enforcement), multi-machine chaos/soak, operational upgrades/DR, complete
-  capacity control, and positional/async local I/O remain production work.
+- Managed namespace hard links and symbolic links are supported end to end.
+  Extended attributes use a durable side table (64 KiB/value, 64/inode,
+  256 KiB total/inode), and Linux POSIX ACL blobs round-trip and inherit as
+  `system.posix_acl_access/default`. ACL permission enforcement is deliberately
+  not claimed until FluxFS has an authenticated UID/GID identity model.
+- Remaining POSIX scope includes locking, mmap coherence, open-unlink lifetime,
+  and permission enforcement. Multi-machine chaos/soak, operational upgrades/DR,
+  complete capacity control, and positional/async local I/O also remain production work.
+- Open-unlink lifetime is not yet guaranteed: final-name unlink currently reaps
+  the inode. Durable session references versus daemon-local grace collection is
+  an explicit performance/correctness decision, not a completed capability.

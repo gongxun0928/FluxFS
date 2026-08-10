@@ -14,20 +14,24 @@ use fluxfs_proto::meta::v1::{
     ExpireChunkReservationsResponse, FailFlushConflictRequest, FailFlushConflictResponse,
     FinalizeGcTombstonesRequest, FinalizeGcTombstonesResponse, FinishGcRequest, FinishGcResponse,
     GetInodeRequest, GetInodeResponse, GetManifestRequest, GetManifestResponse,
-    GetWorkerMembershipRequest, ImportExternalRequest, ImportExternalResponse,
-    InitializeGcDeleteTargetsRequest, InitializeGcDeleteTargetsResponse, ListFlushIntentsRequest,
-    ListFlushIntentsResponse, ListGcTombstonesRequest, ListGcTombstonesResponse, LookupRequest,
-    LookupResponse, PingRequest, PingResponse, PutInodeCasRequest, PutInodeCasResponse,
-    PutInodeRequest, PutInodeResponse, PutManifestRequest, PutManifestResponse, ReaddirRequest,
-    ReaddirResponse, RegisterWorkerRequest, RenameRequest, RenameResponse, ReserveChunksRequest,
-    ReserveChunksResponse, RmdirRequest, RmdirResponse, TombstoneGcBatchRequest,
-    TombstoneGcBatchResponse, UnlinkRequest, UnlinkResponse, WorkerMembershipResponse,
+    GetWorkerMembershipRequest, GetXattrRequest, GetXattrResponse, ImportExternalRequest,
+    ImportExternalResponse, InitializeGcDeleteTargetsRequest, InitializeGcDeleteTargetsResponse,
+    LinkRequest, LinkResponse, ListFlushIntentsRequest, ListFlushIntentsResponse,
+    ListGcTombstonesRequest, ListGcTombstonesResponse, ListXattrsRequest, ListXattrsResponse,
+    LookupRequest, LookupResponse, PingRequest, PingResponse, PutInodeCasRequest,
+    PutInodeCasResponse, PutInodeRequest, PutInodeResponse, PutManifestRequest,
+    PutManifestResponse, ReaddirRequest, ReaddirResponse, RegisterWorkerRequest,
+    RemoveXattrRequest, RemoveXattrResponse, RenameRequest, RenameResponse, ReserveChunksRequest,
+    ReserveChunksResponse, RmdirRequest, RmdirResponse, SetXattrRequest, SetXattrResponse,
+    SymlinkRequest, SymlinkResponse, TombstoneGcBatchRequest, TombstoneGcBatchResponse,
+    UnlinkRequest, UnlinkResponse, WorkerMembershipResponse,
 };
 use fluxfs_proto::meta_codec::{
     decode_chunk_ids, decode_flush_intent, decode_gc_delete_acks, decode_inode, decode_manifest,
     decode_ufs_object, decode_worker_registration, decode_worker_targets, encode_dentries,
     encode_flush_intents, encode_gc_batch, encode_gc_plan, encode_gc_tombstones, encode_inode,
     encode_manifest, encode_worker_membership, file_type_from_wire, status_from_flux,
+    xattr_set_mode_from_wire,
 };
 use fluxfs_proto::{MetaService, MetaServiceServer};
 use fluxfs_types::{
@@ -340,6 +344,34 @@ impl MetaService for MetaSvc {
             .await?;
         let inode = self.map_resp_inode(resp)?;
         Ok(Response::new(CreateResponse {
+            inode_json: encode_inode(&inode).map_err(status_from_flux)?,
+        }))
+    }
+
+    async fn symlink(
+        &self,
+        req: Request<SymlinkRequest>,
+    ) -> Result<Response<SymlinkResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
+        let corr_id = fluxfs_proto::request_id::extract_request_id(&req);
+        let r = req.into_inner();
+        let resp = self
+            .write(
+                &corr_id,
+                MetaRaftRequest::Symlink {
+                    request_id: parse_request_op_id(&r.request_id),
+                    ledger_now_unix_ms: 0,
+                    parent: r.parent,
+                    name: r.name,
+                    target: r.target,
+                    uid: r.uid,
+                    gid: r.gid,
+                    expected_parent_generation: parent_gen_cas(r.expected_parent_generation),
+                },
+            )
+            .await?;
+        let inode = self.map_resp_inode(resp)?;
+        Ok(Response::new(SymlinkResponse {
             inode_json: encode_inode(&inode).map_err(status_from_flux)?,
         }))
     }
@@ -891,6 +923,108 @@ impl MetaService for MetaSvc {
             .await?;
         self.map_resp_empty(resp)?;
         Ok(Response::new(RmdirResponse {}))
+    }
+
+    async fn link(&self, req: Request<LinkRequest>) -> Result<Response<LinkResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
+        let corr_id = fluxfs_proto::request_id::extract_request_id(&req);
+        let r = req.into_inner();
+        let resp = self
+            .write(
+                &corr_id,
+                MetaRaftRequest::Link {
+                    request_id: parse_request_op_id(&r.request_id),
+                    ledger_now_unix_ms: 0,
+                    inode: r.inode,
+                    new_parent: r.new_parent,
+                    new_name: r.new_name,
+                    expected_new_parent_generation: parent_gen_cas(
+                        r.expected_new_parent_generation,
+                    ),
+                },
+            )
+            .await?;
+        let inode = self.map_resp_inode(resp)?;
+        Ok(Response::new(LinkResponse {
+            inode_json: encode_inode(&inode).map_err(status_from_flux)?,
+        }))
+    }
+
+    async fn get_xattr(
+        &self,
+        req: Request<GetXattrRequest>,
+    ) -> Result<Response<GetXattrResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::ReadMeta)?;
+        let request = req.into_inner();
+        let value = self
+            .store
+            .get_xattr(request.inode, &request.name)
+            .map_err(status_from_flux)?;
+        Ok(Response::new(GetXattrResponse { value }))
+    }
+
+    async fn list_xattrs(
+        &self,
+        req: Request<ListXattrsRequest>,
+    ) -> Result<Response<ListXattrsResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::ReadMeta)?;
+        let names = self
+            .store
+            .list_xattrs(req.into_inner().inode)
+            .map_err(status_from_flux)?;
+        Ok(Response::new(ListXattrsResponse { names }))
+    }
+
+    async fn set_xattr(
+        &self,
+        req: Request<SetXattrRequest>,
+    ) -> Result<Response<SetXattrResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
+        let corr_id = fluxfs_proto::request_id::extract_request_id(&req);
+        let request = req.into_inner();
+        let response = self
+            .write(
+                &corr_id,
+                MetaRaftRequest::SetXattr {
+                    request_id: parse_request_op_id(&request.request_id),
+                    ledger_now_unix_ms: 0,
+                    expected_generation: request.expected_generation,
+                    inode: request.inode,
+                    name: request.name,
+                    value: request.value,
+                    mode: xattr_set_mode_from_wire(request.mode).map_err(status_from_flux)?,
+                },
+            )
+            .await?;
+        let inode = self.map_resp_inode(response)?;
+        Ok(Response::new(SetXattrResponse {
+            inode_json: encode_inode(&inode).map_err(status_from_flux)?,
+        }))
+    }
+
+    async fn remove_xattr(
+        &self,
+        req: Request<RemoveXattrRequest>,
+    ) -> Result<Response<RemoveXattrResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
+        let corr_id = fluxfs_proto::request_id::extract_request_id(&req);
+        let request = req.into_inner();
+        let response = self
+            .write(
+                &corr_id,
+                MetaRaftRequest::RemoveXattr {
+                    request_id: parse_request_op_id(&request.request_id),
+                    ledger_now_unix_ms: 0,
+                    expected_generation: request.expected_generation,
+                    inode: request.inode,
+                    name: request.name,
+                },
+            )
+            .await?;
+        let inode = self.map_resp_inode(response)?;
+        Ok(Response::new(RemoveXattrResponse {
+            inode_json: encode_inode(&inode).map_err(status_from_flux)?,
+        }))
     }
 
     async fn rename(

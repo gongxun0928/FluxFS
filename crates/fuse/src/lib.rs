@@ -3,11 +3,12 @@
 use fluxfs_chunk::ChunkStore;
 use fluxfs_client::{FluxClient, InodeSetAttr};
 use fluxfs_meta::MetaStore;
-use fluxfs_types::{FileType as FluxFileType, FluxError, Inode};
+use fluxfs_types::{FileType as FluxFileType, FluxError, Inode, XattrSetMode};
 use fuser::{
     mount, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
     INodeNo, LockOwner, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, SessionACL, TimeOrNow,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr, Request, SessionACL,
+    TimeOrNow,
 }; // SessionACL used in mount_ephemeral
 use std::ffi::OsStr;
 use std::path::Path;
@@ -30,6 +31,7 @@ impl<M: MetaStore + 'static, C: ChunkStore + 'static> FluxFs<M, C> {
         let kind = match ino.file_type {
             FluxFileType::Directory => FileType::Directory,
             FluxFileType::Regular => FileType::RegularFile,
+            FluxFileType::Symlink => FileType::Symlink,
         };
         let atime = ms_to_systime(ino.atime_ms);
         let mtime = ms_to_systime(ino.mtime_ms);
@@ -149,6 +151,34 @@ impl<M: MetaStore + 'static, C: ChunkStore + 'static> Filesystem for FluxFs<M, C
         }
     }
 
+    fn symlink(
+        &self,
+        req: &Request,
+        parent: INodeNo,
+        link_name: &OsStr,
+        target: &Path,
+        reply: ReplyEntry,
+    ) {
+        let (Some(link_name), Some(target)) = (link_name.to_str(), target.to_str()) else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        match self
+            .client
+            .symlink(parent.0, link_name, target, req.uid(), req.gid())
+        {
+            Ok(inode) => reply.entry(&TTL, &self.attr(&inode), Generation(0)),
+            Err(error) => reply.error(map_err(error)),
+        }
+    }
+
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        match self.client.readlink(ino.0) {
+            Ok(target) => reply.data(target.as_bytes()),
+            Err(error) => reply.error(map_err(error)),
+        }
+    }
+
     fn rename(
         &self,
         _req: &Request,
@@ -175,6 +205,97 @@ impl<M: MetaStore + 'static, C: ChunkStore + 'static> Filesystem for FluxFs<M, C
             newname,
             flags.contains(RenameFlags::RENAME_NOREPLACE),
         ) {
+            Ok(_) => reply.ok(),
+            Err(error) => reply.error(map_err(error)),
+        }
+    }
+
+    fn link(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        newparent: INodeNo,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        let Some(newname) = newname.to_str() else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        match self.client.link(ino.0, newparent.0, newname) {
+            Ok(inode) => reply.entry(&TTL, &self.attr(&inode), Generation(0)),
+            Err(error) => reply.error(map_err(error)),
+        }
+    }
+
+    fn setxattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        position: u32,
+        reply: ReplyEmpty,
+    ) {
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        if position != 0 || flags & !0x3 != 0 || flags == 0x3 {
+            reply.error(Errno::EINVAL);
+            return;
+        }
+        let mode = match flags {
+            0x1 => XattrSetMode::Create,
+            0x2 => XattrSetMode::Replace,
+            _ => XattrSetMode::Upsert,
+        };
+        match self.client.set_xattr(ino.0, name, value, mode) {
+            Ok(_) => reply.ok(),
+            Err(error) => reply.error(map_err(error)),
+        }
+    }
+
+    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        match self.client.get_xattr(ino.0, name) {
+            Ok(value) if size == 0 => reply.size(value.len() as u32),
+            Ok(value) if value.len() <= size as usize => reply.data(&value),
+            Ok(_) => reply.error(Errno::ERANGE),
+            Err(error) => reply.error(map_err(error)),
+        }
+    }
+
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        match self.client.list_xattrs(ino.0) {
+            Ok(names) => {
+                let mut value = Vec::new();
+                for name in names {
+                    value.extend_from_slice(name.as_bytes());
+                    value.push(0);
+                }
+                if size == 0 {
+                    reply.size(value.len() as u32);
+                } else if value.len() <= size as usize {
+                    reply.data(&value);
+                } else {
+                    reply.error(Errno::ERANGE);
+                }
+            }
+            Err(error) => reply.error(map_err(error)),
+        }
+    }
+
+    fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        match self.client.remove_xattr(ino.0, name) {
             Ok(_) => reply.ok(),
             Err(error) => reply.error(map_err(error)),
         }
@@ -336,6 +457,7 @@ impl<M: MetaStore + 'static, C: ChunkStore + 'static> Filesystem for FluxFs<M, C
             let kind = match child.file_type {
                 FluxFileType::Directory => FileType::Directory,
                 FluxFileType::Regular => FileType::RegularFile,
+                FluxFileType::Symlink => FileType::Symlink,
             };
             if reply.add(INodeNo(d.child), next, kind, &d.name) {
                 break;
@@ -373,6 +495,9 @@ fn map_err(e: FluxError) -> Errno {
         FluxError::NotDirectory => Errno::ENOTDIR,
         FluxError::IsDirectory => Errno::EISDIR,
         FluxError::NotEmpty => Errno::ENOTEMPTY,
+        FluxError::NoData => Errno::ENODATA,
+        FluxError::NoSpace => Errno::ENOSPC,
+        FluxError::NotPermitted => Errno::EPERM,
         FluxError::Capability(_) => Errno::EOPNOTSUPP,
         FluxError::Busy => Errno::EAGAIN,
         FluxError::CasFailed { .. } => Errno::EAGAIN,

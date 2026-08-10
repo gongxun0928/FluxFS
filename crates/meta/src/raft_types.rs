@@ -6,7 +6,7 @@
 use fluxfs_types::{
     ChunkId, FileType, FlushId, FlushIntent, FluxError, GcBatch, GcLeaseId, GcPlan, Inode,
     Manifest, RequestOpId, UfsObject, WorkerMembership, WorkerRegistration, WorkerTargetId,
-    WriteTicketId,
+    WriteTicketId, XattrSetMode,
 };
 use openraft::declare_raft_types;
 use openraft::BasicNode;
@@ -50,6 +50,19 @@ pub enum MetaRaftRequest {
         uid: u32,
         gid: u32,
         /// When set, CAS `parent.generation` before inserting the dentry.
+        #[serde(default)]
+        expected_parent_generation: Option<u64>,
+    },
+    Symlink {
+        #[serde(default)]
+        request_id: Option<RequestOpId>,
+        #[serde(default)]
+        ledger_now_unix_ms: u64,
+        parent: u64,
+        name: String,
+        target: String,
+        uid: u32,
+        gid: u32,
         #[serde(default)]
         expected_parent_generation: Option<u64>,
     },
@@ -251,6 +264,37 @@ pub enum MetaRaftRequest {
         #[serde(default)]
         expected_parent_generation: Option<u64>,
     },
+    Link {
+        #[serde(default)]
+        request_id: Option<RequestOpId>,
+        #[serde(default)]
+        ledger_now_unix_ms: u64,
+        inode: u64,
+        new_parent: u64,
+        new_name: String,
+        #[serde(default)]
+        expected_new_parent_generation: Option<u64>,
+    },
+    SetXattr {
+        #[serde(default)]
+        request_id: Option<RequestOpId>,
+        #[serde(default)]
+        ledger_now_unix_ms: u64,
+        expected_generation: u64,
+        inode: u64,
+        name: String,
+        value: Vec<u8>,
+        mode: XattrSetMode,
+    },
+    RemoveXattr {
+        #[serde(default)]
+        request_id: Option<RequestOpId>,
+        #[serde(default)]
+        ledger_now_unix_ms: u64,
+        expected_generation: u64,
+        inode: u64,
+        name: String,
+    },
     Rmdir {
         #[serde(default)]
         request_id: Option<RequestOpId>,
@@ -284,6 +328,7 @@ impl MetaRaftRequest {
         match self {
             Self::RegisterWorker { request_id, .. }
             | Self::Create { request_id, .. }
+            | Self::Symlink { request_id, .. }
             | Self::PutInode { request_id, .. }
             | Self::PutInodeCas { request_id, .. }
             | Self::PutManifest { request_id, .. }
@@ -304,6 +349,9 @@ impl MetaRaftRequest {
             | Self::FinishGc { request_id, .. }
             | Self::ImportExternal { request_id, .. }
             | Self::Unlink { request_id, .. }
+            | Self::Link { request_id, .. }
+            | Self::SetXattr { request_id, .. }
+            | Self::RemoveXattr { request_id, .. }
             | Self::Rmdir { request_id, .. }
             | Self::Rename { request_id, .. } => request_id.as_ref(),
         }
@@ -313,6 +361,7 @@ impl MetaRaftRequest {
         match &mut self {
             Self::RegisterWorker { request_id, .. }
             | Self::Create { request_id, .. }
+            | Self::Symlink { request_id, .. }
             | Self::PutInode { request_id, .. }
             | Self::PutInodeCas { request_id, .. }
             | Self::PutManifest { request_id, .. }
@@ -333,6 +382,9 @@ impl MetaRaftRequest {
             | Self::FinishGc { request_id, .. }
             | Self::ImportExternal { request_id, .. }
             | Self::Unlink { request_id, .. }
+            | Self::Link { request_id, .. }
+            | Self::SetXattr { request_id, .. }
+            | Self::RemoveXattr { request_id, .. }
             | Self::Rmdir { request_id, .. }
             | Self::Rename { request_id, .. } => {
                 *request_id = Some(id);
@@ -348,6 +400,9 @@ impl MetaRaftRequest {
                 ledger_now_unix_ms, ..
             }
             | Self::Create {
+                ledger_now_unix_ms, ..
+            }
+            | Self::Symlink {
                 ledger_now_unix_ms, ..
             }
             | Self::PutInode {
@@ -408,6 +463,15 @@ impl MetaRaftRequest {
                 ledger_now_unix_ms, ..
             }
             | Self::Unlink {
+                ledger_now_unix_ms, ..
+            }
+            | Self::Link {
+                ledger_now_unix_ms, ..
+            }
+            | Self::SetXattr {
+                ledger_now_unix_ms, ..
+            }
+            | Self::RemoveXattr {
                 ledger_now_unix_ms, ..
             }
             | Self::Rmdir {
@@ -427,6 +491,9 @@ impl MetaRaftRequest {
             | Self::Create {
                 ledger_now_unix_ms, ..
             }
+            | Self::Symlink {
+                ledger_now_unix_ms, ..
+            }
             | Self::PutInode {
                 ledger_now_unix_ms, ..
             }
@@ -487,6 +554,15 @@ impl MetaRaftRequest {
             | Self::Unlink {
                 ledger_now_unix_ms, ..
             }
+            | Self::Link {
+                ledger_now_unix_ms, ..
+            }
+            | Self::SetXattr {
+                ledger_now_unix_ms, ..
+            }
+            | Self::RemoveXattr {
+                ledger_now_unix_ms, ..
+            }
             | Self::Rmdir {
                 ledger_now_unix_ms, ..
             }
@@ -504,6 +580,7 @@ impl MetaRaftRequest {
         match self {
             Self::RegisterWorker { .. } => "register_worker",
             Self::Create { .. } => "create",
+            Self::Symlink { .. } => "symlink",
             Self::PutInode { .. } => "put_inode",
             Self::PutInodeCas { .. } => "put_inode_cas",
             Self::PutManifest { .. } => "put_manifest",
@@ -524,6 +601,9 @@ impl MetaRaftRequest {
             Self::FinishGc { .. } => "finish_gc",
             Self::ImportExternal { .. } => "import_external",
             Self::Unlink { .. } => "unlink",
+            Self::Link { .. } => "link",
+            Self::SetXattr { .. } => "set_xattr",
+            Self::RemoveXattr { .. } => "remove_xattr",
             Self::Rmdir { .. } => "rmdir",
             Self::Rename { .. } => "rename",
         }
