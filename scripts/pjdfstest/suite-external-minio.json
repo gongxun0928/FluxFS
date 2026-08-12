@@ -1,0 +1,16 @@
+{
+  "mode": "external-minio",
+  "cases": [
+    {"test": "mkdir/01.t", "category": "external-namespace"},
+    {"test": "mkdir/04.t", "category": "external-namespace"},
+    {"test": "mkdir/10.t", "category": "external-namespace"},
+    {"test": "rmdir/01.t", "category": "external-namespace"},
+    {"test": "rmdir/04.t", "category": "external-namespace"},
+    {"test": "rename/03.t", "category": "external-rename"},
+    {"test": "symlink/04.t", "category": "external-symlink"},
+    {"test": "link/09.t", "category": "external-hardlink"},
+    {"test": "unlink/04.t", "category": "external-unlink"},
+    {"test": "open/04.t", "category": "external-open"},
+    {"test": "truncate/04.t", "category": "external-truncate"}
+  ]
+}

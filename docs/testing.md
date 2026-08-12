@@ -51,20 +51,52 @@ replay. A failing random seed is a test artifact, not just log trivia.
 
 ## pjdfstest integration
 
-The first CI job follows the proven ZeroFS shape: install FUSE 3 and pjdfstest,
-start MinIO, start FluxFS, mount it, wait with `mountpoint`, run an explicit test
-allowlist, and always unmount/kill services. Start with cases matching the
-declared alpha surface instead of copying ZeroFS's mature exclusions. Each
-excluded upstream test needs a tracked reason: unsupported-by-scope, known bug,
-or environment limitation. Pin the pjdfstest revision so upstream changes do
-not silently change the gate.
+The reproducible runner is `scripts/test-pjdfstest.sh`. It checks out
+pjdfstest revision `85a8aea9e685999ef0540392fd80535f873d7ff7`, builds it from
+source, mounts FluxFS as root, runs each selected `.t` file independently, and
+always tears down the mount and its isolated MinIO container. Required host
+tools are FUSE 3, Git, Autoconf/Automake, Make, Perl `prove`, Python 3, and
+passwordless `sudo`; the External lane also requires Docker and curl.
 
-Initial suites: basic open/read/write/stat, mkdir/rmdir, rename within one
-mount, truncate, fsync, hard/symbolic links, xattr CRUD and ACL round-trip, and
-64-bit timestamps, including read/write/truncate through a descriptor after
-its final name is unlinked. Exclude nested/cross-mount rename, mmap coherence,
-file locking, ACL permission enforcement, and other semantics explicitly
-outside v0.1.
+Run the lanes separately or together:
+
+```bash
+scripts/test-pjdfstest.sh ephemeral
+scripts/test-pjdfstest.sh external-minio
+scripts/test-pjdfstest.sh all
+```
+
+JSON, JUnit XML, raw TAP, and mount logs are written under
+`target/pjdfstest-reports/`. Reports record the pinned pjdfstest revision,
+FluxFS commit and dirty state, plus SHA-256 digests of the suite and known-fail
+documents. A pin upgrade is a dedicated review change and must regenerate both
+lanes' baselines. Each case has a 60-second default timeout, overridable with
+`FLUXFS_PJDFSTEST_CASE_TIMEOUT`.
+
+The gate is fail-closed: suite and known-fail entries must name exact test
+files, wildcard/duplicate/orphan entries are rejected, an unexpected failure
+blocks, and an unexpected pass also blocks until its obsolete exclusion is
+removed. A known failure with `reason=bug` remains blocking; only individually
+reviewed `deferred` or `env-limit` entries are non-blocking. Even those must
+match an exact expected TAP failure signature (`expected_output`), so an
+environment failure cannot masquerade as the deferred semantic. Each exclusion
+also records a category and concrete detail.
+
+The initial Ephemeral suite has 42 files: 26 pass and 16 are exact deferred
+cases. Green coverage includes mkdir/rmdir, rename, hard/symbolic links,
+unlink, open flags/modes, truncate/ftruncate, subsecond and post-2038
+timestamps, and `unlink/14.t` open-after-final-unlink semantics. The 16
+deferred files contain special-file matrices or full UID/GID permission
+enforcement checks outside v0.1. The separate External-MinIO lane has 11 exact
+expected failures documenting the intentional fail-closed namespace-mutation
+contract; it is a negative contract baseline, not a claim that External
+namespace mutation works.
+
+Still outside this first allowlist are mmap coherence, file locking, special
+files, ACL permission enforcement, cross-mount behavior, and pjdfstest coverage
+for Linux xattrs/ACL storage and fsync crash recovery. Those remain covered by
+FluxFS-native integration tests until a suitable upstream or supplemental
+conformance suite is added.
 
 ## MVP staging and gates
 

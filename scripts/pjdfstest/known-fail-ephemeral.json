@@ -1,0 +1,21 @@
+{
+  "mode": "ephemeral",
+  "known_failures": [
+    {"test": "mkdir/01.t", "category": "special-files", "reason": "deferred", "detail": "case matrix requires fifo/device/socket nodes, which FluxFS does not implement", "expected_output": "got ENOSYS"},
+    {"test": "mkdir/10.t", "category": "special-files", "reason": "deferred", "detail": "case matrix requires fifo/device/socket nodes before checking EEXIST", "expected_output": "got ENOSYS"},
+    {"test": "rmdir/01.t", "category": "special-files", "reason": "deferred", "detail": "case matrix requires fifo nodes, which FluxFS does not implement", "expected_output": "got ENOSYS"},
+    {"test": "rmdir/06.t", "category": "special-files", "reason": "deferred", "detail": "non-empty matrix requires fifo/device/socket nodes", "expected_output": "got ENOSYS"},
+    {"test": "rename/12.t", "category": "special-files", "reason": "deferred", "detail": "ENOTDIR matrix requires fifo/device/socket nodes", "expected_output": "got ENOSYS"},
+    {"test": "rename/13.t", "category": "special-files", "reason": "deferred", "detail": "directory replacement matrix includes unsupported fifo/device/socket nodes", "expected_output": "got ENOSYS"},
+    {"test": "rename/14.t", "category": "special-files", "reason": "deferred", "detail": "EISDIR matrix includes unsupported fifo/device/socket nodes", "expected_output": "got ENOSYS"},
+    {"test": "rename/20.t", "category": "special-files", "reason": "deferred", "detail": "non-empty destination matrix includes unsupported fifo/device/socket children", "expected_output": "got ENOSYS"},
+    {"test": "rename/23.t", "category": "special-files", "reason": "deferred", "detail": "multiply-linked destination matrix includes unsupported fifo/device/socket nodes", "expected_output": "got ENOSYS"},
+    {"test": "symlink/08.t", "category": "special-files", "reason": "deferred", "detail": "EEXIST matrix includes unsupported fifo/device/socket nodes", "expected_output": "got ENOSYS"},
+    {"test": "link/01.t", "category": "special-files", "reason": "deferred", "detail": "ENOTDIR matrix requires fifo/device/socket nodes", "expected_output": "got ENOSYS"},
+    {"test": "link/10.t", "category": "special-files", "reason": "deferred", "detail": "EEXIST matrix includes unsupported fifo/device/socket nodes", "expected_output": "got ENOSYS"},
+    {"test": "link/11.t", "category": "permissions", "reason": "deferred", "detail": "directory ownership and non-root permission enforcement are outside the current authenticated UID/GID contract", "expected_output": "got EACCES"},
+    {"test": "open/01.t", "category": "special-files", "reason": "deferred", "detail": "ENOTDIR matrix requires fifo/device/socket nodes", "expected_output": "got ENOSYS"},
+    {"test": "open/22.t", "category": "special-files", "reason": "deferred", "detail": "O_EXCL matrix includes unsupported fifo/device/socket nodes", "expected_output": "got ENOSYS"},
+    {"test": "ftruncate/00.t", "category": "permissions", "reason": "deferred", "detail": "case includes non-root access and mode-000 descriptor checks before full UID/GID permission enforcement", "expected_output": "got EACCES"}
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "mode": "external-minio",
+  "known_failures": [
+    {"test": "mkdir/01.t", "category": "external-namespace", "reason": "deferred", "detail": "pjdfstest setup creates random names while External/MinIO namespace mutation intentionally fails closed", "expected_output": "got EROFS"},
+    {"test": "mkdir/04.t", "category": "external-namespace", "reason": "deferred", "detail": "pjdfstest setup creates random names while External/MinIO namespace mutation intentionally fails closed", "expected_output": "got EROFS"},
+    {"test": "mkdir/10.t", "category": "external-namespace", "reason": "deferred", "detail": "pjdfstest setup creates random names while External/MinIO namespace mutation intentionally fails closed", "expected_output": "got EROFS"},
+    {"test": "rmdir/01.t", "category": "external-namespace", "reason": "deferred", "detail": "pjdfstest setup creates random names while External/MinIO namespace mutation intentionally fails closed", "expected_output": "got EROFS"},
+    {"test": "rmdir/04.t", "category": "external-namespace", "reason": "deferred", "detail": "pjdfstest setup creates random names while External/MinIO namespace mutation intentionally fails closed", "expected_output": "got EROFS"},
+    {"test": "rename/03.t", "category": "external-rename", "reason": "deferred", "detail": "External rename is fail-closed and pjdfstest has no preseeded immutable fixture adapter", "expected_output": "got EROFS"},
+    {"test": "symlink/04.t", "category": "external-symlink", "reason": "deferred", "detail": "External symlink creation is fail-closed", "expected_output": "got EROFS"},
+    {"test": "link/09.t", "category": "external-hardlink", "reason": "deferred", "detail": "External hardlink creation is fail-closed", "expected_output": "got EROFS"},
+    {"test": "unlink/04.t", "category": "external-unlink", "reason": "deferred", "detail": "External unlink is fail-closed", "expected_output": "got EROFS"},
+    {"test": "open/04.t", "category": "external-open", "reason": "deferred", "detail": "case setup depends on managed namespace creation; External creation is fail-closed", "expected_output": "got EROFS"},
+    {"test": "truncate/04.t", "category": "external-truncate", "reason": "deferred", "detail": "case setup depends on managed namespace creation; External fixture adapter is future work", "expected_output": "got EROFS"}
+  ]
+}
