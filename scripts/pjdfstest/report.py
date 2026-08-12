@@ -47,6 +47,8 @@ def validate_configuration(suite: dict, known_document: dict) -> dict[str, dict]
     entries = known_document.get("known_failures")
     if not isinstance(cases, list) or not isinstance(entries, list):
         raise SystemExit("suite cases and known_failures must be arrays")
+    if not cases:
+        raise SystemExit("suite cases must not be empty")
 
     case_by_test: dict[str, dict] = {}
     for case in cases:
@@ -85,6 +87,10 @@ def validate_configuration(suite: dict, known_document: dict) -> dict[str, dict]
             "expected_output"
         ]:
             raise SystemExit(f"known-fail expected_output is required: {entry}")
+        if not isinstance(entry.get("expected_not_ok"), int) or entry[
+            "expected_not_ok"
+        ] <= 0:
+            raise SystemExit(f"known-fail expected_not_ok must be positive: {entry}")
         try:
             re.compile(entry["expected_output"])
         except re.error as error:
@@ -100,7 +106,15 @@ def classify_result(passed: bool, known: dict | None, output: str = "") -> str:
         return "unexpected-fail"
     if passed:
         return "unexpected-pass"
-    if re.search(known["expected_output"], output, flags=re.MULTILINE) is None:
+    failure_lines = [
+        line
+        for line in output.splitlines()
+        if line.startswith("not ok") and "# TODO" not in line and "# SKIP" not in line
+    ]
+    signature = re.compile(known["expected_output"])
+    if len(failure_lines) != known["expected_not_ok"] or any(
+        signature.search(line) is None for line in failure_lines
+    ):
         return "expected-failure-mismatch"
     if known["reason"] == "bug":
         return "known-bug-fail"
@@ -115,6 +129,7 @@ def main() -> int:
     parser.add_argument("--mountpoint", required=True, type=pathlib.Path)
     parser.add_argument("--report-dir", required=True, type=pathlib.Path)
     parser.add_argument("--revision", required=True)
+    parser.add_argument("--pin-file", required=True, type=pathlib.Path)
     parser.add_argument("--fluxfs-revision", required=True)
     parser.add_argument("--fluxfs-dirty", required=True, choices=("true", "false"))
     parser.add_argument("--timeout-seconds", type=positive_int, default=60)
@@ -182,6 +197,7 @@ def main() -> int:
         "schema_version": 1,
         "mode": suite["mode"],
         "pjdfstest_revision": args.revision,
+        "pin_sha256": sha256_file(args.pin_file),
         "fluxfs_revision": args.fluxfs_revision,
         "fluxfs_dirty": args.fluxfs_dirty == "true",
         "timeout_seconds": args.timeout_seconds,

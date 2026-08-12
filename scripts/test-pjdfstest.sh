@@ -20,10 +20,9 @@ fi
 source "$config_dir/pin.env"
 cache_root="${FLUXFS_PJDFSTEST_CACHE:-$repo_dir/target/pjdfstest}"
 report_dir="${FLUXFS_PJDFSTEST_REPORT_DIR:-$repo_dir/target/pjdfstest-reports}"
-src_dir="$cache_root/src"
-build_stamp="$cache_root/build-revision"
+git_dir="$cache_root/repository.git"
 
-for command in git autoreconf automake make prove sudo fusermount3 mountpoint python3; do
+for command in git autoreconf automake make prove sudo fusermount3 mountpoint python3 tar; do
     command -v "$command" >/dev/null || { echo "missing prerequisite: $command" >&2; exit 2; }
 done
 if [[ "$mode" == external-minio ]]; then
@@ -37,28 +36,34 @@ sudo -n true 2>/dev/null || {
 }
 
 (cd "$config_dir" && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -q test_report.py)
-
-mkdir -p "$cache_root" "$report_dir"
-if [[ ! -d "$src_dir/.git" ]]; then
-    git clone --quiet "$PJDFSTEST_REPOSITORY" "$src_dir"
-fi
-if ! git -C "$src_dir" cat-file -e "$PJDFSTEST_REVISION^{commit}" 2>/dev/null; then
-    git -C "$src_dir" fetch --quiet origin "$PJDFSTEST_REVISION"
-fi
-git -C "$src_dir" checkout --quiet --detach "$PJDFSTEST_REVISION"
-test "$(git -C "$src_dir" rev-parse HEAD)" = "$PJDFSTEST_REVISION"
-if [[ ! -x "$src_dir/pjdfstest" \
-    || ! -f "$build_stamp" \
-    || $(<"$build_stamp") != "$PJDFSTEST_REVISION" ]]; then
-    (cd "$src_dir" && autoreconf -ifs && ./configure --quiet && make -s pjdfstest)
-    printf '%s\n' "$PJDFSTEST_REVISION" >"$build_stamp"
-fi
-cargo build --manifest-path "$repo_dir/Cargo.toml" -p fluxfs
 fluxfs_revision=$(git -C "$repo_dir" rev-parse HEAD)
 fluxfs_dirty=false
 if [[ -n $(git -C "$repo_dir" status --porcelain) ]]; then
     fluxfs_dirty=true
 fi
+if $fluxfs_dirty && [[ "${FLUXFS_PJDFSTEST_ALLOW_DIRTY:-0}" != 1 ]]; then
+    echo "FluxFS worktree is dirty; commit it or set FLUXFS_PJDFSTEST_ALLOW_DIRTY=1" >&2
+    exit 2
+fi
+
+mkdir -p "$cache_root" "$report_dir"
+if [[ ! -f "$git_dir/HEAD" ]]; then
+    git clone --quiet --bare "$PJDFSTEST_REPOSITORY" "$git_dir"
+fi
+if ! git --git-dir "$git_dir" cat-file -e "$PJDFSTEST_REVISION^{commit}" 2>/dev/null; then
+    git --git-dir "$git_dir" fetch --quiet "$PJDFSTEST_REPOSITORY" "$PJDFSTEST_REVISION"
+fi
+test "$(git --git-dir "$git_dir" rev-parse "$PJDFSTEST_REVISION^{commit}")" = "$PJDFSTEST_REVISION"
+source_root=$(mktemp -d -t fluxfs-pjdfstest-source.XXXXXX)
+src_dir="$source_root/src"
+mkdir "$src_dir"
+cleanup_source() {
+    rm -rf -- "$source_root"
+}
+trap cleanup_source EXIT
+git --git-dir "$git_dir" archive "$PJDFSTEST_REVISION" | tar -x -C "$src_dir"
+(cd "$src_dir" && autoreconf -ifs && ./configure --quiet && make -s pjdfstest)
+cargo build --manifest-path "$repo_dir/Cargo.toml" -p fluxfs
 
 run_mode() (
     local current_mode=$1
@@ -76,7 +81,7 @@ run_mode() (
             wait "$mount_pid" 2>/dev/null || true
         fi
         if $minio_started; then
-            FLUXFS_MINIO_NAME="fluxfs-pjdfstest-minio" \
+            FLUXFS_MINIO_NAME="$FLUXFS_MINIO_NAME" \
                 "$repo_dir/scripts/dev-minio.sh" stop >/dev/null 2>&1 || true
         fi
         sudo -n rm -rf -- "$test_root"
@@ -95,13 +100,15 @@ run_mode() (
         pick_free_tcp_port() {
             python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
         }
-        export FLUXFS_MINIO_NAME=fluxfs-pjdfstest-minio
+        export FLUXFS_MINIO_NAME="fluxfs-pjdfstest-${current_mode}-$$-${RANDOM}"
         export FLUXFS_MINIO_PORT="${FLUXFS_PJDFSTEST_MINIO_PORT:-$(pick_free_tcp_port)}"
         export FLUXFS_MINIO_CONSOLE_PORT="${FLUXFS_PJDFSTEST_MINIO_CONSOLE_PORT:-$(pick_free_tcp_port)}"
         while [[ "$FLUXFS_MINIO_CONSOLE_PORT" == "$FLUXFS_MINIO_PORT" ]]; do
             FLUXFS_MINIO_CONSOLE_PORT=$(pick_free_tcp_port)
         done
         export FLUXFS_MINIO_BUCKET=fluxfs-pjdfstest
+        export FLUXFS_MINIO_IMAGE="$PJDFSTEST_MINIO_IMAGE"
+        export FLUXFS_MINIO_MC_IMAGE="$PJDFSTEST_MINIO_MC_IMAGE"
         "$repo_dir/scripts/dev-minio.sh" stop >/dev/null
         minio_started=true
         "$repo_dir/scripts/dev-minio.sh" >/dev/null
@@ -142,6 +149,7 @@ run_mode() (
         --mountpoint "$mount_dir" \
         --report-dir "$report_dir" \
         --revision "$PJDFSTEST_REVISION" \
+        --pin-file "$config_dir/pin.env" \
         --fluxfs-revision "$fluxfs_revision" \
         --fluxfs-dirty "$fluxfs_dirty" \
         --timeout-seconds "${FLUXFS_PJDFSTEST_CASE_TIMEOUT:-60}" || runner_status=$?

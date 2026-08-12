@@ -57,6 +57,9 @@ source, mounts FluxFS as root, runs each selected `.t` file independently, and
 always tears down the mount and its isolated MinIO container. Required host
 tools are FUSE 3, Git, Autoconf/Automake, Make, Perl `prove`, Python 3, and
 passwordless `sudo`; the External lane also requires Docker and curl.
+The pjdfstest source is exported from the pinned Git object into a fresh
+temporary build tree on every lane; the MinIO server and client images are
+digest-pinned in `scripts/pjdfstest/pin.env`.
 
 Run the lanes separately or together:
 
@@ -71,16 +74,19 @@ JSON, JUnit XML, raw TAP, and mount logs are written under
 FluxFS commit and dirty state, plus SHA-256 digests of the suite and known-fail
 documents. A pin upgrade is a dedicated review change and must regenerate both
 lanes' baselines. Each case has a 60-second default timeout, overridable with
-`FLUXFS_PJDFSTEST_CASE_TIMEOUT`.
+`FLUXFS_PJDFSTEST_CASE_TIMEOUT`. A dirty FluxFS worktree is rejected by default;
+local harness development may opt in explicitly with
+`FLUXFS_PJDFSTEST_ALLOW_DIRTY=1` and the report will record that state.
 
 The gate is fail-closed: suite and known-fail entries must name exact test
 files, wildcard/duplicate/orphan entries are rejected, an unexpected failure
 blocks, and an unexpected pass also blocks until its obsolete exclusion is
 removed. A known failure with `reason=bug` remains blocking; only individually
 reviewed `deferred` or `env-limit` entries are non-blocking. Even those must
-match an exact expected TAP failure signature (`expected_output`), so an
-environment failure cannot masquerade as the deferred semantic. Each exclusion
-also records a category and concrete detail.
+match the exact expected number of non-TODO `not ok` lines, and every such line
+must match its allowed TAP failure signature. This prevents a new failure from
+hiding behind one expected substring or a deferred matrix from silently
+shrinking. Each exclusion also records a category and concrete detail.
 
 The initial Ephemeral suite has 42 files: 26 pass and 16 are exact deferred
 cases. Green coverage includes mkdir/rmdir, rename, hard/symbolic links,
