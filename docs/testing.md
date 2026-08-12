@@ -61,9 +61,10 @@ not silently change the gate.
 
 Initial suites: basic open/read/write/stat, mkdir/rmdir, rename within one
 mount, truncate, fsync, hard/symbolic links, xattr CRUD and ACL round-trip, and
-64-bit timestamps. Exclude open-unlink lifetime until its session model is
-selected, plus nested/cross-mount rename, mmap coherence, file locking, ACL
-permission enforcement, and other semantics explicitly outside v0.1.
+64-bit timestamps, including read/write/truncate through a descriptor after
+its final name is unlinked. Exclude nested/cross-mount rename, mmap coherence,
+file locking, ACL permission enforcement, and other semantics explicitly
+outside v0.1.
 
 ## MVP staging and gates
 

@@ -481,6 +481,32 @@ impl MetaStore for RaftMetaStore {
         Self::map_empty(resp)
     }
 
+    fn open_inode(&self, session_id: &str, inode: InodeId) -> Result<()> {
+        Self::map_empty(self.write(MetaRaftRequest::OpenInode {
+            request_id: Some(RequestOpId::random()),
+            ledger_now_unix_ms: 0,
+            session_id: session_id.to_string(),
+            inode,
+        })?)
+    }
+
+    fn close_inode(&self, session_id: &str, inode: InodeId) -> Result<()> {
+        Self::map_empty(self.write(MetaRaftRequest::CloseInode {
+            request_id: Some(RequestOpId::random()),
+            ledger_now_unix_ms: 0,
+            session_id: session_id.to_string(),
+            inode,
+        })?)
+    }
+
+    fn recover_session(&self, session_id: &str) -> Result<()> {
+        Self::map_empty(self.write(MetaRaftRequest::RecoverSession {
+            request_id: Some(RequestOpId::random()),
+            ledger_now_unix_ms: 0,
+            session_id: session_id.to_string(),
+        })?)
+    }
+
     fn rmdir_cas(
         &self,
         expected_parent_generation: Option<u64>,

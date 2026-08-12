@@ -42,6 +42,7 @@ const KEY_META_SCHEMA_VERSION: &str = "meta_schema_version";
 const KEY_WORKER_MEMBERSHIP: &str = "worker_membership";
 const RESERVATION_PREFIX: &str = "write_reservation:";
 const TOMBSTONE_PREFIX: &str = "gc_tombstone:";
+const OPEN_PRESENCE_PREFIX: &str = "open_presence:";
 
 /// Full MetaStore snapshot payload for OpenRaft install/build.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +52,8 @@ pub struct MetaSnapshotData {
     pub manifests: Vec<(u64, Manifest)>,
     #[serde(default)]
     pub xattrs: Vec<(InodeId, String, Vec<u8>)>,
+    #[serde(default)]
+    pub open_presences: Vec<(InodeId, String)>,
     pub next_inode: u64,
     pub next_manifest: u64,
     pub sm: SmAppliedMeta,
@@ -161,7 +164,8 @@ impl HeedMetaStore {
         for migration in migrations {
             // v0 -> v1 marks the store. v1 -> v2 switches future manifest
             // writes to the versioned tree wire form. v2 -> v3 adds an empty
-            // xattr database. All are additive; no row rewrite is required.
+            // xattr database. v3 -> v4 adds open-presence keys in the existing
+            // meta database. All are additive; no row rewrite is required.
             meta.put(&mut wtxn, KEY_META_SCHEMA_VERSION, &u32_bytes(migration.to))
                 .map_err(|e| FluxError::Meta(e.to_string()))?;
         }
@@ -686,6 +690,24 @@ impl HeedMetaStore {
                         Err(e) => MetaRaftResponse::Err(e),
                     }
                 }
+                MetaRaftRequest::OpenInode {
+                    session_id, inode, ..
+                } => match self.open_inode_in_txn(&mut wtxn, session_id, *inode) {
+                    Ok(()) => MetaRaftResponse::Empty,
+                    Err(e) => MetaRaftResponse::Err(e),
+                },
+                MetaRaftRequest::CloseInode {
+                    session_id, inode, ..
+                } => match self.close_inode_in_txn(&mut wtxn, session_id, *inode) {
+                    Ok(()) => MetaRaftResponse::Empty,
+                    Err(e) => MetaRaftResponse::Err(e),
+                },
+                MetaRaftRequest::RecoverSession { session_id, .. } => {
+                    match self.recover_session_in_txn(&mut wtxn, session_id) {
+                        Ok(()) => MetaRaftResponse::Empty,
+                        Err(e) => MetaRaftResponse::Err(e),
+                    }
+                }
                 MetaRaftRequest::Link {
                     inode,
                     new_parent,
@@ -981,6 +1003,16 @@ impl HeedMetaStore {
             let (inode, name) = parse_xattr_key(key)?;
             xattrs.push((inode, name.to_string(), value.to_vec()));
         }
+        let mut open_presences = Vec::new();
+        let oiter = self
+            .meta
+            .prefix_iter(&rtxn, OPEN_PRESENCE_PREFIX)
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        for item in oiter {
+            let (key, _) = item.map_err(|e| FluxError::Meta(e.to_string()))?;
+            let (inode, session_id) = parse_open_presence_key(key)?;
+            open_presences.push((inode, session_id.to_string()));
+        }
         let next_inode = u64_from_bytes(
             self.meta
                 .get(&rtxn, "next_inode")
@@ -1013,6 +1045,7 @@ impl HeedMetaStore {
             dentries,
             manifests,
             xattrs,
+            open_presences,
             next_inode,
             next_manifest,
             sm: sm.clone(),
@@ -1155,6 +1188,7 @@ impl HeedMetaStore {
         }
         self.clear_meta_prefix_in_txn(&mut wtxn, RESERVATION_PREFIX)?;
         self.clear_meta_prefix_in_txn(&mut wtxn, TOMBSTONE_PREFIX)?;
+        self.clear_meta_prefix_in_txn(&mut wtxn, OPEN_PRESENCE_PREFIX)?;
         for reservation in &snap.chunk_reservations {
             self.put_reservation_in_txn(&mut wtxn, reservation)?;
         }
@@ -1167,8 +1201,15 @@ impl HeedMetaStore {
                 },
             )?;
         }
+
         for tombstone in &snap.gc_delete_tombstones {
             self.put_tombstone_in_txn(&mut wtxn, tombstone)?;
+        }
+        for (inode, session_id) in &snap.open_presences {
+            validate_session_id(session_id)?;
+            self.meta
+                .put(&mut wtxn, &open_presence_key(*inode, session_id), &[])
+                .map_err(|e| FluxError::Meta(e.to_string()))?;
         }
         self.put_worker_membership_in_txn(&mut wtxn, &snap.worker_membership)?;
         self.put_sm_meta_raw(&mut wtxn, &snap.sm)?;
@@ -1274,6 +1315,22 @@ impl HeedMetaStore {
                     inode,
                     name: name.to_string(),
                     value: value.to_vec(),
+                },
+            )?;
+        }
+
+        let oiter = self
+            .meta
+            .prefix_iter(&rtxn, OPEN_PRESENCE_PREFIX)
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        for item in oiter {
+            let (key, _) = item.map_err(|e| FluxError::Meta(e.to_string()))?;
+            let (inode, session_id) = parse_open_presence_key(key)?;
+            write_record(
+                &mut file,
+                &SnapshotRecord::OpenPresence {
+                    inode,
+                    session_id: session_id.to_string(),
                 },
             )?;
         }
@@ -1419,6 +1476,7 @@ impl HeedMetaStore {
         }
         self.clear_meta_prefix_in_txn(&mut wtxn, RESERVATION_PREFIX)?;
         self.clear_meta_prefix_in_txn(&mut wtxn, TOMBSTONE_PREFIX)?;
+        self.clear_meta_prefix_in_txn(&mut wtxn, OPEN_PRESENCE_PREFIX)?;
         self.meta
             .delete(&mut wtxn, KEY_WORKER_MEMBERSHIP)
             .map_err(|e| FluxError::Meta(e.to_string()))?;
@@ -1475,6 +1533,12 @@ impl HeedMetaStore {
                 SnapshotRecord::Xattr { inode, name, value } => {
                     self.xattrs
                         .put(&mut wtxn, &xattr_key(inode, &name), &value)
+                        .map_err(|e| FluxError::Meta(e.to_string()))?;
+                }
+                SnapshotRecord::OpenPresence { inode, session_id } => {
+                    validate_session_id(&session_id)?;
+                    self.meta
+                        .put(&mut wtxn, &open_presence_key(inode, &session_id), &[])
                         .map_err(|e| FluxError::Meta(e.to_string()))?;
                 }
                 SnapshotRecord::ClientRequest {
@@ -2134,6 +2198,98 @@ impl HeedMetaStore {
         self.remove_inode_link_in_txn(wtxn, child)
     }
 
+    fn open_inode_in_txn(
+        &self,
+        wtxn: &mut heed::RwTxn,
+        session_id: &str,
+        inode: InodeId,
+    ) -> Result<()> {
+        validate_session_id(session_id)?;
+        let opened = get_inode_raw(&self.inodes, wtxn, inode)?;
+        if opened.file_type != FileType::Regular {
+            return Err(FluxError::InvalidArg(
+                "only regular files may have open-handle presence".into(),
+            ));
+        }
+        self.meta
+            .put(wtxn, &open_presence_key(inode, session_id), &[])
+            .map_err(|e| FluxError::Meta(e.to_string()))
+    }
+
+    fn close_inode_in_txn(
+        &self,
+        wtxn: &mut heed::RwTxn,
+        session_id: &str,
+        inode: InodeId,
+    ) -> Result<()> {
+        validate_session_id(session_id)?;
+        self.meta
+            .delete(wtxn, &open_presence_key(inode, session_id))
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        self.reap_unlinked_inode_if_unopened_in_txn(wtxn, inode)
+    }
+
+    fn recover_session_in_txn(&self, wtxn: &mut heed::RwTxn, session_id: &str) -> Result<()> {
+        validate_session_id(session_id)?;
+        let mut stale = Vec::new();
+        let iter = self
+            .meta
+            .prefix_iter(wtxn, OPEN_PRESENCE_PREFIX)
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        for item in iter {
+            let (key, _) = item.map_err(|e| FluxError::Meta(e.to_string()))?;
+            let (inode, owner) = parse_open_presence_key(key)?;
+            if owner == session_id {
+                stale.push((key.to_string(), inode));
+            }
+        }
+        for (key, _) in &stale {
+            self.meta
+                .delete(wtxn, key)
+                .map_err(|e| FluxError::Meta(e.to_string()))?;
+        }
+        for inode in stale
+            .into_iter()
+            .map(|(_, inode)| inode)
+            .collect::<BTreeSet<_>>()
+        {
+            self.reap_unlinked_inode_if_unopened_in_txn(wtxn, inode)?;
+        }
+        Ok(())
+    }
+
+    fn has_open_presence_in_txn(&self, txn: &heed::RoTxn<'_>, inode: InodeId) -> Result<bool> {
+        let mut iter = self
+            .meta
+            .prefix_iter(txn, &open_presence_inode_prefix(inode))
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        Ok(iter
+            .next()
+            .transpose()
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+            .is_some())
+    }
+
+    fn reap_unlinked_inode_if_unopened_in_txn(
+        &self,
+        wtxn: &mut heed::RwTxn,
+        inode: InodeId,
+    ) -> Result<()> {
+        let raw = self
+            .inodes
+            .get(wtxn, &inode_key(inode))
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        let Some(raw) = raw else {
+            return Ok(());
+        };
+        let current: Inode =
+            serde_json::from_slice(raw).map_err(|e| FluxError::Meta(e.to_string()))?;
+        if current.link_count == 0 && !self.has_open_presence_in_txn(wtxn, inode)? {
+            self.delete_inode_in_txn(wtxn, inode)?;
+        }
+        Ok(())
+    }
+
     fn rmdir_in_txn(
         &self,
         wtxn: &mut heed::RwTxn,
@@ -2335,7 +2491,7 @@ impl HeedMetaStore {
             .checked_add(1)
             .ok_or_else(|| FluxError::InvalidArg("inode generation overflow".into()))?;
         child.ctime_ms = now_ms();
-        if child.link_count == 0 {
+        if child.link_count == 0 && !self.has_open_presence_in_txn(wtxn, child.id)? {
             self.delete_inode_in_txn(wtxn, child.id)
         } else {
             put_inode_raw(&self.inodes, wtxn, &child)
@@ -2359,6 +2515,18 @@ impl HeedMetaStore {
             .map_err(|e| FluxError::Meta(e.to_string()))?;
         for key in xattr_keys {
             self.xattrs
+                .delete(wtxn, &key)
+                .map_err(|e| FluxError::Meta(e.to_string()))?;
+        }
+        let open_keys = self
+            .meta
+            .prefix_iter(wtxn, &open_presence_inode_prefix(child_id))
+            .map_err(|e| FluxError::Meta(e.to_string()))?
+            .map(|item| item.map(|(key, _)| key.to_string()))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| FluxError::Meta(e.to_string()))?;
+        for key in open_keys {
+            self.meta
                 .delete(wtxn, &key)
                 .map_err(|e| FluxError::Meta(e.to_string()))?;
         }
@@ -3408,6 +3576,18 @@ impl MetaStore for HeedMetaStore {
         })
     }
 
+    fn open_inode(&self, session_id: &str, inode: InodeId) -> Result<()> {
+        self.with_write_txn(|store, wtxn| store.open_inode_in_txn(wtxn, session_id, inode))
+    }
+
+    fn close_inode(&self, session_id: &str, inode: InodeId) -> Result<()> {
+        self.with_write_txn(|store, wtxn| store.close_inode_in_txn(wtxn, session_id, inode))
+    }
+
+    fn recover_session(&self, session_id: &str) -> Result<()> {
+        self.with_write_txn(|store, wtxn| store.recover_session_in_txn(wtxn, session_id))
+    }
+
     fn rmdir_cas(
         &self,
         expected_parent_generation: Option<u64>,
@@ -3592,6 +3772,38 @@ fn parse_xattr_key(key: &str) -> Result<(InodeId, &str)> {
     let inode =
         u64::from_str_radix(inode_hex, 16).map_err(|error| FluxError::Meta(error.to_string()))?;
     Ok((inode, name))
+}
+
+fn open_presence_key(inode: InodeId, session_id: &str) -> String {
+    format!("{}{session_id}", open_presence_inode_prefix(inode))
+}
+
+fn open_presence_inode_prefix(inode: InodeId) -> String {
+    format!("{OPEN_PRESENCE_PREFIX}{inode:016x}:")
+}
+
+fn parse_open_presence_key(key: &str) -> Result<(InodeId, &str)> {
+    let rest = key
+        .strip_prefix(OPEN_PRESENCE_PREFIX)
+        .ok_or_else(|| FluxError::Meta("bad open-presence key prefix".into()))?;
+    let (inode_hex, session_id) = rest
+        .split_once(':')
+        .ok_or_else(|| FluxError::Meta("bad open-presence key".into()))?;
+    let inode = u64::from_str_radix(inode_hex, 16).map_err(|e| FluxError::Meta(e.to_string()))?;
+    validate_session_id(session_id)?;
+    Ok((inode, session_id))
+}
+
+fn validate_session_id(session_id: &str) -> Result<()> {
+    if session_id.is_empty()
+        || session_id.len() > 128
+        || !session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(FluxError::InvalidArg("invalid mount session id".into()));
+    }
+    Ok(())
 }
 
 fn validate_xattr_name(name: &str) -> Result<()> {
@@ -5197,6 +5409,17 @@ mod tests {
                 )
                 .unwrap();
         }
+        let opened = store
+            .create(
+                ROOT_INODE,
+                "snapshot-open.bin",
+                FileType::Regular,
+                0o600,
+                0,
+                0,
+            )
+            .unwrap();
+        store.open_inode("snapshot-session", opened.id).unwrap();
         let snap_path = dir.path().join("stream.snap");
         store
             .export_snapshot_to_path(&SmAppliedMeta::default(), &snap_path)
@@ -5213,6 +5436,62 @@ mod tests {
                 .lookup(ROOT_INODE, &format!("stream-{i}.bin"))
                 .unwrap();
         }
+        restored.unlink(ROOT_INODE, "snapshot-open.bin").unwrap();
+        assert_eq!(restored.get_inode(opened.id).unwrap().link_count, 0);
+        restored.close_inode("snapshot-session", opened.id).unwrap();
+        assert_eq!(
+            restored.get_inode(opened.id).unwrap_err(),
+            FluxError::NotFound
+        );
+    }
+
+    #[test]
+    fn open_unlink_lifetime_is_per_session_and_recovery_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HeedMetaStore::open(dir.path()).unwrap();
+        let file = store
+            .create(ROOT_INODE, "open.bin", FileType::Regular, 0o600, 0, 0)
+            .unwrap();
+
+        store.open_inode("mount-a", file.id).unwrap();
+        store.open_inode("mount-a", file.id).unwrap();
+        store.open_inode("mount-b", file.id).unwrap();
+        store.unlink(ROOT_INODE, "open.bin").unwrap();
+        assert_eq!(store.get_inode(file.id).unwrap().link_count, 0);
+
+        store.close_inode("mount-a", file.id).unwrap();
+        assert_eq!(store.get_inode(file.id).unwrap().link_count, 0);
+        store.recover_session("mount-a").unwrap();
+        store.recover_session("mount-a").unwrap();
+        assert_eq!(store.get_inode(file.id).unwrap().link_count, 0);
+
+        store.recover_session("mount-b").unwrap();
+        assert_eq!(store.get_inode(file.id).unwrap_err(), FluxError::NotFound);
+        store.close_inode("mount-b", file.id).unwrap();
+    }
+
+    #[test]
+    fn rename_replacement_retains_an_open_unlinked_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HeedMetaStore::open(dir.path()).unwrap();
+        let source = store
+            .create(ROOT_INODE, "source", FileType::Regular, 0o600, 0, 0)
+            .unwrap();
+        let destination = store
+            .create(ROOT_INODE, "destination", FileType::Regular, 0o600, 0, 0)
+            .unwrap();
+        store.open_inode("rename-session", destination.id).unwrap();
+
+        let moved = store
+            .rename(ROOT_INODE, "source", ROOT_INODE, "destination", false)
+            .unwrap();
+        assert_eq!(moved.id, source.id);
+        assert_eq!(store.get_inode(destination.id).unwrap().link_count, 0);
+        store.close_inode("rename-session", destination.id).unwrap();
+        assert_eq!(
+            store.get_inode(destination.id).unwrap_err(),
+            FluxError::NotFound
+        );
     }
 
     #[test]

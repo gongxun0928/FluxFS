@@ -304,7 +304,10 @@ impl<M: MetaStore + 'static, C: ChunkStore + 'static> Filesystem for FluxFs<M, C
     fn open(&self, _req: &Request, ino: INodeNo, _flags: fuser::OpenFlags, reply: ReplyOpen) {
         match self.client.get_inode(ino.0) {
             Ok(inode) if inode.file_type == FluxFileType::Regular => {
-                reply.opened(FileHandle(0), FopenFlags::empty());
+                match self.client.open_inode_handle(ino.0) {
+                    Ok(()) => reply.opened(FileHandle(0), FopenFlags::empty()),
+                    Err(error) => reply.error(map_err(error)),
+                }
             }
             Ok(_) => reply.error(Errno::EISDIR),
             Err(e) => reply.error(map_err(e)),
@@ -329,15 +332,16 @@ impl<M: MetaStore + 'static, C: ChunkStore + 'static> Filesystem for FluxFs<M, C
             .client
             .create_file(parent.0, name, mode, req.uid(), req.gid())
         {
-            Ok(ino) => {
-                reply.created(
+            Ok(ino) => match self.client.open_inode_handle(ino.id) {
+                Ok(()) => reply.created(
                     &TTL,
                     &self.attr(&ino),
                     Generation(0),
                     FileHandle(0),
                     FopenFlags::empty(),
-                );
-            }
+                ),
+                Err(error) => reply.error(map_err(error)),
+            },
             Err(e) => reply.error(map_err(e)),
         }
     }
@@ -393,14 +397,17 @@ impl<M: MetaStore + 'static, C: ChunkStore + 'static> Filesystem for FluxFs<M, C
     fn release(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         _fh: FileHandle,
         _flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        reply.ok();
+        match self.client.close_inode_handle(ino.0) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(map_err(error)),
+        }
     }
 
     fn fsync(

@@ -257,6 +257,24 @@ pub trait MetaStore: Send + Sync {
         name: &str,
     ) -> Result<()>;
 
+    /// Record that `session_id` has at least one live open handle for `inode`.
+    ///
+    /// Presence is idempotent: clients coalesce their local 0→1 transition so
+    /// Meta stores one durable row per `(session, inode)`, not one row per fd.
+    fn open_inode(&self, session_id: &str, inode: InodeId) -> Result<()>;
+
+    /// Remove a session's durable open presence for one inode. If the inode has
+    /// already reached `nlink == 0` and no other session keeps it open, this
+    /// atomically makes the inode eligible for the existing GC path.
+    fn close_inode(&self, session_id: &str, inode: InodeId) -> Result<()>;
+
+    /// Clear every stale presence owned by a restarting mount session.
+    ///
+    /// Mount daemons persist their session id locally and call this once before
+    /// accepting new opens. The operation is idempotent so reconnect/retry is
+    /// safe through Raft.
+    fn recover_session(&self, session_id: &str) -> Result<()>;
+
     /// Remove an empty directory from `parent`.
     fn rmdir(&self, parent: InodeId, name: &str) -> Result<()> {
         self.rmdir_cas(None, parent, name)

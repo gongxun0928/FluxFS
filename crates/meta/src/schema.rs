@@ -5,8 +5,9 @@ use fluxfs_types::{FluxError, Result};
 /// Version zero is the legacy, unmarked alpha layout. Version one adds the
 /// durable marker; version two writes versioned ordered extent trees while
 /// retaining a reader for legacy manifest arrays; version three adds the
-/// durable xattr side table used by POSIX ACL storage.
-pub const CURRENT_META_SCHEMA_VERSION: u32 = 3;
+/// durable xattr side table used by POSIX ACL storage; version four adds
+/// durable `(inode, mount-session)` open-presence rows for open-unlink lifetime.
+pub const CURRENT_META_SCHEMA_VERSION: u32 = 4;
 pub const LEGACY_UNMARKED_SCHEMA_VERSION: u32 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,7 +17,7 @@ pub struct MetaMigration {
     pub name: &'static str,
 }
 
-const MIGRATIONS: [MetaMigration; 3] = [
+const MIGRATIONS: [MetaMigration; 4] = [
     MetaMigration {
         from: LEGACY_UNMARKED_SCHEMA_VERSION,
         to: 1,
@@ -31,6 +32,11 @@ const MIGRATIONS: [MetaMigration; 3] = [
         from: 2,
         to: 3,
         name: "add durable xattr side table",
+    },
+    MetaMigration {
+        from: 3,
+        to: 4,
+        name: "add durable open-inode session presence",
     },
 ];
 
@@ -70,14 +76,18 @@ mod tests {
 
     #[test]
     fn migration_path_is_explicit_and_rejects_downgrade() {
-        assert_eq!(migration_path(0, 3).unwrap(), MIGRATIONS);
+        assert_eq!(migration_path(0, 4).unwrap(), MIGRATIONS);
         assert_eq!(
-            migration_path(1, 3).unwrap(),
-            vec![MIGRATIONS[1], MIGRATIONS[2]]
+            migration_path(1, 4).unwrap(),
+            vec![MIGRATIONS[1], MIGRATIONS[2], MIGRATIONS[3]]
         );
-        assert_eq!(migration_path(2, 3).unwrap(), vec![MIGRATIONS[2]]);
-        assert!(migration_path(3, 3).unwrap().is_empty());
-        assert!(migration_path(4, 3)
+        assert_eq!(
+            migration_path(2, 4).unwrap(),
+            vec![MIGRATIONS[2], MIGRATIONS[3]]
+        );
+        assert_eq!(migration_path(3, 4).unwrap(), vec![MIGRATIONS[3]]);
+        assert!(migration_path(4, 4).unwrap().is_empty());
+        assert!(migration_path(5, 4)
             .unwrap_err()
             .to_string()
             .contains("newer"));

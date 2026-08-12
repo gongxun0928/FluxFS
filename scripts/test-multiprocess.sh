@@ -127,6 +127,26 @@ test "$(count_chunks "$test_root/worker-0")" -ge 1
 test "$(count_chunks "$test_root/worker-1")" -ge 1
 test "$(count_chunks "$test_root/worker-2")" -eq 0
 
+# Exercise OpenInode/CloseInode over tonic + Raft, not only embedded Meta.
+python3 - "$mount_dir/remote-open-unlink.bin" <<'PY'
+import os, sys
+
+path = sys.argv[1]
+fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+try:
+    os.write(fd, b"remote-open")
+    os.fsync(fd)
+    os.unlink(path)
+    assert not os.path.exists(path)
+    assert os.pread(fd, 11, 0) == b"remote-open"
+    assert os.pwrite(fd, b"X", 10) == 1
+    os.fdatasync(fd)
+    assert os.pread(fd, 11, 0) == b"remote-opeX"
+finally:
+    os.close(fd)
+assert not os.path.exists(path)
+PY
+
 # The initial RF=2 set is workers 0/1. With worker 0 down, reads from worker 1
 # lazily copy accessed chunks to spare worker 2. Before the next write ACKs, a
 # paginated inventory scrub restores every reachable authoritative chunk to RF=2.

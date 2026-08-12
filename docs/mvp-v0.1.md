@@ -103,7 +103,8 @@ This is the reuse point Gongxun asked for: **one chunk layout for write cache an
 | rename involving External without copy-up | **No** → copy-up first or EXDEV |
 | hardlink / symlink / xattr | Yes for FluxFS-managed namespace; External mutation fails closed |
 | POSIX ACL | Storage, validation, inheritance and round-trip only; no enforcement |
-| flock / open-unlink lifetime | Defer |
+| open-unlink lifetime | Yes for managed regular files via durable mount-session presence |
+| flock | Defer |
 | fsync | Flush that inode’s dirty extents (best-effort durability) |
 
 ## 6. What we take from references (MVP-level)

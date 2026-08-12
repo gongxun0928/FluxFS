@@ -8,23 +8,25 @@ use fluxfs_metrics::{install_process_metrics, spawn_prometheus, FluxMetrics};
 use fluxfs_proto::meta::v1::{
     AbortChunkReservationRequest, AbortChunkReservationResponse, AcknowledgeGcDeletesRequest,
     AcknowledgeGcDeletesResponse, BeginFlushRequest, BeginFlushResponse, BeginGcRequest,
-    BeginGcResponse, CommitFlushRequest, CommitFlushResponse, CommitInodeManifestRequest,
-    CommitInodeManifestReservedRequest, CommitInodeManifestResponse, CreateRequest, CreateResponse,
-    CurrentGcPlanRequest, CurrentGcPlanResponse, ExpireChunkReservationsRequest,
-    ExpireChunkReservationsResponse, FailFlushConflictRequest, FailFlushConflictResponse,
-    FinalizeGcTombstonesRequest, FinalizeGcTombstonesResponse, FinishGcRequest, FinishGcResponse,
-    GetInodeRequest, GetInodeResponse, GetManifestRequest, GetManifestResponse,
-    GetWorkerMembershipRequest, GetXattrRequest, GetXattrResponse, ImportExternalRequest,
-    ImportExternalResponse, InitializeGcDeleteTargetsRequest, InitializeGcDeleteTargetsResponse,
-    LinkRequest, LinkResponse, ListFlushIntentsRequest, ListFlushIntentsResponse,
-    ListGcTombstonesRequest, ListGcTombstonesResponse, ListXattrsRequest, ListXattrsResponse,
-    LookupRequest, LookupResponse, PingRequest, PingResponse, PutInodeCasRequest,
+    BeginGcResponse, CloseInodeRequest, CloseInodeResponse, CommitFlushRequest,
+    CommitFlushResponse, CommitInodeManifestRequest, CommitInodeManifestReservedRequest,
+    CommitInodeManifestResponse, CreateRequest, CreateResponse, CurrentGcPlanRequest,
+    CurrentGcPlanResponse, ExpireChunkReservationsRequest, ExpireChunkReservationsResponse,
+    FailFlushConflictRequest, FailFlushConflictResponse, FinalizeGcTombstonesRequest,
+    FinalizeGcTombstonesResponse, FinishGcRequest, FinishGcResponse, GetInodeRequest,
+    GetInodeResponse, GetManifestRequest, GetManifestResponse, GetWorkerMembershipRequest,
+    GetXattrRequest, GetXattrResponse, ImportExternalRequest, ImportExternalResponse,
+    InitializeGcDeleteTargetsRequest, InitializeGcDeleteTargetsResponse, LinkRequest, LinkResponse,
+    ListFlushIntentsRequest, ListFlushIntentsResponse, ListGcTombstonesRequest,
+    ListGcTombstonesResponse, ListXattrsRequest, ListXattrsResponse, LookupRequest, LookupResponse,
+    OpenInodeRequest, OpenInodeResponse, PingRequest, PingResponse, PutInodeCasRequest,
     PutInodeCasResponse, PutInodeRequest, PutInodeResponse, PutManifestRequest,
-    PutManifestResponse, ReaddirRequest, ReaddirResponse, RegisterWorkerRequest,
-    RemoveXattrRequest, RemoveXattrResponse, RenameRequest, RenameResponse, ReserveChunksRequest,
-    ReserveChunksResponse, RmdirRequest, RmdirResponse, SetXattrRequest, SetXattrResponse,
-    SymlinkRequest, SymlinkResponse, TombstoneGcBatchRequest, TombstoneGcBatchResponse,
-    UnlinkRequest, UnlinkResponse, WorkerMembershipResponse,
+    PutManifestResponse, ReaddirRequest, ReaddirResponse, RecoverSessionRequest,
+    RecoverSessionResponse, RegisterWorkerRequest, RemoveXattrRequest, RemoveXattrResponse,
+    RenameRequest, RenameResponse, ReserveChunksRequest, ReserveChunksResponse, RmdirRequest,
+    RmdirResponse, SetXattrRequest, SetXattrResponse, SymlinkRequest, SymlinkResponse,
+    TombstoneGcBatchRequest, TombstoneGcBatchResponse, UnlinkRequest, UnlinkResponse,
+    WorkerMembershipResponse,
 };
 use fluxfs_proto::meta_codec::{
     decode_chunk_ids, decode_flush_intent, decode_gc_delete_acks, decode_inode, decode_manifest,
@@ -903,6 +905,71 @@ impl MetaService for MetaSvc {
             .await?;
         self.map_resp_empty(resp)?;
         Ok(Response::new(UnlinkResponse {}))
+    }
+
+    async fn open_inode(
+        &self,
+        req: Request<OpenInodeRequest>,
+    ) -> Result<Response<OpenInodeResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
+        let corr_id = fluxfs_proto::request_id::extract_request_id(&req);
+        let request = req.into_inner();
+        let response = self
+            .write(
+                &corr_id,
+                MetaRaftRequest::OpenInode {
+                    request_id: parse_request_op_id(&request.request_id),
+                    ledger_now_unix_ms: 0,
+                    session_id: request.session_id,
+                    inode: request.inode,
+                },
+            )
+            .await?;
+        self.map_resp_empty(response)?;
+        Ok(Response::new(OpenInodeResponse {}))
+    }
+
+    async fn close_inode(
+        &self,
+        req: Request<CloseInodeRequest>,
+    ) -> Result<Response<CloseInodeResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
+        let corr_id = fluxfs_proto::request_id::extract_request_id(&req);
+        let request = req.into_inner();
+        let response = self
+            .write(
+                &corr_id,
+                MetaRaftRequest::CloseInode {
+                    request_id: parse_request_op_id(&request.request_id),
+                    ledger_now_unix_ms: 0,
+                    session_id: request.session_id,
+                    inode: request.inode,
+                },
+            )
+            .await?;
+        self.map_resp_empty(response)?;
+        Ok(Response::new(CloseInodeResponse {}))
+    }
+
+    async fn recover_session(
+        &self,
+        req: Request<RecoverSessionRequest>,
+    ) -> Result<Response<RecoverSessionResponse>, Status> {
+        fluxfs_tls::require_in_extensions(&req, fluxfs_types::auth::Capability::MutateMeta)?;
+        let corr_id = fluxfs_proto::request_id::extract_request_id(&req);
+        let request = req.into_inner();
+        let response = self
+            .write(
+                &corr_id,
+                MetaRaftRequest::RecoverSession {
+                    request_id: parse_request_op_id(&request.request_id),
+                    ledger_now_unix_ms: 0,
+                    session_id: request.session_id,
+                },
+            )
+            .await?;
+        self.map_resp_empty(response)?;
+        Ok(Response::new(RecoverSessionResponse {}))
     }
 
     async fn rmdir(&self, req: Request<RmdirRequest>) -> Result<Response<RmdirResponse>, Status> {

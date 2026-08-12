@@ -38,6 +38,9 @@ service MetaService {
   rpc FinishGc(FinishGcRequest) returns (FinishGcResponse);
   rpc ImportExternal(ImportExternalRequest) returns (ImportExternalResponse);
   rpc Unlink(UnlinkRequest) returns (UnlinkResponse);
+  rpc OpenInode(OpenInodeRequest) returns (OpenInodeResponse);
+  rpc CloseInode(CloseInodeRequest) returns (CloseInodeResponse);
+  rpc RecoverSession(RecoverSessionRequest) returns (RecoverSessionResponse);
   rpc Link(LinkRequest) returns (LinkResponse);
   rpc GetXattr(GetXattrRequest) returns (GetXattrResponse);
   rpc ListXattrs(ListXattrsRequest) returns (ListXattrsResponse);
@@ -237,6 +240,26 @@ message UnlinkRequest {
   string request_id = 4;
 }
 message UnlinkResponse {}
+
+message OpenInodeRequest {
+  string session_id = 1;
+  uint64 inode = 2;
+  string request_id = 3;
+}
+message OpenInodeResponse {}
+
+message CloseInodeRequest {
+  string session_id = 1;
+  uint64 inode = 2;
+  string request_id = 3;
+}
+message CloseInodeResponse {}
+
+message RecoverSessionRequest {
+  string session_id = 1;
+  string request_id = 2;
+}
+message RecoverSessionResponse {}
 
 message LinkRequest {
   uint64 inode = 1;

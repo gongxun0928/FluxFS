@@ -264,6 +264,29 @@ pub enum MetaRaftRequest {
         #[serde(default)]
         expected_parent_generation: Option<u64>,
     },
+    OpenInode {
+        #[serde(default)]
+        request_id: Option<RequestOpId>,
+        #[serde(default)]
+        ledger_now_unix_ms: u64,
+        session_id: String,
+        inode: u64,
+    },
+    CloseInode {
+        #[serde(default)]
+        request_id: Option<RequestOpId>,
+        #[serde(default)]
+        ledger_now_unix_ms: u64,
+        session_id: String,
+        inode: u64,
+    },
+    RecoverSession {
+        #[serde(default)]
+        request_id: Option<RequestOpId>,
+        #[serde(default)]
+        ledger_now_unix_ms: u64,
+        session_id: String,
+    },
     Link {
         #[serde(default)]
         request_id: Option<RequestOpId>,
@@ -349,6 +372,9 @@ impl MetaRaftRequest {
             | Self::FinishGc { request_id, .. }
             | Self::ImportExternal { request_id, .. }
             | Self::Unlink { request_id, .. }
+            | Self::OpenInode { request_id, .. }
+            | Self::CloseInode { request_id, .. }
+            | Self::RecoverSession { request_id, .. }
             | Self::Link { request_id, .. }
             | Self::SetXattr { request_id, .. }
             | Self::RemoveXattr { request_id, .. }
@@ -382,6 +408,9 @@ impl MetaRaftRequest {
             | Self::FinishGc { request_id, .. }
             | Self::ImportExternal { request_id, .. }
             | Self::Unlink { request_id, .. }
+            | Self::OpenInode { request_id, .. }
+            | Self::CloseInode { request_id, .. }
+            | Self::RecoverSession { request_id, .. }
             | Self::Link { request_id, .. }
             | Self::SetXattr { request_id, .. }
             | Self::RemoveXattr { request_id, .. }
@@ -463,6 +492,15 @@ impl MetaRaftRequest {
                 ledger_now_unix_ms, ..
             }
             | Self::Unlink {
+                ledger_now_unix_ms, ..
+            }
+            | Self::OpenInode {
+                ledger_now_unix_ms, ..
+            }
+            | Self::CloseInode {
+                ledger_now_unix_ms, ..
+            }
+            | Self::RecoverSession {
                 ledger_now_unix_ms, ..
             }
             | Self::Link {
@@ -554,6 +592,15 @@ impl MetaRaftRequest {
             | Self::Unlink {
                 ledger_now_unix_ms, ..
             }
+            | Self::OpenInode {
+                ledger_now_unix_ms, ..
+            }
+            | Self::CloseInode {
+                ledger_now_unix_ms, ..
+            }
+            | Self::RecoverSession {
+                ledger_now_unix_ms, ..
+            }
             | Self::Link {
                 ledger_now_unix_ms, ..
             }
@@ -601,6 +648,9 @@ impl MetaRaftRequest {
             Self::FinishGc { .. } => "finish_gc",
             Self::ImportExternal { .. } => "import_external",
             Self::Unlink { .. } => "unlink",
+            Self::OpenInode { .. } => "open_inode",
+            Self::CloseInode { .. } => "close_inode",
+            Self::RecoverSession { .. } => "recover_session",
             Self::Link { .. } => "link",
             Self::SetXattr { .. } => "set_xattr",
             Self::RemoveXattr { .. } => "remove_xattr",

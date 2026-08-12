@@ -140,6 +140,16 @@ mount-free CLI has no UFS publication adapter; this preserves the existing
 External consistency boundary instead of pretending a metadata-only delete or
 rename modified the backing object.
 
+Managed regular files implement POSIX open-unlink lifetime with durable
+`(inode, mount-session)` presence in Meta. Each mount coalesces local file
+descriptors so only the first open and last release for an inode traverse
+Raft. Final-name unlink leaves an `nlink=0` inode reachable by existing handles;
+the last session close reaps it. A stable id in `<data-dir>/mount-session-id`
+lets startup `SessionRecover` idempotently clear rows left by a daemon crash.
+Different concurrent mounts must use different data directories/session ids;
+a permanently lost session currently causes safe garbage retention until the
+future lease/admin-fencing path is added.
+
 ## 3. Garbage collection
 
 Physical data deletion is asynchronous. Mount readiness and foreground writes
@@ -150,7 +160,7 @@ progress.
 | Garbage source | How it becomes reclaimable | Reclamation path |
 |---|---|---|
 | Client crash after Worker Put but before metadata commit | The durable pre-Put reservation protects the chunk for 15 minutes. After replicated expiry, the chunk is no longer protected. | Inventory-driven GC creates a durable tombstone, deletes each recorded Worker target, persists acknowledgements, then finalizes the tombstone. |
-| Unlink with `nlink` reaching zero | The inode is removed and its active reservations are aborted, so its manifest and chunks become unreachable. | The same background manifest/chunk reachability scan and tombstone workflow reclaims them. |
+| Unlink with `nlink` reaching zero | With no open session, the inode is removed and its active reservations are aborted. With an open handle it remains as `nlink=0` until the last close or startup session recovery. | Once the inode is removed, the same background manifest/chunk reachability scan and tombstone workflow reclaims it. |
 | Overwrite or truncate | The inode CAS points to a new immutable manifest; superseded manifests and chunks are no longer reachable from any current inode. | The same bounded background pass deletes unreachable manifests and tombstones zero-reference chunks. |
 
 Reservations and tombstones survive restart and snapshot restore. Creating a
@@ -238,9 +248,10 @@ than a capability claimed by the current implementation.
   256 KiB total/inode), and Linux POSIX ACL blobs round-trip and inherit as
   `system.posix_acl_access/default`. ACL permission enforcement is deliberately
   not claimed until FluxFS has an authenticated UID/GID identity model.
-- Remaining POSIX scope includes locking, mmap coherence, open-unlink lifetime,
-  and permission enforcement. Multi-machine chaos/soak, operational upgrades/DR,
+- Remaining POSIX scope includes locking, mmap coherence, and permission
+  enforcement. Multi-machine chaos/soak, operational upgrades/DR,
   complete capacity control, and positional/async local I/O also remain production work.
-- Open-unlink lifetime is not yet guaranteed: final-name unlink currently reaps
-  the inode. Durable session references versus daemon-local grace collection is
-  an explicit performance/correctness decision, not a completed capability.
+- Open-unlink lifetime uses durable per-session presence. Healthy multi-mount
+  behavior and restart of the same persistent mount session are covered; a
+  lease or explicit administrative fence is still needed to reclaim a session
+  whose data directory is permanently lost.

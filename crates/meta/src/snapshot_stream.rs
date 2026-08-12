@@ -15,9 +15,10 @@ use crate::raft_types::{MetaRaftResponse, SmAppliedMeta};
 
 /// File magic (includes trailing newline for easy `file(1)` / hexdump checks).
 pub const SNAPSHOT_MAGIC: &[u8] = b"fluxfs-meta-snapshot\n";
-/// Version 2 adds streamed xattr records. Readers still accept v1 snapshots;
-/// old binaries reject v2 rather than silently dropping xattrs on restore.
-pub const SNAPSHOT_VERSION: u32 = 2;
+/// Version 2 adds streamed xattr records; version 3 adds durable open-presence
+/// rows. Readers retain v1/v2 compatibility while old binaries reject newer
+/// snapshots rather than silently dropping handle-lifetime state.
+pub const SNAPSHOT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotFormat {
@@ -49,6 +50,10 @@ pub enum SnapshotRecord {
         inode: u64,
         name: String,
         value: Vec<u8>,
+    },
+    OpenPresence {
+        inode: u64,
+        session_id: String,
     },
     ClientRequest {
         id: String,
@@ -107,7 +112,7 @@ pub fn detect_format(r: &mut (impl Read + Seek)) -> Result<SnapshotFormat> {
     r.read_exact(&mut ver)
         .map_err(|e| FluxError::Io(e.to_string()))?;
     let version = u32::from_le_bytes(ver);
-    if !matches!(version, 1 | SNAPSHOT_VERSION) {
+    if !matches!(version, 1 | 2 | SNAPSHOT_VERSION) {
         return Err(FluxError::Meta(format!(
             "unsupported snapshot version {version}"
         )));

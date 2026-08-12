@@ -92,6 +92,28 @@ assert int(st.st_mtime) == 1_234_567_890
 assert open(path, "rb").read() == b"abXYefgh" + b"\0" * 4
 PY
 
+# Final-name unlink must detach the namespace immediately while the open fd
+# continues to address the retained inode until release.
+python3 - "$mount_dir/open-unlink.bin" <<'PY'
+import os, sys
+
+path = sys.argv[1]
+fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+try:
+    assert os.write(fd, b"before-unlink") == 13
+    os.fsync(fd)
+    os.unlink(path)
+    assert not os.path.exists(path)
+    assert os.pread(fd, 13, 0) == b"before-unlink"
+    assert os.pwrite(fd, b"after", 0) == 5
+    os.ftruncate(fd, 8)
+    os.fdatasync(fd)
+    assert os.pread(fd, 8, 0) == b"aftere-u"
+finally:
+    os.close(fd)
+assert not os.path.exists(path)
+PY
+
 # Atomic namespace operations through real FUSE callbacks.
 mkdir "$mount_dir/rename-left" "$mount_dir/rename-right"
 printf 'rename-source\n' >"$mount_dir/rename-left/source"
@@ -156,9 +178,11 @@ mkdir "$mount_dir/dir/acl-child-dir"
 getfacl -cn "$mount_dir/dir/acl-child-dir" | grep -q '^user:12345:r-x$'
 getfacl -cdn "$mount_dir/dir/acl-child-dir" | grep -q '^user:12345:r-x$'
 stop_mount
+session_id_before=$(tr -d '\n' <"$data_dir/mount-session-id")
 
 # Reopen the same metadata/chunk directories and verify acknowledged data.
 start_mount
+test "$(tr -d '\n' <"$data_dir/mount-session-id")" = "$session_id_before"
 test "$(cat "$mount_dir/hello.txt")" = "hello XY"
 test "$(cat "$mount_dir/dir/nested.txt")" = "nested"
 test ! -e "$mount_dir/remove.txt"

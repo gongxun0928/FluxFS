@@ -83,6 +83,10 @@ pub struct FluxClient<M: MetaStore, C: ChunkStore> {
     ufs_paths: Mutex<HashMap<InodeId, String>>,
     /// Last content address considered by bounded background GC.
     gc_cursor: Mutex<Option<ChunkId>>,
+    /// Stable mount identity used for durable open-unlink presence.
+    open_session_id: Option<String>,
+    /// Per-mount fd counts; only 0→1 / 1→0 transitions reach Meta.
+    open_inode_counts: Mutex<HashMap<InodeId, u64>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -121,7 +125,68 @@ impl<M: MetaStore, C: ChunkStore> FluxClient<M, C> {
             ufs: None,
             ufs_paths: Mutex::new(HashMap::from([(ROOT_INODE, String::new())])),
             gc_cursor: Mutex::new(None),
+            open_session_id: None,
+            open_inode_counts: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Configure one stable mount-session id. The caller must invoke
+    /// [`Self::recover_open_session`] before serving FUSE requests.
+    pub fn with_open_session(mut self, session_id: impl Into<String>) -> Self {
+        self.open_session_id = Some(session_id.into());
+        self
+    }
+
+    pub fn recover_open_session(&self) -> Result<()> {
+        let session_id = self.open_session_id()?;
+        self.meta.recover_session(session_id)?;
+        self.open_inode_counts
+            .lock()
+            .map_err(|_| FluxError::Meta("open inode count lock poisoned".into()))?
+            .clear();
+        Ok(())
+    }
+
+    pub fn open_inode_handle(&self, inode: InodeId) -> Result<()> {
+        let session_id = self.open_session_id()?;
+        let mut counts = self
+            .open_inode_counts
+            .lock()
+            .map_err(|_| FluxError::Meta("open inode count lock poisoned".into()))?;
+        let count = counts.entry(inode).or_insert(0);
+        if *count == 0 {
+            self.meta.open_inode(session_id, inode)?;
+        }
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| FluxError::InvalidArg("open inode count overflow".into()))?;
+        Ok(())
+    }
+
+    pub fn close_inode_handle(&self, inode: InodeId) -> Result<()> {
+        let session_id = self.open_session_id()?;
+        let mut counts = self
+            .open_inode_counts
+            .lock()
+            .map_err(|_| FluxError::Meta("open inode count lock poisoned".into()))?;
+        let Some(count) = counts.get_mut(&inode) else {
+            // FUSE should balance open/create with release. Treat a duplicate
+            // release as idempotent so recovery is robust to retry.
+            return self.meta.close_inode(session_id, inode);
+        };
+        if *count > 1 {
+            *count -= 1;
+            return Ok(());
+        }
+        self.meta.close_inode(session_id, inode)?;
+        counts.remove(&inode);
+        Ok(())
+    }
+
+    fn open_session_id(&self) -> Result<&str> {
+        self.open_session_id.as_deref().ok_or_else(|| {
+            FluxError::InvalidArg("client has no configured mount session id".into())
+        })
     }
 
     /// Attach OpenDAL UFS with the default in-memory Clean read cache (tests).
@@ -1689,6 +1754,27 @@ mod tests {
         assert_eq!(got, b"hello world");
         let part = client.read_at(f.id, 6, 5).unwrap();
         assert_eq!(part, b"world");
+    }
+
+    #[test]
+    fn mount_session_coalesces_local_opens_until_last_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = HeedMetaStore::open(dir.path().join("meta")).unwrap();
+        let chunks = DiskChunkStore::open(dir.path().join("chunks")).unwrap();
+        let client = FluxClient::new(meta, chunks).with_open_session("client-session");
+        client.recover_open_session().unwrap();
+        let file = client
+            .create_file(ROOT_INODE, "open.bin", 0o600, 0, 0)
+            .unwrap();
+
+        client.open_inode_handle(file.id).unwrap();
+        client.open_inode_handle(file.id).unwrap();
+        client.unlink(ROOT_INODE, "open.bin").unwrap();
+        assert_eq!(client.get_inode(file.id).unwrap().link_count, 0);
+        client.close_inode_handle(file.id).unwrap();
+        assert_eq!(client.get_inode(file.id).unwrap().link_count, 0);
+        client.close_inode_handle(file.id).unwrap();
+        assert_eq!(client.get_inode(file.id).unwrap_err(), FluxError::NotFound);
     }
 
     #[test]

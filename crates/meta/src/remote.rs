@@ -3,13 +3,14 @@
 use crate::store::MetaStore;
 use fluxfs_proto::meta::v1::{
     AbortChunkReservationRequest, AcknowledgeGcDeletesRequest, BeginFlushRequest, BeginGcRequest,
-    CommitFlushRequest, CommitInodeManifestRequest, CommitInodeManifestReservedRequest,
-    CreateRequest, CurrentGcPlanRequest, ExpireChunkReservationsRequest, FailFlushConflictRequest,
-    FinalizeGcTombstonesRequest, FinishGcRequest, GetInodeRequest, GetManifestRequest,
-    GetWorkerMembershipRequest, GetXattrRequest, ImportExternalRequest,
-    InitializeGcDeleteTargetsRequest, LinkRequest, ListFlushIntentsRequest,
-    ListGcTombstonesRequest, ListXattrsRequest, LookupRequest, PutInodeCasRequest, PutInodeRequest,
-    PutManifestRequest, ReaddirRequest, RegisterWorkerRequest, RemoveXattrRequest, RenameRequest,
+    CloseInodeRequest, CommitFlushRequest, CommitInodeManifestRequest,
+    CommitInodeManifestReservedRequest, CreateRequest, CurrentGcPlanRequest,
+    ExpireChunkReservationsRequest, FailFlushConflictRequest, FinalizeGcTombstonesRequest,
+    FinishGcRequest, GetInodeRequest, GetManifestRequest, GetWorkerMembershipRequest,
+    GetXattrRequest, ImportExternalRequest, InitializeGcDeleteTargetsRequest, LinkRequest,
+    ListFlushIntentsRequest, ListGcTombstonesRequest, ListXattrsRequest, LookupRequest,
+    OpenInodeRequest, PutInodeCasRequest, PutInodeRequest, PutManifestRequest, ReaddirRequest,
+    RecoverSessionRequest, RegisterWorkerRequest, RemoveXattrRequest, RenameRequest,
     ReserveChunksRequest, RmdirRequest, SetXattrRequest, SymlinkRequest, TombstoneGcBatchRequest,
     UnlinkRequest,
 };
@@ -638,6 +639,50 @@ impl MetaStore for RemoteMetaStore {
                 request_id: RequestOpId::random().to_hex(),
             })
             .await
+        })
+        .map_err(flux_from_status)?;
+        Ok(())
+    }
+
+    fn open_inode(&self, session_id: &str, inode: InodeId) -> Result<()> {
+        let mut client = self.client()?;
+        self.block_on(async {
+            client
+                .open_inode(OpenInodeRequest {
+                    session_id: session_id.to_string(),
+                    inode,
+                    request_id: RequestOpId::random().to_hex(),
+                })
+                .await
+        })
+        .map_err(flux_from_status)?;
+        Ok(())
+    }
+
+    fn close_inode(&self, session_id: &str, inode: InodeId) -> Result<()> {
+        let mut client = self.client()?;
+        self.block_on(async {
+            client
+                .close_inode(CloseInodeRequest {
+                    session_id: session_id.to_string(),
+                    inode,
+                    request_id: RequestOpId::random().to_hex(),
+                })
+                .await
+        })
+        .map_err(flux_from_status)?;
+        Ok(())
+    }
+
+    fn recover_session(&self, session_id: &str) -> Result<()> {
+        let mut client = self.client()?;
+        self.block_on(async {
+            client
+                .recover_session(RecoverSessionRequest {
+                    session_id: session_id.to_string(),
+                    request_id: RequestOpId::random().to_hex(),
+                })
+                .await
         })
         .map_err(flux_from_status)?;
         Ok(())

@@ -3,8 +3,10 @@ use clap::{Parser, Subcommand};
 use fluxfs_chunk::{ChunkStore, DiskChunkStore, RemoteReplicatedChunkStore, ReplicatedChunkStore};
 use fluxfs_client::FluxClient;
 use fluxfs_meta::{start_single_voter, HeedMetaStore, MetaStore, RaftMetaStore, RemoteMetaStore};
-use fluxfs_types::{FileType, ROOT_INODE};
+use fluxfs_types::{FileType, RequestOpId, ROOT_INODE};
 use fluxfs_ufs::{RangeReq, ReadPathConfig, S3Options, Ufs};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -509,6 +511,7 @@ fn mount_with_chunks<C: ChunkStore + 'static>(
     ufs: Option<(Ufs, ReadPathConfig)>,
     tls: TlsClientArgs,
 ) -> Result<()> {
+    let session_id = load_mount_session_id(&data_dir)?;
     let mode = if ufs.is_some() {
         "UFS External/Dirty write-back"
     } else {
@@ -520,7 +523,7 @@ fn mount_with_chunks<C: ChunkStore + 'static>(
             .context("connect meta")?;
         // Touch root to fail fast if MetaMaster is down.
         meta.get_inode(ROOT_INODE).context("meta get root")?;
-        let client = build_client(meta, chunks, ufs)?;
+        let client = build_client(meta, chunks, ufs, &session_id)?;
         reconcile_before_mount(&client)?;
         println!(
             "mounting {mode} FluxFS ({chunk_mode}, remote meta={addr}) data_dir={} mountpoint={}",
@@ -547,7 +550,7 @@ fn mount_with_chunks<C: ChunkStore + 'static>(
         })
         .context("start embedded openraft")?;
         let meta = RaftMetaStore::new_owned(store, raft, rt);
-        let client = build_client(meta, chunks, ufs)?;
+        let client = build_client(meta, chunks, ufs, &session_id)?;
         reconcile_before_mount(&client)?;
         println!(
             "mounting {mode} FluxFS ({chunk_mode}, embedded raft) data_dir={} mountpoint={}",
@@ -622,10 +625,24 @@ fn mount_with_background_gc<M: MetaStore + 'static, C: ChunkStore + 'static>(
         "background GC: batch={BACKGROUND_GC_BATCH} idle={}s (non-blocking)",
         BACKGROUND_GC_IDLE.as_secs()
     );
-    let mount_result = fluxfs_fuse::mount_ephemeral(client, mountpoint).context("fuse mount");
+    let mount_result =
+        fluxfs_fuse::mount_ephemeral(Arc::clone(&client), mountpoint).context("fuse mount");
     gc_stop.store(true, Ordering::Relaxed);
     let _ = gc_handle.join();
-    mount_result
+    let cleanup_result = client
+        .recover_open_session()
+        .context("clear mount open-session presence");
+    let result = mount_result.and(cleanup_result);
+    // Embedded Raft owns a Tokio runtime. Because `main` itself is async, the
+    // final client Arc otherwise drops that runtime on a non-blocking runtime
+    // worker after unmount and Tokio panics. Dispose it inside block_in_place;
+    // remote clients are harmless here and follow the same deterministic path.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::task::block_in_place(|| drop(client));
+    } else {
+        drop(client);
+    }
+    result
 }
 
 fn run_orphan_gc_cmd(
@@ -719,6 +736,9 @@ fn run_orphan_gc_with_chunks<C: ChunkStore>(
 }
 
 fn reconcile_before_mount<M: MetaStore, C: ChunkStore>(client: &FluxClient<M, C>) -> Result<()> {
+    client
+        .recover_open_session()
+        .context("recover stale mount open-session presence")?;
     // Do not run stop-the-world orphan GC on the mount critical path: it stalls
     // FUSE bring-up and holds a Meta Busy lease across the whole sweep.
     // Release any interrupted lease so writers are not stuck Busy after mount;
@@ -747,8 +767,9 @@ fn build_client<M: MetaStore + 'static, C: ChunkStore + 'static>(
     meta: M,
     chunks: C,
     ufs: Option<(Ufs, ReadPathConfig)>,
+    session_id: &str,
 ) -> Result<Arc<FluxClient<M, C>>> {
-    let client = FluxClient::new(meta, chunks);
+    let client = FluxClient::new(meta, chunks).with_open_session(session_id);
     let client = if let Some((ufs, read_cfg)) = ufs {
         if read_cfg.disk_capacity_bytes > 0 {
             let dir = read_cfg
@@ -768,6 +789,38 @@ fn build_client<M: MetaStore + 'static, C: ChunkStore + 'static>(
         client
     };
     Ok(Arc::new(client))
+}
+
+fn load_mount_session_id(data_dir: &std::path::Path) -> Result<String> {
+    let path = data_dir.join("mount-session-id");
+    let read_existing = || -> Result<String> {
+        let session_id = std::fs::read_to_string(&path)
+            .with_context(|| format!("read mount session id {}", path.display()))?;
+        let session_id = session_id.trim().to_string();
+        if session_id.is_empty() {
+            bail!("mount session id {} is empty", path.display());
+        }
+        Ok(session_id)
+    };
+    if path.exists() {
+        return read_existing();
+    }
+
+    let session_id = RequestOpId::random().to_hex();
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut file) => {
+            writeln!(file, "{session_id}").context("write mount session id")?;
+            file.sync_all().context("fsync mount session id")?;
+            std::fs::File::open(data_dir)
+                .and_then(|dir| dir.sync_all())
+                .context("fsync mount data directory")?;
+            Ok(session_id)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => read_existing(),
+        Err(error) => {
+            Err(error).with_context(|| format!("create mount session id {}", path.display()))
+        }
+    }
 }
 
 fn run_meta_ping(addr: &str, tls: &TlsClientArgs) -> Result<()> {
